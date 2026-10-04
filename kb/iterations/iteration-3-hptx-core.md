@@ -35,7 +35,8 @@ Read first: wiki `protocols/hp-object-format`, `protocols/iopar`,
   GROB decode (131x64, rows padded to bytes, LSB = leftmost pixel) to PNG.
 - [ ] Backup/restore: `ARCHIVE :IO:name` / `RESTORE` over Kermit, binary.
 - [ ] Tests: unit tests on parsers with recorded replies from all three models;
-  `tests/e2e.rs` (one binary) with ~6 scenarios: ls, get, put round trip,
+  `tests/e2e.rs` (one binary; replace the iteration-1 raw I-packet smoke
+  test with kermit-proto-based scenarios) with ~6 scenarios: ls, get, put round trip,
   run, screenshot, backup; each runs against whatever model the container
   is (CI runs the 48SX; developers run others locally).
 

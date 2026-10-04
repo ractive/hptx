@@ -31,7 +31,8 @@ Read first: wiki `protocols/kermit`, `protocols/kermit-hp`,
   file grows (System RPL copies on every packet): default timeout 20 s and a
   configurable inter-packet pause.
 - [ ] Tests: hand-written byte traces for each packet type and block check;
-  traces recorded from the emulator (M1's container) for a full `C "6 7 *"`,
+  traces recorded from the emulator (`just emulator-up`, see
+  `emulator/README.md`) for a full `C "6 7 *"`,
   `G D`, GET and SEND; the stale-NAK-on-connect case (discard pending input
   for ~0.5 s after connect is a transport concern, but the state machine must
   survive an unsolicited NAK before S).
