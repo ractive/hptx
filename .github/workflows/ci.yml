@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace -q
+
+  e2e:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Deliberately not cached or pushed: the image contains HP ROMs.
+      - name: Build emulator image
+        run: docker build -t hp49g-emu emulator
+      - name: Start HP 48SX
+        run: |
+          docker run -d -p 4848:4848 -e MODEL=48sx --name calc hp49g-emu
+          timeout 90 sh -c 'until docker logs calc 2>&1 | grep -q bridged; do sleep 1; done'
+      - name: End-to-end tests
+        env:
+          HPTX_E2E_ADDR: tcp://localhost:4848
+        run: cargo test -p hptx-core --test e2e -- --nocapture
+      - name: Screen and logs on failure
+        if: failure()
+        run: |
+          docker exec calc calc-screen || true
+          docker exec calc cat /tmp/saturn.log || true
+          docker logs calc
