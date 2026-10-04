@@ -1,0 +1,13 @@
+{ HOME } 244692.
+D1 24.5 Directory 65022.
+G 1103.5 Graphic 3894.
+TG 18.5 List 53238.
+B 18.5 Binary Integer 4734.
+C 24. Complex Number 45768.
+A 22. Algebraic 2509.
+P 20.5 Program 38804.
+L 15.5 List 61254.
+S 12.5 String 32458.
+R 16. Real Number 52870.
+IOPAR 29.5 List 10777.
+CASDIR 128. Directory 15302.

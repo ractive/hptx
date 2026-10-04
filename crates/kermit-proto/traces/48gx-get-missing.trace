@@ -1,0 +1,3 @@
+# record get NOSUCH
+> \x01) RNOSUCHL\r
+< \x011 EUndefined Name,\r

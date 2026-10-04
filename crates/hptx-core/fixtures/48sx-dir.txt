@@ -1,0 +1,11 @@
+D1 29 Directory 51467
+G 1103.5 Graphic 3894
+TG 17 Real Number 23381
+B 18.5 Binary Integer 4734
+C 24 Complex Number 45768
+A 22 Algebraic 20138
+P 20.5 Program 18728
+L 15.5 List 52320
+S 12.5 String 32458
+R 16 Real Number 52870
+IOPAR 29.5 List 8861

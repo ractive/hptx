@@ -1,0 +1,2 @@
+2:      "Version HP48-R"
+1:   "Copyright HP 1993"
