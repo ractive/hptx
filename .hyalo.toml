@@ -1,0 +1,87 @@
+dir = "kb"
+
+[schema.default]
+required = ["title", "type"]
+
+[schema.types.iteration]
+required = ["title", "type", "date", "status", "branch", "tags"]
+filename-template = "iterations/iteration-{n}-{slug}.md"
+
+[schema.types.iteration.defaults]
+status = "planned"
+date = "$today"
+type = "iteration"
+
+[schema.types.iteration.properties.status]
+type = "enum"
+values = ["planned", "in-progress", "completed", "superseded", "shelved", "deferred"]
+
+[schema.types.iteration.properties.branch]
+type = "string"
+pattern = "^iter-\\d+[a-z]*/"
+
+[schema.types.iteration.properties.date]
+type = "date"
+
+[schema.types.iteration.properties.tags]
+type = "list"
+
+[schema.types.research]
+required = ["title", "type", "date", "status"]
+
+[schema.types.research.properties.date]
+type = "date"
+
+[schema.types.research.properties.status]
+type = "enum"
+values = ["active", "archived", "reference", "completed", "superseded"]
+
+[schema.types.backlog]
+required = ["title", "type", "date", "status", "priority"]
+
+[schema.types.backlog.properties.date]
+type = "date"
+
+[schema.types.backlog.properties.status]
+type = "enum"
+values = ["planned", "in-progress", "completed", "wont-do", "deferred"]
+
+[schema.types.backlog.properties.priority]
+type = "enum"
+values = ["low", "medium", "high", "critical"]
+
+[schema.types.docs]
+required = ["title", "type", "date", "status"]
+
+[schema.types.docs.properties.date]
+type = "date"
+
+[schema.types.docs.properties.status]
+type = "enum"
+values = ["active", "archived", "draft"]
+
+[schema.types.decisions]
+required = ["title", "type", "date", "status"]
+
+[schema.types.decisions.properties.date]
+type = "date"
+
+[schema.types.decisions.properties.status]
+type = "enum"
+values = ["active", "archived", "reference"]
+
+[views.planned]
+properties = ["status=planned"]
+
+[views.in-progress]
+properties = ["status=in-progress"]
+fields = ["tasks"]
+
+[views.open-tasks]
+task = "todo"
+
+[views.orphans]
+orphan = true
+
+[lint]
+ignore = ["iterations/done/**", "backlog/done/**"]

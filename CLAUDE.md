@@ -1,61 +1,40 @@
 # hptx
 
-Rust tools for transferring files between HP Saturn calculators (HP48 S/SX/G/GX,
-HP49G, HP38G/39G/40G) and a modern computer over serial: Kermit and XModem.
-Read `PLAN.md` before doing anything; it holds the milestones, the decisions
-already made and the known calculator quirks.
+Rust tools for transferring files between HP Saturn calculators (HP48/49,
+later 38/39/40) and a modern computer over serial. MIT, see `AI_NOTICE`.
 
-## Where knowledge lives
+# Agents
+Delegate implementation work to Opus agents (`model: opus`) whenever possible;
+brief them with the iteration file, the kb docs to read and the acceptance
+criteria. The main session reviews.
 
-- `~/devel/hp-literature/` is an LLM wiki about these calculators. Query it
-  with the `hyalo` CLI from that directory (`hyalo summary`, `hyalo read
-  index.md`, `hyalo find "kermit server"`, `hyalo read protocols/kermit-hp.md`).
-  Protocol pages: `protocols/kermit`, `kermit-hp`, `server-commands`, `iopar`,
-  `hp-object-format`, `xmodem`, `xmodem-hp`, `xserv`. Cite wiki pages in code
-  comments as `wiki: protocols/kermit-hp` when a quirk is implemented.
-  If you learn something new about the calculators, add it to the wiki
-  (follow its own `CLAUDE.md`), don't bury it in a code comment only.
-- `~/devel/hpcomm/` is the 1999-2001 HPComm C++ source (GPL, co-owned by HP).
-  Read `hpcomm/Kermit.cpp`, `Prot.cpp`, `Filer*.cpp` and `hpgcomm/XModem.cpp`
-  to learn HP behaviour. Never copy or closely translate code from it: hptx
-  is MIT. Facts, yes; expression, no.
-- `emulator/` holds the saturnng Docker container (HP48SX, 48GX, 49G) with the
-  calculator's serial port on TCP 4848. `emulator/README.md` explains it.
-  The image contains HP ROMs: never push it to a registry.
+# Documentation
+All project knowledge lives in `./kb/` as markdown with YAML frontmatter.
+Read first: `kb/docs/architecture.md`, `kb/decision-log.md`,
+`kb/docs/knowledge-sources.md`, `kb/docs/test-policy.md`,
+`kb/docs/cli-conventions.md`, `kb/docs/calculator-quirks.md`.
+- Iteration plans: `kb/iterations/iteration-N-slug.md`, tasks as checkboxes,
+  status `planned` -> `in-progress` -> `completed`.
+- Decisions: `kb/decision-log.md` (dated entries; never re-litigate silently).
+- Research: `kb/research/`. Backlog: `kb/backlog/`.
 
-## Decisions (do not re-litigate)
+Always use `hyalo` for kb interactions, never Read/Grep/Edit on kb files
+except for body prose: `hyalo summary`, `hyalo find`, `hyalo read <path>`,
+`hyalo set`, `hyalo task toggle`, `hyalo lint`. `.hyalo.toml` sets `dir = "kb"`;
+do not pass `--dir`. Follow the hints hyalo prints. `hyalo lint` must be clean
+before a PR. The calculator wiki at `~/devel/hp-literature/` is separate and
+also hyalo-driven.
 
-- License MIT with `AI_NOTICE`; public repo; GitHub user `ractive`.
-- Rust, edition 2024, stable toolchain. Crates: `kermit-proto`, `xmodem-proto`
-  (generic, sans-IO, publishable), `hptx-core` (HP layer + transports),
-  `hptx-cli` (binary `hptx`). A Tauri app comes later, no front-end chosen.
-- Protocol crates are sans-IO: bytes in, bytes and events out, caller owns
-  I/O, time and files. No threads, sockets, filesystem or async inside them.
-- First target HP48SX, then HP49G (both exist as real hardware here), HP48GX
-  in CI only, HP38G/39G/40G last (only Emu48 on Windows emulates them).
-- CLI conventions borrowed from `~/devel/hyalo`: text on a TTY, JSON when
-  piped, `{results, total, hints}` envelope, `--jq`, hints suggesting next
-  commands, `--dry-run` on destructive commands, shell completions. Nothing
-  more elaborate; one `--help` must serve humans and agents.
+# Rust
+- Edition 2024, stable. Windows, Linux, macOS.
+- Before committing or a PR, in order: `cargo fmt`,
+  `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace -q`.
+- No `.unwrap()`/`.expect()` outside tests; `anyhow::Context` with `?`.
+- Test policy in `kb/docs/test-policy.md`: fast unit tests, one e2e binary per
+  crate, emulator tests gated by `HPTX_E2E_ADDR`.
 
-## Test policy (important)
-
-- Protocol crates: unit tests only, byte traces in, bytes/events out.
-  Milliseconds. No mocks of serial ports.
-- At most one integration test binary per crate (`tests/e2e.rs` with
-  modules). Never one file per scenario.
-- End-to-end tests against the emulator run only when `HPTX_E2E_ADDR`
-  (e.g. `tcp://localhost:4848`) is set, and only in a separate CI job. Keep
-  them to a handful of scenarios per model.
-- No heavy dev-dependencies in the sans-IO crates. No fuzzing, property or
-  snapshot tests until a bug justifies one.
-- `just test` runs the fast suite; `just e2e` the emulator suite.
-
-## Working style
-
-- Implementation milestones are done by Opus agents (`model: opus`) with a
-  brief that names the PLAN.md milestone, the wiki pages to read and the
-  acceptance criteria. The main session reviews.
-- Work on a branch per milestone, open a PR, the user merges.
-- Commit messages end with `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`
-  (or the model that wrote it). Never commit secrets or ROM images.
+# PR discipline
+One iteration = one branch (`iter-N/short-description`) = one PR. Self-review
+the diff. Commit messages end with
+`Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>` (or the model that
+wrote it). Never commit secrets or ROM images; never push the emulator image.
