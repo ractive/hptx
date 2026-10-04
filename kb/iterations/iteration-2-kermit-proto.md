@@ -51,3 +51,12 @@ missing name; 49G: host, dir, finish) replay as unit tests, plus a stale-NAK
 variant. Findings: command packets must use block check 1 even after an I
 exchange agreed on 3; the fresh 48SX transfers in ASCII mode
 (`kb/docs/calculator-quirks.md`).
+
+Review (PR #3): seven findings, all fixed with tests. `start` returns
+`StartError { Busy, TooLong }` and rejects R/C data over 77 encoded bytes; a
+receive timeout NAKs packet n instead of re-ACKing n-1; a bad-check frame
+counts as a NAK in send mode only when its SEQ is n; negotiation keeps QCTL,
+QBIN and REPT distinct; a file name that does not fit in F fails instead of
+being truncated; `cancel`/`fail` drop queued output before the E packet;
+deadlines use `checked_add`. All tasks landed. Items carried over to
+iteration 3 are listed in that plan under "From iteration 2".

@@ -40,6 +40,25 @@ Read first: wiki `protocols/hp-object-format`, `protocols/iopar`,
   run, screenshot, backup; each runs against whatever model the container
   is (CI runs the 48SX; developers run others locally).
 
+### From iteration 2
+
+- [ ] Transfer mode: the fresh 48SX transfers in ASCII mode (bytes 0-26 of a
+  binary file did not survive the iteration-2 `48sx-send` round trip).
+  hptx-core sets or checks the mode (IOPAR / `TRANSIO`) before put/get, and
+  the e2e put round trip proves binary survives byte for byte.
+- [ ] HP charset translation: `kermit-proto` passes names, data and server
+  text as raw bytes (decision log 2026-10-04); hptx-core translates the HP
+  charset to and from UTF-8 for names and text.
+- [ ] Command length: `Client::start` rejects R/C data over 77 encoded bytes
+  (`StartError::TooLong`). Host commands built here (rename, `IOPAR` set,
+  long paths) stay under that or are split across several `C` packets, and the
+  error is surfaced to the CLI with a clear message.
+- [ ] Record `kermit-proto` traces from a 48GX (iteration 2 only has 48SX
+  and 49G) and add them to the replay tests.
+- [ ] Loss recovery through a transport: an in-memory transport test that
+  drops a D packet during GET and checks recovery through the NAK-on-timeout
+  path (unit-tested only in iteration 2).
+
 ## Acceptance criteria
 
 e2e green on 48SX in CI, and passes locally on 48GX and 49G.
