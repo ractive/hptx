@@ -1,0 +1,17 @@
+[package]
+name = "hptx-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "hptx"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+
+[lints]
+workspace = true
