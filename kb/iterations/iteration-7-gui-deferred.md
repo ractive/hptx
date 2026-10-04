@@ -15,6 +15,3 @@ Tauri 2, front-end undecided, two-pane filer on `hptx-core`. Not before M4
 is used daily.
 
 ## Tasks
-
-
-

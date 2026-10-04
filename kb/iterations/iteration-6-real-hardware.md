@@ -16,6 +16,3 @@ every CLI command, both protocols on the 49G, timing on long transfers,
 early-49G DTR/RTS behaviour. File every surprise into the wiki.
 
 ## Tasks
-
-
-

@@ -20,4 +20,3 @@ tags:
   line, runs `cargo test -p hptx-core --test e2e` with `HPTX_E2E_ADDR`.
   Cache cargo, not the Docker image (it contains ROMs).
 - [ ] README stub. Acceptance: CI green on both jobs.
-
