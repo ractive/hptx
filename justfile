@@ -21,6 +21,11 @@ fmt:
 e2e:
     HPTX_E2E_ADDR={{e2e_addr}} cargo test -p hptx-core --test e2e -- --nocapture
 
+# e.g. `just record-trace dir > crates/kermit-proto/traces/48sx-dir.trace`
+# Record a Kermit trace from the running emulator to stdout
+record-trace +args:
+    @cargo run -q -p kermit-proto --example record -- localhost:4848 {{args}}
+
 # Build and start the emulator; model is 49g, 48gx or 48sx
 emulator-up model="48sx":
     docker build -t hp49g-emu emulator

@@ -10,7 +10,8 @@ tags:
 
 # Architecture and goal
 
-Status: skeleton only (2026-10-04). Nothing built yet except `emulator/`.
+Status (2026-10-04): `kermit-proto` client implemented (iteration 2);
+`xmodem-proto`, `hptx-core` and `hptx-cli` are still skeletons.
 
 ## Goal
 
@@ -28,18 +29,26 @@ hptx-core      HP layer: server commands, object format, IOPAR, GROB,
 hptx-cli       binary `hptx`
 ```
 
-Sans-IO seam, same for both protocol crates:
+Sans-IO seam, same for both protocol crates (as built in `kermit-proto`):
 
 ```text
-fn handle_input(&mut self, bytes: &[u8]);
+fn start(&mut self, now: Instant, command: Command) -> Result<(), Busy>;
+fn handle_input(&mut self, now: Instant, bytes: &[u8]);
 fn handle_timeout(&mut self, now: Instant);
-fn poll_output(&mut self) -> Option<Vec<u8>>;
-fn poll_event(&mut self) -> Option<Event>;   // FileStart, Data, FileEnd, Error, Done
+fn poll_output(&mut self, now: Instant) -> Option<Vec<u8>>;  // one packet, write atomically
+fn poll_event(&mut self) -> Option<Event>;
 fn next_timeout(&self) -> Option<Instant>;
 ```
 
+Every call that can queue output takes `now`, so the state machine owns
+retransmit deadlines and the inter-packet pause without reading a clock.
+Kermit events: `FileStart`, `Data`, `Progress`, `FileEnd`, `ServerText`,
+`Error`, `Done`. Names, file data and server text are raw bytes in the
+calculator's character set; `hptx-core` translates.
+
 Files cross the boundary as events and chunks. The only link property the
 protocol must know is whether the link is 8-bit clean (Kermit prefixing);
-baud, parity and port names belong to the transport.
+baud, parity and port names belong to the transport. Discarding stale input
+for about 0.5 s after connecting is the transport's job.
 
 ## Milestones
