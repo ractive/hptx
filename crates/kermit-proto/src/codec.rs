@@ -5,6 +5,8 @@
 pub const SOH: u8 = 0x01;
 /// Carriage return, the default end-of-line byte.
 pub const CR: u8 = 0x0D;
+/// Largest LEN value a (short) packet can carry: `tochar(94)` is `~`.
+pub const MAX_LEN: usize = 94;
 
 /// Turn a small number (0..=94) into a printable character.
 pub const fn tochar(x: u8) -> u8 {
@@ -118,14 +120,30 @@ impl Packet {
         }
     }
 
+    /// Longest data field that fits in a packet whose LEN may be at most
+    /// `maxl` (capped at [`MAX_LEN`]) with block check `check`.
+    pub fn max_data(maxl: usize, check: BlockCheck) -> usize {
+        maxl.min(MAX_LEN).saturating_sub(2 + check.len())
+    }
+
     /// NPAD x PADC, SOH, LEN, SEQ, TYPE, DATA, CHECK, EOL.
+    ///
+    /// The data field must fit: `data.len() <= Packet::max_data(MAX_LEN, check)`.
+    /// Callers guarantee this; violating it is a bug, caught by a debug
+    /// assertion. In release builds the LEN byte saturates at `~` instead of
+    /// wrapping into a different, valid-looking length.
     pub fn encode(&self, check: BlockCheck, framing: &Framing) -> Vec<u8> {
         let len = 2 + self.data.len() + check.len();
+        debug_assert!(
+            len <= MAX_LEN,
+            "packet data too long: LEN {len} exceeds {MAX_LEN}"
+        );
+        let len_char = u8::try_from(len.min(MAX_LEN)).map_or(tochar(94), tochar);
         let mut out = Vec::with_capacity(usize::from(framing.npad) + len + 3);
         out.extend(std::iter::repeat_n(framing.padc, usize::from(framing.npad)));
         out.push(SOH);
         let body_start = out.len();
-        out.push(tochar(len as u8));
+        out.push(len_char);
         out.push(tochar(self.seq % 64));
         out.push(self.kind);
         out.extend_from_slice(&self.data);
@@ -346,6 +364,27 @@ mod tests {
             let frame = &wire[..wire.len() - 1];
             assert_eq!(parse_frame(frame, t).unwrap(), p);
         }
+    }
+
+    #[test]
+    fn max_data_and_longest_packet() {
+        assert_eq!(Packet::max_data(80, BlockCheck::Type1), 77);
+        assert_eq!(Packet::max_data(94, BlockCheck::Type3), 89);
+        assert_eq!(Packet::max_data(200, BlockCheck::Type3), 89);
+        assert_eq!(Packet::max_data(3, BlockCheck::Type3), 0);
+        let p = Packet::new(0, b'D', vec![b'x'; 89]);
+        let wire = p.encode(BlockCheck::Type3, &Framing::default());
+        assert_eq!(wire[1], b'~');
+        let frame = &wire[..wire.len() - 1];
+        assert_eq!(parse_frame(frame, BlockCheck::Type3).unwrap(), p);
+    }
+
+    #[test]
+    #[should_panic(expected = "packet data too long")]
+    #[cfg(debug_assertions)]
+    fn oversized_packet_is_caught() {
+        let p = Packet::new(0, b'D', vec![b'x'; 90]);
+        let _ = p.encode(BlockCheck::Type3, &Framing::default());
     }
 
     #[test]

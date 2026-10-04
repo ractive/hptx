@@ -128,6 +128,12 @@ pub fn negotiate(ours: &InitParams, theirs: &InitParams) -> Negotiated {
         None
     };
     let rept = (ours.rept == theirs.rept && is_prefix(ours.rept)).then_some(ours.rept);
+    // QCTL (either side's), QBIN and REPT must be distinct. On a collision the
+    // optional feature is turned off: QBIN against QCTL first, then REPT
+    // against QCTL or the surviving QBIN.
+    let is_qctl = |c: u8| c == ours.qctl || c == theirs.qctl;
+    let qbin = qbin.filter(|&c| !is_qctl(c));
+    let rept = rept.filter(|&c| !is_qctl(c) && Some(c) != qbin);
     let check = if ours.chkt == theirs.chkt {
         BlockCheck::from_char(ours.chkt).unwrap_or(BlockCheck::Type1)
     } else {
@@ -274,5 +280,46 @@ mod tests {
         assert_eq!(negotiate(&o, &theirs).peer_maxl, 10);
         theirs.maxl = 200;
         assert_eq!(negotiate(&o, &theirs).peer_maxl, 94);
+    }
+
+    #[test]
+    fn negotiate_prefixes_distinct() {
+        // REPT equal to QBIN: repeat compression is dropped, QBIN kept.
+        let mut o = ours();
+        o.qbin = b'&';
+        o.rept = b'&';
+        let mut theirs = o;
+        theirs.qbin = b'Y';
+        let n = negotiate(&o, &theirs);
+        assert_eq!((n.send.qbin, n.send.rept), (Some(b'&'), None));
+        assert_eq!((n.recv.qbin, n.recv.rept), (Some(b'&'), None));
+
+        // REPT equal to the peer's QCTL: dropped in both directions.
+        let o = ours();
+        let mut theirs = o;
+        theirs.qctl = b'~';
+        let n = negotiate(&o, &theirs);
+        assert_eq!((n.send.rept, n.recv.rept), (None, None));
+        // ... and equal to our QCTL.
+        let mut o2 = o;
+        o2.qctl = b'~';
+        let n = negotiate(&o2, &o);
+        assert_eq!((n.send.rept, n.recv.rept), (None, None));
+
+        // QBIN equal to the peer's QCTL: 8th-bit prefixing off, REPT kept.
+        let mut o = ours();
+        o.qbin = b'&';
+        let mut theirs = o;
+        theirs.qbin = b'Y';
+        theirs.qctl = b'&';
+        let n = negotiate(&o, &theirs);
+        assert_eq!((n.send.qbin, n.recv.qbin), (None, None));
+        assert_eq!(n.send.rept, Some(b'~'));
+
+        // Distinct prefixes are untouched.
+        let mut o = ours();
+        o.qbin = b'&';
+        let n = negotiate(&o, &o);
+        assert_eq!((n.send.qbin, n.send.rept), (Some(b'&'), Some(b'~')));
     }
 }

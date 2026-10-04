@@ -11,7 +11,8 @@
 //! # The seam
 //!
 //! - [`Client::start`] begins a transaction ([`Command`]); the first packet is
-//!   queued at once.
+//!   queued at once. It returns a [`StartError`] while a transaction is
+//!   running or if the command does not fit in one packet.
 //! - [`Client::handle_input`] feeds bytes read from the link, in any chunking.
 //! - [`Client::handle_timeout`] tells the client that time has passed; call it
 //!   when [`Client::next_timeout`] is reached (or whenever a read times out;
@@ -98,6 +99,6 @@ pub mod trace;
 #[cfg(test)]
 mod trace_tests;
 
-pub use client::{Busy, Client, Command, Config, Error, Event, OutgoingFile};
+pub use client::{Client, Command, Config, Error, Event, OutgoingFile, StartError};
 pub use codec::BlockCheck;
 pub use params::InitParams;

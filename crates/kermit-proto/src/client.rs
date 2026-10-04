@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::time::{Duration, Instant};
 
-use crate::codec::{BlockCheck, CR, Deframer, FrameError, Framing, Packet, parse_frame};
+use crate::codec::{BlockCheck, CR, Deframer, FrameError, Framing, Packet, parse_frame, unchar};
 use crate::params::{InitParams, Negotiated, negotiate};
 use crate::prefix::{self, Quoting};
 
@@ -130,17 +130,37 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// Returned by [`Client::start`] while a transaction is running.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Busy;
+/// Default MAXL assumed for the peer before any Send-Init exchange.
+const DEFAULT_MAXL: usize = 80;
 
-impl fmt::Display for Busy {
+/// Why [`Client::start`] refused a command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartError {
+    /// A transaction is already running.
+    Busy,
+    /// The encoded command data (R name, C text) does not fit in one packet
+    /// under the default MAXL of 80 with block check type 1.
+    TooLong {
+        /// Encoded data length.
+        len: usize,
+        /// Largest encoded data length that fits.
+        max: usize,
+    },
+}
+
+impl fmt::Display for StartError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("a transaction is already running")
+        match self {
+            StartError::Busy => f.write_str("a transaction is already running"),
+            StartError::TooLong { len, max } => write!(
+                f,
+                "command too long: {len} encoded bytes, at most {max} fit in one packet"
+            ),
+        }
     }
 }
 
-impl std::error::Error for Busy {}
+impl std::error::Error for StartError {}
 
 /// What the reply to the command packet means.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -230,15 +250,14 @@ impl Client {
 
     /// Begin a transaction. Clears buffered input. First packet is available
     /// from `poll_output(now)` immediately.
-    pub fn start(&mut self, now: Instant, command: Command) -> Result<(), Busy> {
+    ///
+    /// Fails with [`StartError::Busy`] while a transaction is running and with
+    /// [`StartError::TooLong`] if the encoded command data does not fit in one
+    /// packet; the client is unchanged in both cases.
+    pub fn start(&mut self, now: Instant, command: Command) -> Result<(), StartError> {
         if !self.is_idle() {
-            return Err(Busy);
+            return Err(StartError::Busy);
         }
-        self.deframer.clear();
-        self.neg = None;
-        self.seq = 0;
-        self.retries = 0;
-        self.deadline = None;
         let q = Quoting::default();
         let (kind, data, phase) = match command {
             Command::Info => (b'I', self.ours.encode(), Phase::Await(Kind::Info)),
@@ -262,6 +281,19 @@ impl Client {
             Command::Finish => (b'G', b"F".to_vec(), Phase::Await(Kind::Generic)),
             Command::Logout => (b'G', b"L".to_vec(), Phase::Await(Kind::Generic)),
         };
+        // Commands go out before negotiation: default MAXL, block check 1.
+        let max = Packet::max_data(DEFAULT_MAXL, BlockCheck::Type1);
+        if data.len() > max {
+            return Err(StartError::TooLong {
+                len: data.len(),
+                max,
+            });
+        }
+        self.deframer.clear();
+        self.neg = None;
+        self.seq = 0;
+        self.retries = 0;
+        self.deadline = None;
         self.phase = phase;
         let bytes = Packet::new(0, kind, data).encode(BlockCheck::Type1, &Framing::default());
         self.last_sent = bytes.clone();
@@ -285,11 +317,13 @@ impl Client {
                 _ => BlockCheck::Type1,
             };
             let parsed = parse_frame(&frame, check);
+            // SEQ as received, also for frames that fail the check.
+            let raw_seq = frame.get(2).map(|&c| unchar(c));
             match self.phase {
                 Phase::Idle => {}
                 Phase::Await(kind) => self.on_await(now, kind, parsed),
                 Phase::Receive { .. } => self.on_receive(now, parsed),
-                Phase::Send(_) => self.on_send(now, parsed),
+                Phase::Send(_) => self.on_send(now, parsed, raw_seq),
             }
         }
         if self.is_idle() {
@@ -306,7 +340,13 @@ impl Client {
             && now >= d
         {
             self.deadline = None;
-            self.retry(now, now);
+            if matches!(self.phase, Phase::Receive { .. }) {
+                // Receiving: NAK the packet we expect (Kermit), not the last ACK.
+                let nak = self.nak();
+                self.retry_with(now, now, nak);
+            } else {
+                self.retry(now, now);
+            }
         }
     }
 
@@ -321,7 +361,8 @@ impl Client {
         }
         let (_, bytes) = self.queue.pop_front()?;
         if !self.is_idle() {
-            self.deadline = Some(now + self.config.timeout);
+            // Overflow (absurdly large timeout) means no deadline.
+            self.deadline = now.checked_add(self.config.timeout);
         }
         Some(bytes)
     }
@@ -377,12 +418,23 @@ impl Client {
         self.neg.map_or_else(Quoting::default, |n| n.recv)
     }
 
+    /// When a packet sent in reply to input at `now` becomes due. A pause that
+    /// overflows `Instant` is ignored rather than delaying forever.
+    fn paused(&self, now: Instant) -> Instant {
+        now.checked_add(self.config.packet_pause).unwrap_or(now)
+    }
+
+    /// NAK for the expected seq with the negotiated check and framing.
+    fn nak(&self) -> Vec<u8> {
+        Packet::new(self.seq, b'N', Vec::new()).encode(self.check(), &self.framing())
+    }
+
     /// Queue a new packet in reply to input; it becomes the retransmit copy.
     fn reply(&mut self, now: Instant, bytes: Vec<u8>) {
         self.last_sent = bytes.clone();
         self.deadline = None;
-        self.queue
-            .push_back((now + self.config.packet_pause, bytes));
+        let due = self.paused(now);
+        self.queue.push_back((due, bytes));
     }
 
     fn reply_packet(&mut self, now: Instant, seq: u8, kind: u8, data: Vec<u8>) {
@@ -392,18 +444,27 @@ impl Client {
 
     /// Count a retry and re-queue `last_sent` due at `due`, or give up.
     fn retry(&mut self, now: Instant, due: Instant) {
+        let bytes = self.last_sent.clone();
+        self.retry_with(now, due, bytes);
+    }
+
+    /// Count a retry and queue `bytes` (not stored as `last_sent`) due at
+    /// `due`, or give up.
+    fn retry_with(&mut self, now: Instant, due: Instant, bytes: Vec<u8>) {
         self.retries += 1;
         if self.retries > self.config.retries {
             self.fail(now, Error::Timeout, Some(b"Too many retries"));
         } else {
             self.deadline = None;
-            self.queue.push_back((due, self.last_sent.clone()));
+            self.queue.push_back((due, bytes));
         }
     }
 
     fn stale_nak(&mut self, now: Instant) {
-        let grace = now + self.config.nak_grace;
-        self.deadline = Some(self.deadline.map_or(grace, |d| d.min(grace)));
+        // A grace period that overflows `Instant` leaves the deadline as is.
+        if let Some(grace) = now.checked_add(self.config.nak_grace) {
+            self.deadline = Some(self.deadline.map_or(grace, |d| d.min(grace)));
+        }
     }
 
     fn finish(&mut self, event: Event) {
@@ -412,8 +473,10 @@ impl Client {
         self.deadline = None;
     }
 
-    /// Queue an E packet (if `text`), emit Error, go idle.
+    /// Queue an E packet (if `text`), emit Error, go idle. Output still queued
+    /// (a held-back ACK, D or F) is dropped first so nothing follows the E.
     fn fail(&mut self, now: Instant, err: Error, text: Option<&[u8]>) {
+        self.queue.clear();
         if let Some(text) = text {
             let data = prefix::encode_all(text, &self.send_quoting());
             let bytes = Packet::new(self.seq, b'E', data).encode(self.check(), &self.framing());
@@ -496,10 +559,11 @@ impl Client {
         let p = match parsed {
             Ok(p) => p,
             Err(FrameError::BadCheck) => {
-                // Not stored as last_sent: a timeout resends the last ACK.
-                let nak = Packet::new(n, b'N', Vec::new()).encode(self.check(), &self.framing());
+                // Not stored as last_sent: a duplicate still gets the last ACK.
+                let nak = self.nak();
                 self.deadline = None;
-                self.queue.push_back((now + self.config.packet_pause, nak));
+                let due = self.paused(now);
+                self.queue.push_back((due, nak));
                 return;
             }
             Err(FrameError::BadLength) => return,
@@ -512,8 +576,8 @@ impl Client {
         if p.seq != n {
             if p.seq == (n + 63) % 64 && p.kind != b'N' {
                 self.retries = 0;
-                self.queue
-                    .push_back((now + self.config.packet_pause, self.last_sent.clone()));
+                let due = self.paused(now);
+                self.queue.push_back((due, self.last_sent.clone()));
                 self.deadline = None;
             }
             return;
@@ -572,13 +636,19 @@ impl Client {
 
     // ---- sending ----
 
-    fn on_send(&mut self, now: Instant, parsed: Result<Packet, FrameError>) {
+    fn on_send(&mut self, now: Instant, parsed: Result<Packet, FrameError>, raw_seq: Option<u8>) {
         let n = self.seq;
         let init = matches!(&self.phase, Phase::Send(s) if s.step == Step::Init);
         let p = match parsed {
             Ok(p) => p,
             Err(FrameError::BadCheck) => {
-                self.retry(now, now + self.config.packet_pause);
+                // A damaged reply for the outstanding packet acts as a NAK.
+                // Anything else (e.g. a late duplicate ACK(0) to S, which uses
+                // check type 1) is ignored.
+                if raw_seq == Some(n) {
+                    let due = self.paused(now);
+                    self.retry(now, due);
+                }
                 return;
             }
             Err(FrameError::BadLength) => return,
@@ -594,7 +664,8 @@ impl Client {
                 if init {
                     self.stale_nak(now);
                 } else {
-                    self.retry(now, now + self.config.packet_pause);
+                    let due = self.paused(now);
+                    self.retry(now, due);
                 }
             }
             _ => {}
@@ -607,8 +678,8 @@ impl Client {
     }
 
     fn max_data(&self) -> usize {
-        let maxl = self.neg.map_or(80, |n| n.peer_maxl);
-        usize::from(maxl).saturating_sub(2 + self.check().len())
+        let maxl = self.neg.map_or(DEFAULT_MAXL, |n| usize::from(n.peer_maxl));
+        Packet::max_data(maxl, self.check())
     }
 
     fn sending(&mut self) -> Option<&mut Sending> {
@@ -679,17 +750,25 @@ impl Client {
         }
     }
 
-    /// Send F for the current file, or B when all files are done.
+    /// Send F for the current file, or B when all files are done. Fails the
+    /// transaction if the encoded name does not fit in one packet.
     fn next_file(&mut self, now: Instant) {
         let max = self.max_data();
         let q = self.send_quoting();
         let Some(s) = self.sending() else { return };
-        match s
-            .files
-            .get(s.idx)
-            .map(|f| prefix::encode(&f.name, &q, max).0)
-        {
-            Some(name) => {
+        let encoded = s.files.get(s.idx).map(|f| {
+            let (enc, used) = prefix::encode(&f.name, &q, max);
+            (enc, used == f.name.len())
+        });
+        match encoded {
+            Some((_, false)) => {
+                self.protocol(
+                    now,
+                    format!("file name does not fit in a packet of {max} data bytes"),
+                    b"File name too long",
+                );
+            }
+            Some((name, true)) => {
                 s.pos = 0;
                 s.step = Step::File;
                 self.send_next(now, b'F', name);
@@ -1316,11 +1395,178 @@ mod tests {
     }
 
     #[test]
+    fn start_rejects_command_too_long() {
+        let now = Instant::now();
+        let mut c = Client::new(cfg());
+        // Default MAXL 80, check type 1: 77 data bytes fit.
+        assert_eq!(
+            c.start(now, Command::Host(vec![b'x'; 78])),
+            Err(StartError::TooLong { len: 78, max: 77 })
+        );
+        // Control characters double in size when encoded.
+        assert_eq!(
+            c.start(now, Command::Get(vec![b'\r'; 39])),
+            Err(StartError::TooLong { len: 78, max: 77 })
+        );
+        assert!(c.is_idle());
+        assert_eq!(c.poll_output(now), None);
+        c.start(now, Command::Host(vec![b'x'; 77])).unwrap();
+        let pkt = c.poll_output(now).unwrap();
+        assert_eq!(pkt, wire(0, b'C', &[b'x'; 77], T1));
+        assert_eq!(pkt[1], b'~' - 14); // LEN 80
+    }
+
+    /// Get: R out, S in, ACK out, F(1) in, ACK(1) out.
+    fn get_started(config: Config) -> (Client, Instant) {
+        let now = Instant::now();
+        let mut c = Client::new(config);
+        c.start(now, Command::Get(b"F".to_vec())).unwrap();
+        assert_eq!(c.poll_output(now), Some(wire(0, b'R', b"F", T1)));
+        c.handle_input(now, &wire(0, b'S', b"~* @-#Y3", T1));
+        assert_eq!(c.poll_output(now), Some(wire(0, b'Y', OURS, T1)));
+        (c, now)
+    }
+
+    #[test]
+    fn receive_timeout_naks_expected_packet() {
+        let config = Config {
+            retries: 2,
+            ..cfg()
+        };
+        let timeout = config.timeout;
+        let (mut c, mut t) = get_started(config);
+        // Timeout right after the S ACK: NAK(1), which the sender reads as ACK(0).
+        t += timeout;
+        c.handle_timeout(t);
+        assert_eq!(c.poll_output(t), Some(wire(1, b'N', b"", T3)));
+        c.handle_input(t, &wire(1, b'F', b"F", T3));
+        assert_eq!(c.poll_output(t), Some(wire(1, b'Y', b"", T3)));
+        // Timeouts while waiting for packet 2: NAK(2), counted as retries.
+        for _ in 0..2 {
+            t += timeout;
+            c.handle_timeout(t);
+            assert_eq!(c.poll_output(t), Some(wire(2, b'N', b"", T3)));
+        }
+        // A duplicate still gets the last ACK, not the NAK.
+        c.handle_input(t, &wire(1, b'F', b"F", T3));
+        assert_eq!(c.poll_output(t), Some(wire(1, b'Y', b"", T3)));
+        // The duplicate reset the retry count: two more NAKs, then give up.
+        for _ in 0..2 {
+            t += timeout;
+            c.handle_timeout(t);
+            assert_eq!(c.poll_output(t), Some(wire(2, b'N', b"", T3)));
+        }
+        t += timeout;
+        c.handle_timeout(t);
+        assert_eq!(
+            c.poll_output(t),
+            Some(wire(2, b'E', b"Too many retries", T3))
+        );
+        assert_eq!(
+            c.poll_event(),
+            Some(Event::FileStart {
+                name: b"F".to_vec()
+            })
+        );
+        assert_eq!(c.poll_event(), Some(Event::Error(Error::Timeout)));
+    }
+
+    #[test]
+    fn send_ignores_bad_check_for_other_seq() {
+        let mut t = send_start();
+        t += &out(1, b'F', b"A", T3);
+        // Late duplicate ACK(0) to S: type 1, fails the type 3 check, ignored.
+        t += &inp(0, b'Y', PEER_SMALL, T1);
+        // Damaged frame with an unrelated seq: ignored.
+        let mut bad = wire(5, b'Y', b"", T3);
+        bad[4] ^= 1;
+        t += &format!("< {}\n", trace::escape(&bad));
+        t += &inp(1, b'Y', b"", T3);
+        t += &out(2, b'Z', b"", T3);
+        let (c, ev) = replay_client(Command::Send(vec![file(b"A", b"")]), cfg(), &t);
+        assert_eq!(
+            ev,
+            vec![Event::FileStart {
+                name: b"A".to_vec()
+            }]
+        );
+        assert_eq!(c.retries, 0);
+    }
+
+    #[test]
+    fn send_file_name_too_long_fails() {
+        // Peer MAXL 20, type 3: 15 data bytes; the name needs 16.
+        let mut t = send_start();
+        t += &out(0, b'E', b"File name too long", T3);
+        let ev = replay(
+            Command::Send(vec![file(b"ABCDEFGHIJKLMNOP", b"x")]),
+            cfg(),
+            &t,
+        );
+        assert!(matches!(ev.as_slice(), [Event::Error(Error::Protocol(_))]));
+        // 15 bytes fit.
+        let mut t = send_start();
+        t += &out(1, b'F', b"ABCDEFGHIJKLMNO", T3);
+        let ev = replay(
+            Command::Send(vec![file(b"ABCDEFGHIJKLMNO", b"")]),
+            cfg(),
+            &t,
+        );
+        assert!(ev.is_empty());
+    }
+
+    #[test]
+    fn cancel_drops_queued_output() {
+        let pause = Duration::from_millis(100);
+        let config = Config {
+            packet_pause: pause,
+            ..cfg()
+        };
+        let now = Instant::now();
+        let mut c = Client::new(config);
+        c.start(now, Command::Host(b"6 7 *".to_vec())).unwrap();
+        assert!(c.poll_output(now).is_some());
+        // The ACK to S is held back by the pause when we cancel.
+        c.handle_input(now, b"\x01+ S~* @-#Y3$\r");
+        c.cancel(now);
+        assert_eq!(c.poll_output(now), Some(wire(1, b'E', b"Cancelled", T3)));
+        assert_eq!(c.poll_output(now + pause), None);
+        assert_eq!(c.next_timeout(), None);
+        assert_eq!(c.poll_event(), Some(Event::Error(Error::Cancelled)));
+    }
+
+    #[test]
+    fn huge_durations_do_not_overflow() {
+        let config = Config {
+            timeout: Duration::MAX,
+            packet_pause: Duration::MAX,
+            nak_grace: Duration::MAX,
+            ..cfg()
+        };
+        let now = Instant::now();
+        let mut c = Client::new(config);
+        c.start(now, Command::Host(b"6 7 *".to_vec())).unwrap();
+        assert!(c.poll_output(now).is_some());
+        // Deadline overflows: none.
+        assert_eq!(c.next_timeout(), None);
+        // Grace overflows: no deadline either.
+        c.handle_input(now, b"\x01# N3\r");
+        assert_eq!(c.next_timeout(), None);
+        // Pause overflows: the reply is not delayed.
+        c.handle_input(now, b"\x01+ S~* @-#Y3$\r");
+        let ack = wire(0, b'Y', &c.ours.encode(), T1);
+        assert_eq!(c.poll_output(now), Some(ack));
+        c.handle_timeout(now);
+        assert_eq!(c.poll_output(now), None);
+        assert_eq!(c.poll_event(), None);
+    }
+
+    #[test]
     fn busy_and_cancel() {
         let now = Instant::now();
         let mut c = Client::new(cfg());
         c.start(now, Command::Directory).unwrap();
-        assert_eq!(c.start(now, Command::Finish), Err(Busy));
+        assert_eq!(c.start(now, Command::Finish), Err(StartError::Busy));
         assert!(c.poll_output(now).is_some());
         c.cancel(now);
         assert_eq!(c.poll_output(now), Some(wire(0, b'E', b"Cancelled", T1)));
