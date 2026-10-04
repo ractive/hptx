@@ -2,7 +2,7 @@
 title: "Iteration 1: Skeleton and CI"
 type: iteration
 date: 2026-10-04
-status: in-progress
+status: completed
 branch: iter-1/skeleton-and-ci
 tags:
   - iteration
