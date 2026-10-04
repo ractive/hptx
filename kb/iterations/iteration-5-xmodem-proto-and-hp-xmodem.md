@@ -16,6 +16,11 @@ Read first: wiki `protocols/xmodem`, `xmodem-hp`, `xserv`,
 
 ## Tasks
 
+- [ ] Same seam as `kermit-proto` (decision log 2026-10-04): `start`,
+  `handle_input`, `handle_timeout` and `poll_output` take `now`, one packet
+  per `poll_output`, events out, whole file in memory, no I/O dependencies.
+  Reuse the `kermit_proto::trace` format and the `record` example pattern
+  (`just record-trace`) for XModem traces replayed as unit tests.
 - [ ] 128-byte and 1k blocks, checksum and CRC-16 (MSB-first #1021), receiver
   start characters NAK / `C`, fallback to checksum after failed CRC attempts
   (the 48G has no CRC at all).
