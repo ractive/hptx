@@ -2,7 +2,7 @@
 type: iteration
 title: "Iteration 12: audit fixes"
 date: 2026-10-06
-status: in-progress
+status: completed
 tags:
   - iteration
   - core
