@@ -2,7 +2,7 @@
 type: iteration
 title: "Iteration 11a: CI, supply chain and release dry run"
 date: 2026-10-05
-status: in-progress
+status: completed
 tags:
   - iteration
   - infrastructure
@@ -46,7 +46,7 @@ wall time before and after in this file.
   default branch, so it also triggers on a `pull_request` (and an `iter-*/**`
   push) that changes `release.yml`: that is the dry run. Record the artifact
   sizes here.
-- [ ] Decision-log entry: supply-chain policy and the release shape.
+- [x] Decision-log entry: supply-chain policy and the release shape.
 
 ## Acceptance criteria
 
