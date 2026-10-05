@@ -18,7 +18,7 @@
 //! HP specifics live in the caller: starting `XRECV`/`XSEND` on the
 //! calculator, and stripping the padding of the last block (the receiver hands
 //! back every byte it received; [`Event::FileEnd`] says how much padding there
-//! can be). wiki: protocols/xmodem, protocols/xmodem-hp.
+//! can be).
 //!
 //! # Starting a transfer on the calculator
 //!
@@ -42,18 +42,26 @@
 //! - [`Transfer::handle_timeout`] tells the machine that time has passed; call
 //!   it when [`Transfer::next_timeout`] is reached (it does nothing early).
 //! - [`Transfer::poll_output`] hands out the next write: one whole block, one
-//!   control byte, or the CAN sequence. Write each in one go: inter-byte gaps
-//!   overrun the HP's receiver.
+//!   control byte, or the CAN sequence. The transport must put each on the
+//!   wire as one unit, without inter-byte gaps, because gaps overrun the HP's
+//!   receiver. `write_all` alone does not promise that (it may issue several
+//!   writes); it is enough where one write of a buffer this size is not
+//!   split, as on a TCP socket to an emulator or a serial port with a large
+//!   enough output buffer.
 //! - [`Transfer::poll_event`] yields [`Event`]s: `Started`, `Progress`, a
 //!   receiver's `FileEnd`, and finally exactly one `Done` or `Error`.
 //! - [`Transfer::next_timeout`] is the earliest instant at which the machine
 //!   wants to be called again (reply deadline, start-character interval,
-//!   inter-byte timeout, quiet line before a NAK). Use it as the read timeout.
+//!   inter-byte timeout, quiet line before a NAK, end of the linger). Use it
+//!   as the read timeout.
 //!
 //! Every call that can queue output takes `now`, so retransmit deadlines are
 //! computed from the caller's clock. After `Done` or `Error` keep calling
 //! `poll_output` until it returns `None`: the final ACK or the CANs may still
-//! be queued.
+//! be queued. A receiver then lingers for [`Config::linger`] to re-ACK a
+//! retransmitted EOT in case the final ACK was lost; keep driving it until
+//! [`Transfer::next_timeout`] is `None`, or [`Transfer::start`] the next
+//! transfer, which ends the linger.
 //!
 //! # Driver loop
 //!
@@ -73,7 +81,8 @@
 //!     loop {
 //!         let now = Instant::now();
 //!         while let Some(bytes) = xfer.poll_output(now) {
-//!             link.write_all(&bytes)?; // one block or control byte, one write
+//!             // A whole block per call; the link must not split it.
+//!             link.write_all(&bytes)?;
 //!         }
 //!         while let Some(event) = xfer.poll_event() {
 //!             match event {

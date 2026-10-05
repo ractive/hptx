@@ -235,3 +235,69 @@ Decisions already made. Do not re-litigate; add a dated entry to change one.
   can only ever capture the server banner; `pict` fetches the graphics
   screen with `PICT RCL` (via `HPTXTMP`). The display itself is captured by
   hand (`LCD→ 'S' STO` before SERVER, then `get` and `grob to-png`).
+
+## 2026-10-05 (publishing and the relation to saturnus)
+
+- **Only `kermit-proto` and `xmodem-proto` are published to crates.io.**
+  hptx-cli stays git-only (release binaries, `cargo install --git`):
+  publishing it would chain every hptx release behind a saturnus release
+  for the small gain of `cargo install hptx`. Dropped (user).
+- **hptx is the cable tool.** CLI and REPL over Kermit and XModem, for real
+  hardware and for emulators treated as hardware. Agents drive a real
+  calculator through the CLI's JSON mode; there is no hptx MCP server.
+- **Two repositories, not a monorepo.** Different products, cadences and
+  knowledge bases. The crate graph is acyclic today: saturnus-mcp depends
+  on hptx-core (with hptx-core's `saturnus` feature off), hptx-core's
+  optional in-process transport depends on the saturnus core crate; the
+  mutual git pins are a coordination cost, not a build cycle.
+- **Open (two plan reviews on 2026-10-05):** whether saturnus-mcp stays as
+  the agent's emulator session (depending on hptx-core, the Kermit layer
+  being needed for execution and error text) or is dropped in favour of
+  `saturnus run` plus the hptx CLI; and whether hptx-core's `object.rs`
+  adopts the new `saturnus-objects` decoder (it covers the body decoder,
+  not the file headers, padding, charset and reply parsers). Until decided:
+  no adapter crate, no `hptx-transport` crate, no `:lcd`; the in-process
+  transport stays in hptx-core and should use saturnus-drive's autostart
+  so it boots the 48SX, 48GX and 49G.
+- **Whole-crate audits at milestones** (user): before publishing a crate,
+  before the hardware iteration and before a release, a review-only vehicle
+  PR branched from the iteration 1 merge with the current sources copied on
+  is reviewed by all three reviewers; one regression test per finding; no
+  fuzz or adversarial suites. The hardware iteration precedes the first
+  release.
+
+## 2026-10-05 (iteration 10)
+
+- **Linger after the final ACK.** Both protocol machines keep answering a
+  retransmitted `B` (Kermit) or EOT (XModem) for `Config::linger` after the
+  final ACK (default 1 s, `ZERO` off, deadline fixed at the start); `Done`
+  is emitted once; `is_idle()` is false meanwhile; `start()` ends it. The
+  HP retransmits a lost-ACK `B` only after the TIME it was sent (20 s), so
+  the default catches an immediately damaged ACK, not a long silence.
+  `Session` sets the Kermit linger to its turnaround (200 ms) and starts the
+  turnaround at `Done`, so no transaction got slower.
+- **Receive size caps.** `Config::max_size` (default 4 MiB) in both crates;
+  `Error::TooLarge { limit }`, CAN CAN CAN or an E packet.
+- **A `B` before the file's `Z`, or with `X` text buffered, is a protocol
+  error**, not `Done`.
+- **PADC**: a blank Send-Init field is the default (NUL), per the Kermit
+  manual; a reviewer's claim that a space means pad byte 0x60 was rejected.
+- **`Packet::encode` and `encode_block` return `Result`** with
+  `codec::EncodeError`; `#[non_exhaustive]` on the public enums and configs
+  of both crates, including `Check`, `BlockSize`, `BlockCheck` and
+  `FrameError` after the PR #13 review (so `Config { x, ..Default::default() }`
+  is no longer possible downstream; set fields on a default value instead);
+  `start()` drops the previous transaction's queue, events and peer
+  parameters.
+- **A NAK before the first ACK only switches to checksum from HP's `D` mode**
+  (the 49G's fallback); a standard CRC-16 receiver that NAKs a damaged first
+  block gets the same CRC block again (PR #13 review). Re-ACKs during the
+  linger never pile up: at most one is queued. The XModem driver's linger is
+  short like the Kermit one, and a transport error during the linger after a
+  completed transfer does not discard the transfer.
+- **XModem sender before the first ACK** re-selects the check and block size
+  from any start character (49G falls back D -> NAK); the receiver holds the
+  start-character deadline while a block is arriving.
+- **Publishing**: `cargo publish --dry-run -p kermit-proto -p xmodem-proto`
+  is the verification and the publish command (both at once); the user
+  publishes. No `rust-version` until an MSRV is verified.

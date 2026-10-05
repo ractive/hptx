@@ -22,3 +22,11 @@ Tests must help without slowing the project down (lesson from ff-rdp and hyalo).
 - No heavy dev-dependencies in the sans-IO crates. No fuzzing, property or
   snapshot tests until a bug justifies one.
 - `just test` runs the fast suite; `just e2e` the emulator suite.
+- Whole-crate audits at milestones instead of adversarial suites
+  (2026-10-05): before publishing a crate, before the hardware iteration and
+  before a release, a review-only PR branched from the iteration 1 merge
+  (`26618c4`) with the current sources copied on is reviewed by the
+  `review-pr` skill's three reviewers (claude, glm, greptile); findings are
+  fixed in a normal iteration with one regression test each; the vehicle PR
+  is closed. No fuzz, property or adversarial suites until a bug justifies
+  one.

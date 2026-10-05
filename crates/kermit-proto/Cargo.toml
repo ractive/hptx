@@ -1,9 +1,14 @@
 [package]
 name = "kermit-proto"
+description = "Sans-IO Kermit client (user Kermit) for the Kermit servers of HP 48 and 49 calculators"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+documentation = "https://docs.rs/kermit-proto"
+readme = "README.md"
+keywords = ["kermit", "sans-io", "serial", "file-transfer", "hp48"]
+categories = ["network-programming", "hardware-support"]
 
 [lints]
 workspace = true

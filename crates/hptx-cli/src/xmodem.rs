@@ -32,6 +32,7 @@ pub fn check_name(check: Check) -> &'static str {
         Check::Checksum => "checksum",
         Check::Crc16 => "CRC-16",
         Check::HpCrc => "HP CRC",
+        _ => "other check",
     }
 }
 

@@ -70,11 +70,16 @@ impl Default for XmodemOptions {
     /// checksum; send 1k blocks when the receiver asks for a CRC, 128-byte
     /// blocks when it asks for checksum.
     fn default() -> Self {
+        let mut xmodem = Config::default();
+        xmodem.block_size = BlockSize::B1k;
+        // The receiver's linger after the EOT ACK delays the end of every
+        // receive by its length. There is no turnaround to hide it in (the
+        // user restarts SERVER by hand), so keep it as short as the Kermit
+        // session's (`Options::default`): it still answers an EOT repeated
+        // at once after a damaged ACK.
+        xmodem.linger = Duration::from_millis(200);
         XmodemOptions {
-            xmodem: Config {
-                block_size: BlockSize::B1k,
-                ..Config::default()
-            },
+            xmodem,
             start_timeout: Duration::from_secs(60),
             drain: Duration::ZERO,
         }
@@ -98,28 +103,24 @@ impl XmodemOptions {
             Model::Hp48Sx => Err(Error::Unsupported(
                 "the HP 48S/SX has no XModem; use Kermit".into(),
             )),
-            Model::Hp49G => Ok(XmodemOptions {
-                xmodem: Config {
-                    check: Check::HpCrc,
-                    // Bounded by the start window, not by the count.
-                    crc_attempts: u32::MAX,
-                    block_size: BlockSize::B1k,
-                    ..base.xmodem
-                },
-                ..base
-            }),
-            Model::Hp48Gx => Ok(XmodemOptions {
-                xmodem: Config {
-                    check: Check::Checksum,
-                    block_size: BlockSize::B128,
-                    // Also the pace of the start NAKs: with 10 s the user
-                    // waits up to 10 s after typing XSEND. Conn4x uses 2 s
-                    // for data (wiki: protocols/xmodem-hp).
-                    timeout: Duration::from_secs(3),
-                    ..base.xmodem
-                },
-                ..base
-            }),
+            Model::Hp49G => {
+                let mut xmodem = base.xmodem.clone();
+                xmodem.check = Check::HpCrc;
+                // Bounded by the start window, not by the count.
+                xmodem.crc_attempts = u32::MAX;
+                xmodem.block_size = BlockSize::B1k;
+                Ok(XmodemOptions { xmodem, ..base })
+            }
+            Model::Hp48Gx => {
+                let mut xmodem = base.xmodem.clone();
+                xmodem.check = Check::Checksum;
+                xmodem.block_size = BlockSize::B128;
+                // Also the pace of the start NAKs: with 10 s the user waits
+                // up to 10 s after typing XSEND. Conn4x uses 2 s for data
+                // (wiki: protocols/xmodem-hp).
+                xmodem.timeout = Duration::from_secs(3);
+                Ok(XmodemOptions { xmodem, ..base })
+            }
             Model::Unknown => Ok(base),
         }
     }
@@ -130,11 +131,10 @@ impl XmodemOptions {
         let start = self
             .start_timeout
             .clamp(MIN_START_TIMEOUT, MAX_START_TIMEOUT);
-        Config {
-            start_timeout: start,
-            recv_start_timeout: Some(start),
-            ..self.xmodem.clone()
-        }
+        let mut config = self.xmodem.clone();
+        config.start_timeout = start;
+        config.recv_start_timeout = Some(start);
+        config
     }
 }
 
@@ -280,10 +280,16 @@ impl XmodemSession {
         };
         let mut result: Option<Result<()>> = None;
         let mut buf = [0u8; 2048];
-        loop {
+        'run: loop {
             let now = Instant::now();
             while let Some(bytes) = xfer.poll_output(now) {
-                self.transport.write_packet(&bytes)?;
+                match self.transport.write_packet(&bytes) {
+                    Ok(()) => {}
+                    // A re-ACK during the linger: the file is complete, a
+                    // failing link does not undo it.
+                    Err(_) if matches!(result, Some(Ok(()))) => break 'run,
+                    Err(e) => return Err(e.into()),
+                }
             }
             while let Some(event) = xfer.poll_event() {
                 progress(&event);
@@ -304,6 +310,7 @@ impl XmodemSession {
                         result = Some(Err(Error::Xmodem(xmodem_proto::Error::Timeout)));
                     }
                     Event::Error(e) => result = Some(Err(Error::Xmodem(e))),
+                    _ => {}
                 }
             }
             if result.is_some() && xfer.next_timeout().is_none() {
@@ -323,7 +330,13 @@ impl XmodemSession {
                 (a, b) => a.or(b),
             };
             let wait = until.map_or(IDLE_WAIT, |t| t.saturating_duration_since(now));
-            let n = self.transport.read(&mut buf, wait.max(MIN_WAIT))?;
+            let n = match self.transport.read(&mut buf, wait.max(MIN_WAIT)) {
+                Ok(n) => n,
+                // Lingering after Done: the file is complete, a failing
+                // link only ends the linger.
+                Err(_) if matches!(result, Some(Ok(()))) => break,
+                Err(e) => return Err(e.into()),
+            };
             let now = Instant::now();
             if n > 0 {
                 xfer.handle_input(now, buf.get(..n).unwrap_or_default());
@@ -671,7 +684,7 @@ mod tests {
             while data.len() < 128 {
                 data.push(fill(data.len()));
             }
-            let mut block = encode_block(st.blk, BlockSize::B128, &data, 0, check);
+            let mut block = encode_block(st.blk, BlockSize::B128, &data, 0, check).unwrap();
             if self.behaviour.corrupt_block == Some(st.blk) && !st.mangled.contains(&st.blk) {
                 st.mangled.push(st.blk);
                 block[10] ^= 0xFF;
@@ -786,6 +799,40 @@ mod tests {
             }
             Ok(n)
         }
+    }
+
+    /// [`FakeCalc`] whose link fails for reads once the transfer is done
+    /// (sender: our final ACK written).
+    struct LostAfterDone(FakeCalc);
+
+    impl Transport for LostAfterDone {
+        fn write_packet(&mut self, packet: &[u8]) -> io::Result<()> {
+            self.0.write_packet(packet)
+        }
+
+        fn read(&mut self, buf: &mut [u8], timeout: Duration) -> io::Result<usize> {
+            if self.0.state().done {
+                return Err(io::Error::other("link lost"));
+            }
+            self.0.read(buf, timeout)
+        }
+    }
+
+    #[test]
+    fn link_lost_while_lingering_keeps_the_file() {
+        let file = all_bytes(H49);
+        let peer = FakeCalc::sender(file.clone(), Behaviour::hp49());
+        let mut options = fast(XmodemOptions::for_model(Model::Hp49G).unwrap());
+        options.xmodem.linger = Duration::from_secs(5);
+        let mut s = XmodemSession::new(Box::new(LostAfterDone(peer.clone())), options);
+        let start = Instant::now();
+        let got = s.receive().unwrap();
+        assert_eq!(got.data, file);
+        assert!(peer.state().done);
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "linger ended early"
+        );
     }
 
     fn big_file(header: &[u8; 8]) -> Vec<u8> {
@@ -999,7 +1046,7 @@ mod tests {
     fn continuous_noise_still_ends() {
         let mut options = fast(XmodemOptions::default());
         options.xmodem.retries = 1;
-        let first = encode_block(1, BlockSize::B128, b"x", 0, Check::HpCrc);
+        let first = encode_block(1, BlockSize::B128, b"x", 0, Check::HpCrc).unwrap();
         let line = NoisyLine {
             reads: 0,
             first: Some(first),

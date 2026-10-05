@@ -59,8 +59,16 @@ impl InitParams {
         ]
     }
 
-    /// Missing fields, and blank (b' ') maxl/time/npad/eol/qctl/chkt fields, get the defaults.
-    /// maxl 0 -> 80. Never fails; anything beyond field 9 is ignored.
+    /// Missing fields, and blank (b' ') maxl/time/npad/padc/eol/qctl/chkt
+    /// fields, get the defaults. maxl 0 -> 80. Never fails; anything beyond
+    /// field 9 is ignored.
+    ///
+    /// A blank PADC is the default NUL, not ctl(b' ') = 0x60: the Kermit
+    /// Protocol Manual (6th ed., Send-Init) lets any field be "left blank,
+    /// i.e. contain a space, to accept or specify default values", and PADC
+    /// is "the control character I need for padding", which 0x60 is not. For
+    /// the same reason a PADC that does not decode to a control character
+    /// (0-31 or 127) also gets the default.
     pub fn decode(data: &[u8]) -> Self {
         let mut p = InitParams::default();
         let field = |i: usize| data.get(i).copied().filter(|&c| c != b' ');
@@ -76,8 +84,10 @@ impl InitParams {
         if let Some(c) = field(2) {
             p.npad = unchar(c);
         }
-        if let Some(c) = field(3) {
-            p.padc = ctl(c);
+        if let Some(c) = field(3).map(ctl)
+            && (c < 32 || c == 127)
+        {
+            p.padc = c;
         }
         if let Some(c) = field(4) {
             p.eol = unchar(c);
@@ -221,6 +231,25 @@ mod tests {
         assert_eq!(InitParams::decode(b"         "), InitParams::default());
         assert_eq!(InitParams::decode(b"\x20").maxl, 80);
         assert_eq!(InitParams::decode(b"~4 @-#Y3~extra"), ours());
+    }
+
+    #[test]
+    fn decode_padc() {
+        // Blank PADC: the default NUL, as for every other blank field.
+        let p = InitParams::decode(b"~*\"   ");
+        assert_eq!((p.npad, p.padc), (2, 0));
+        assert_eq!(InitParams::decode(b"~*\"@").padc, 0);
+        assert_eq!(InitParams::decode(b"~*\"?").padc, 0x7F);
+        assert_eq!(InitParams::decode(b"~*\"A").padc, 0x01);
+        // Not a control character: default.
+        assert_eq!(InitParams::decode(b"~*\"`").padc, 0);
+        assert_eq!(InitParams::decode(b"~*\"!").padc, 0);
+        // Round trip of every control character.
+        for padc in (0..32).chain([127]) {
+            let mut o = ours();
+            o.padc = padc;
+            assert_eq!(InitParams::decode(&o.encode()).padc, padc);
+        }
     }
 
     #[test]

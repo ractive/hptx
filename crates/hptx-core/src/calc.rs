@@ -467,11 +467,10 @@ impl Calculator {
         }
         // The warm start ends server mode: no reply ever comes.
         let previous = self.session.config().clone();
-        self.session.set_config(kermit_proto::Config {
-            timeout: RESTORE_TIMEOUT,
-            retries: 0,
-            ..previous.clone()
-        });
+        let mut restore = previous.clone();
+        restore.timeout = RESTORE_TIMEOUT;
+        restore.retries = 0;
+        self.session.set_config(restore);
         let result = self.host(&format!(":0:{RESTORE_VAR} RESTORE"));
         self.session.set_config(previous);
         self.mode = None;
@@ -682,7 +681,6 @@ mod tests {
     use super::*;
     use crate::session::Options;
     use crate::transport::MemoryTransport;
-    use kermit_proto::Config;
     use kermit_proto::codec::{BlockCheck, Deframer, Framing, Packet, parse_frame};
     use kermit_proto::prefix::{self, Quoting};
     use std::sync::{Arc, Mutex};
@@ -701,7 +699,7 @@ mod tests {
         let mut deframer = Deframer::new();
         let mut queue: Vec<Packet> = Vec::new();
         move |bytes| {
-            let wire = |p: &Packet| p.encode(check, &Framing::default());
+            let wire = |p: &Packet| p.encode(check, &Framing::default()).unwrap();
             deframer.push(bytes);
             let mut out = Vec::new();
             while let Some(frame) = deframer.next_frame() {
@@ -749,11 +747,12 @@ mod tests {
     fn calc(reply: impl FnMut(&str) -> String + Send + 'static) -> (Calculator, Log) {
         let log: Log = Arc::default();
         let transport = MemoryTransport::new(fake_server(Arc::clone(&log), reply));
+        let mut kermit = Options::default().kermit;
+        kermit.timeout = Duration::from_millis(200);
+        // The fake server never repeats a B: no linger, no wait.
+        kermit.linger = Duration::ZERO;
         let options = Options {
-            kermit: Config {
-                timeout: Duration::from_millis(200),
-                ..Config::default()
-            },
+            kermit,
             drain: Duration::ZERO,
             turnaround: Duration::ZERO,
         };
