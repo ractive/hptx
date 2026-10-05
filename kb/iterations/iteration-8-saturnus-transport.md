@@ -66,5 +66,12 @@ feature. `just e2e-saturnus` runs the suite in-process.
   about 65 s. saturnus's ROM code runs slower than saturnng's in emulated
   time (an empty 2000-pass loop takes 48880 ticks there, 145 on
   saturnng); that is a saturnus finding, tracked there.
+- Review fixes: `open` fails with `Error::Emulator` when the ROM never
+  shows the boot prompt, a key never settles or the server never sends its
+  first idle NAK (a 256 KB zero file: "did not start the Kermit server: no
+  boot prompt within 60 s"); unit tests for a zero and a short ROM. CI
+  runs clippy with `--all-features` and `cargo test -p hptx-core
+  --features saturnus` (no ROM there, so no in-process e2e). With the NAK
+  check the in-process suite takes 18.5 s.
 - Default build, `just lint` and `just test` are unchanged without the
   feature; clippy and tests also pass with it.
