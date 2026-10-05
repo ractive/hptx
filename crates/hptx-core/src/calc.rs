@@ -550,10 +550,10 @@ impl Calculator {
         }
         let mut switched_to_rpn = false;
         if model == Model::Hp49G {
-            let flag = self.query("-95 FS?", 1)?;
+            let flag = self.query("-95. FS?", 1)?;
             let alg = flag.first().and_then(|v| parse_real(v)) == Some(1.0);
             if alg {
-                self.exec(&["-95 CF".to_string()])?;
+                self.exec(&["-95. CF".to_string()])?;
                 switched_to_rpn = true;
             }
         }
@@ -865,7 +865,7 @@ mod tests {
         let (mut c, log) = calc(|cmd| match cmd {
             "VERSION" => G49_VERSION.into(),
             "G D" => "{ HOME } 2000.\r\nHPTXX 10.5 String 1234.\r\n".into(),
-            "-95 FS?" => "1:                     1.\r\n".into(),
+            "-95. FS?" => "1:                     1.\r\n".into(),
             _ => EMPTY.into(),
         });
         let plan = c
@@ -874,7 +874,7 @@ mod tests {
         assert_eq!(
             sent(&log),
             [
-                "VERSION", "DROP2", "G D", "-95 FS?", "DROP", "-95 CF", "G F"
+                "VERSION", "DROP2", "G D", "-95. FS?", "DROP", "-95. CF", "G F"
             ]
         );
         assert_eq!(plan.model, Model::Hp49G);

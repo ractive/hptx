@@ -115,7 +115,8 @@ const DEFAULT_START_TIMEOUT: u64 = 60;
 fn xmodem_conflict_hint(flag: &str) -> &'static str {
     match flag {
         "--overwrite" => {
-            "XModem cannot replace a variable (the 49G stores NAME.1, the 48G/GX refuses):              drop --protocol xmodem, or `hptx rm NAME` first"
+            "XModem cannot replace a variable (the 49G stores NAME.1, the 48G/GX refuses): \
+             drop --protocol xmodem, or `hptx rm <NAME>` first"
         }
         _ => "XModem moves the file byte for byte; drop the flag or use --protocol kermit",
     }

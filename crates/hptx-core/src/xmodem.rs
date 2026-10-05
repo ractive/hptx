@@ -158,7 +158,8 @@ pub struct XmodemReceived {
     /// Bytes received, padding included.
     pub received: usize,
     /// Size of the last block (128 or 1024; 0 for an empty transfer), the
-    /// padding allowance passed to [`strip_padding`].
+    /// padding allowance passed to [`strip_padding`] is this minus one, the
+    /// most padding a sender can add.
     pub last_block: usize,
     /// Padding bytes cut. `None` when the object-length walk failed (not an
     /// HP binary object, unknown prolog, or more excess than one block):
@@ -235,7 +236,11 @@ impl XmodemSession {
             .ok()
             .and_then(|i| i.size_nibbles)
             .map(|n| HEADER_LEN + n.div_ceil(2));
-        let data = strip_padding(&raw, last_block).to_vec();
+        // Padding never fills a whole block (a sender does not send a block
+        // of pure padding), so a cut may remove at most last_block - 1
+        // bytes; a walk that comes out a full block short leaves the data
+        // untouched instead of losing real bytes.
+        let data = strip_padding(&raw, last_block.saturating_sub(1)).to_vec();
         let stripped = match object_len {
             Some(len) if data.len() == len => Some(raw.len() - len),
             _ => None,
@@ -455,6 +460,18 @@ mod tests {
         assert_eq!(got.check, Check::HpCrc);
         assert_eq!((got.received, got.last_block), (384, 128));
         assert_eq!(got.stripped, Some(384 - 269));
+    }
+
+    #[test]
+    fn allowance_is_one_less_than_a_block() {
+        // A walk that ends exactly one block early must not cut a whole
+        // block of real data; one byte less is the most padding possible.
+        let object = all_bytes(H49);
+        let mut raw = object.clone();
+        raw.extend(std::iter::repeat_n(0u8, 128));
+        assert_eq!(strip_padding(&raw, 127).len(), raw.len());
+        raw.pop();
+        assert_eq!(strip_padding(&raw, 127), &object[..]);
     }
 
     #[test]
