@@ -25,6 +25,7 @@ pub const fn ctl(x: u8) -> u8 {
 
 /// Block check type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum BlockCheck {
     /// Single-character arithmetic checksum.
     Type1,
@@ -211,6 +212,7 @@ impl Default for Framing {
 
 /// Reasons a frame is rejected by [`parse_frame`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FrameError {
     /// LEN out of range or inconsistent with the frame size.
     BadLength,

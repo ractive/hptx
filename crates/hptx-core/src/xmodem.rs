@@ -72,6 +72,12 @@ impl Default for XmodemOptions {
     fn default() -> Self {
         let mut xmodem = Config::default();
         xmodem.block_size = BlockSize::B1k;
+        // The receiver's linger after the EOT ACK delays the end of every
+        // receive by its length. There is no turnaround to hide it in (the
+        // user restarts SERVER by hand), so keep it as short as the Kermit
+        // session's (`Options::default`): it still answers an EOT repeated
+        // at once after a damaged ACK.
+        xmodem.linger = Duration::from_millis(200);
         XmodemOptions {
             xmodem,
             start_timeout: Duration::from_secs(60),
@@ -274,10 +280,16 @@ impl XmodemSession {
         };
         let mut result: Option<Result<()>> = None;
         let mut buf = [0u8; 2048];
-        loop {
+        'run: loop {
             let now = Instant::now();
             while let Some(bytes) = xfer.poll_output(now) {
-                self.transport.write_packet(&bytes)?;
+                match self.transport.write_packet(&bytes) {
+                    Ok(()) => {}
+                    // A re-ACK during the linger: the file is complete, a
+                    // failing link does not undo it.
+                    Err(_) if matches!(result, Some(Ok(()))) => break 'run,
+                    Err(e) => return Err(e.into()),
+                }
             }
             while let Some(event) = xfer.poll_event() {
                 progress(&event);
@@ -318,7 +330,13 @@ impl XmodemSession {
                 (a, b) => a.or(b),
             };
             let wait = until.map_or(IDLE_WAIT, |t| t.saturating_duration_since(now));
-            let n = self.transport.read(&mut buf, wait.max(MIN_WAIT))?;
+            let n = match self.transport.read(&mut buf, wait.max(MIN_WAIT)) {
+                Ok(n) => n,
+                // Lingering after Done: the file is complete, a failing
+                // link only ends the linger.
+                Err(_) if matches!(result, Some(Ok(()))) => break,
+                Err(e) => return Err(e.into()),
+            };
             let now = Instant::now();
             if n > 0 {
                 xfer.handle_input(now, buf.get(..n).unwrap_or_default());
@@ -781,6 +799,40 @@ mod tests {
             }
             Ok(n)
         }
+    }
+
+    /// [`FakeCalc`] whose link fails for reads once the transfer is done
+    /// (sender: our final ACK written).
+    struct LostAfterDone(FakeCalc);
+
+    impl Transport for LostAfterDone {
+        fn write_packet(&mut self, packet: &[u8]) -> io::Result<()> {
+            self.0.write_packet(packet)
+        }
+
+        fn read(&mut self, buf: &mut [u8], timeout: Duration) -> io::Result<usize> {
+            if self.0.state().done {
+                return Err(io::Error::other("link lost"));
+            }
+            self.0.read(buf, timeout)
+        }
+    }
+
+    #[test]
+    fn link_lost_while_lingering_keeps_the_file() {
+        let file = all_bytes(H49);
+        let peer = FakeCalc::sender(file.clone(), Behaviour::hp49());
+        let mut options = fast(XmodemOptions::for_model(Model::Hp49G).unwrap());
+        options.xmodem.linger = Duration::from_secs(5);
+        let mut s = XmodemSession::new(Box::new(LostAfterDone(peer.clone())), options);
+        let start = Instant::now();
+        let got = s.receive().unwrap();
+        assert_eq!(got.data, file);
+        assert!(peer.state().done);
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "linger ended early"
+        );
     }
 
     fn big_file(header: &[u8; 8]) -> Vec<u8> {

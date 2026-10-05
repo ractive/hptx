@@ -28,6 +28,7 @@ pub const SUB: u8 = 0x1A;
 
 /// The block check a transfer uses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Check {
     /// One byte: the sum of the data bytes mod 256. The only mode the 48G
     /// series knows.
@@ -89,6 +90,7 @@ impl Check {
 
 /// Data size of a block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BlockSize {
     /// 128 bytes, header SOH.
     B128,

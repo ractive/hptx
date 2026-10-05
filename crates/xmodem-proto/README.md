@@ -26,7 +26,9 @@ calculator ROMs.
 - `Transfer::handle_timeout(now)` tells the machine time has passed; call it
   when `Transfer::next_timeout()` is reached (it does nothing early).
 - `Transfer::poll_output(now)` hands out the next write: one whole block, one
-  control byte, or the CAN sequence. Write each in one go.
+  control byte, or the CAN sequence.
+  The transport must put it on the wire as one unit, without inter-byte
+  gaps (see the HP notes below).
 - `Transfer::poll_event()` yields events: `Started`, `Progress`, a receiver's
   `FileEnd` and finally exactly one `Done` or `Error`.
 - `Transfer::next_timeout()` is when the machine wants to be called again; use
@@ -55,7 +57,8 @@ fn main() -> std::io::Result<()> {
     loop {
         let now = Instant::now();
         while let Some(bytes) = xfer.poll_output(now) {
-            link.write_all(&bytes)?; // one block or control byte, one write
+            // A whole block per call; the link must not split it.
+            link.write_all(&bytes)?;
         }
         while let Some(event) = xfer.poll_event() {
             match event {
@@ -103,8 +106,12 @@ fn main() -> std::io::Result<()> {
 - The 49G does not convert a received object with more than about 255 bytes of
   padding: with 1k blocks the sender sends the tail in 128-byte blocks
   (`Config::short_tail`).
-- Write each block with a single write: inter-byte gaps overrun the HP's
-  receiver.
+- Each block must reach the wire as one unit: inter-byte gaps overrun the
+  HP's receiver. This is a requirement on the transport, not something
+  `write_all` guarantees (it may split the buffer into several writes). On a
+  TCP socket to an emulator, or a serial port whose driver buffers a whole
+  1k block, one `write_all` per block is enough; otherwise buffer the block
+  and hand it to the port in one call.
 
 ## License
 

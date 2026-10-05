@@ -27,7 +27,9 @@ calculators use neither); attribute packets are acknowledged and ignored.
 - `Client::handle_timeout(now)` tells the client time has passed; call it when
   `Client::next_timeout()` is reached (it does nothing early).
 - `Client::poll_output(now)` hands out the next packet to write: exactly one
-  packet including padding and EOL. Write each in one go.
+  packet including padding and EOL.
+  The transport must put it on the wire as one unit, without inter-byte
+  gaps (see the HP notes below).
 - `Client::poll_event()` yields events: `FileStart`, `Data`, `Progress`,
   `FileEnd`, `ServerText` and finally exactly one `Done` or `Error`.
 - `Client::next_timeout()` is when the client wants to be called again; use it
@@ -58,7 +60,8 @@ fn main() -> std::io::Result<()> {
     loop {
         let now = Instant::now();
         while let Some(packet) = client.poll_output(now) {
-            link.write_all(&packet)?; // one packet, one write
+            // A whole packet per call; the link must not split it.
+            link.write_all(&packet)?;
         }
         while let Some(event) = client.poll_event() {
             match event {
@@ -88,8 +91,12 @@ fn main() -> std::io::Result<()> {
 
 ## HP calculator notes
 
-- Write each packet with a single write: inter-byte gaps overrun the HP's
-  receiver.
+- Each packet must reach the wire as one unit: inter-byte gaps overrun the
+  HP's receiver. This is a requirement on the transport, not something
+  `write_all` guarantees (it may split the buffer into several writes). On a
+  TCP socket to an emulator, or a serial port whose driver buffers a whole
+  packet, one `write_all` per packet is enough; otherwise buffer the packet
+  and hand it to the port in one call.
 - In server mode the HP periodically NAKs packet 0 while idle, so a stale NAK
   can be waiting right after connecting. Discard input for about 0.5 s after
   opening the link; the client also tolerates a stale NAK that slips through

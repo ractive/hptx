@@ -18,9 +18,12 @@
 //!   when [`Client::next_timeout`] is reached (or whenever a read times out;
 //!   it does nothing early).
 //! - [`Client::poll_output`] hands out the next packet to write. Each result is
-//!   exactly one packet including padding and EOL; write it in one go
-//!   (`write_all` of the whole buffer), because inter-byte gaps overrun the
-//!   HP's receiver.
+//!   exactly one packet including padding and EOL. The transport must put it
+//!   on the wire as one unit, without inter-byte gaps, because gaps overrun
+//!   the HP's receiver. `write_all` alone does not promise that (it may
+//!   issue several writes); it is enough where one write of a short buffer
+//!   is not split, as on a TCP socket to an emulator or a serial port with
+//!   a large enough output buffer.
 //! - [`Client::poll_event`] yields [`Event`]s: file starts, data, progress,
 //!   server text and finally exactly one `Done` or `Error`.
 //! - [`Client::next_timeout`] is the earliest instant at which the client wants
@@ -62,7 +65,8 @@
 //!     loop {
 //!         let now = Instant::now();
 //!         while let Some(packet) = client.poll_output(now) {
-//!             link.write_all(&packet)?; // one packet, one write
+//!             // A whole packet per call; the link must not split it.
+//!             link.write_all(&packet)?;
 //!         }
 //!         while let Some(event) = client.poll_event() {
 //!             match event {

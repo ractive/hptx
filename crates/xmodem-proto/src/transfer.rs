@@ -21,7 +21,10 @@ pub struct Config {
     /// `D`, [`Check::Crc16`] sends `C`; both fall back to NAK (checksum)
     /// after [`Config::crc_attempts`] unanswered start characters.
     /// [`Check::Checksum`] sends NAK from the start. The sender ignores this
-    /// and uses whatever the receiver asks for (NAK, `C` or `D`).
+    /// and uses whatever the receiver asks for (NAK, `C` or `D`). Before
+    /// the first ACK the sender follows a later `C` or `D`, and a NAK after
+    /// `D` (the 49G's fallback); a NAK in CRC-16 mode only resends block 1
+    /// in CRC-16, since a standard receiver NAKs a damaged block that way.
     ///
     /// `D` is the default because no HP calculator answers `C`: the 49G's
     /// XSEND answers `D` with HP-CRC blocks (1k blocks when the object is big
@@ -132,7 +135,9 @@ pub enum Command {
 pub enum Event {
     /// The check the transfer runs with is settled: sender, on the receiver's
     /// start character, and again if a later start character before the
-    /// first ACK asks for a different check; receiver, on the first block.
+    /// first ACK changes it (`C` or `D` at any time before the first ACK; NAK
+    /// only after `D`, the 49G's fallback to checksum: after `C` a NAK asks
+    /// for a damaged block 1 again in CRC-16); receiver, on the first block.
     Started {
         /// The block check in use.
         check: Check,
@@ -383,8 +388,13 @@ impl Transfer {
                     self.on_send_byte(now, b)
                 }
                 Phase::RecvStart | Phase::RecvBlocks => self.on_recv_byte(now, b),
-                // A retransmitted EOT: our ACK was lost or damaged.
-                Phase::RecvLinger if b == EOT => self.push(vec![ACK], Wait::None),
+                // A retransmitted EOT: our ACK was lost or damaged. One
+                // pending ACK answers any number of them.
+                Phase::RecvLinger if b == EOT => {
+                    if !self.queue.iter().any(|(q, _)| q.as_slice() == [ACK]) {
+                        self.push(vec![ACK], Wait::None);
+                    }
+                }
                 Phase::RecvLinger => {}
             }
         }
@@ -616,13 +626,19 @@ impl Transfer {
             }
             // A reply cannot answer a write that is still queued.
             _ if !self.queue.is_empty() => {}
-            // Before the first ACK the receiver is still starting: a start
-            // character (NAK, `C` or `D`) asks for block 1 again, in the check
-            // it names. The 49G's XRECV falls back from `D` to NAK; a
-            // standard CRC receiver repeats `C` for a bad first block.
+            // Before the first ACK the receiver may still be starting: `C`
+            // or `D` asks for block 1 again in the check it names. A NAK
+            // switches to checksum only from HP's CRC (the 49G's XRECV falls
+            // back from `D` to NAK); in CRC-16 or checksum mode it is a plain
+            // NAK for a damaged block 1, which a standard CRC-16 receiver
+            // sends while staying in CRC mode.
             Phase::SendBlock { .. } if !self.acked_any && Check::from_start_char(b).is_some() => {
-                let Some(check) = Check::from_start_char(b) else {
+                let Some(asked) = Check::from_start_char(b) else {
                     return;
+                };
+                let check = match (asked, self.check) {
+                    (Check::Checksum, Check::Crc16) => Check::Crc16,
+                    (asked, _) => asked,
                 };
                 if self.retry() {
                     if check != self.check {
@@ -1651,6 +1667,44 @@ mod tests {
         assert_eq!(drain(&mut t, now), Vec::<Vec<u8>>::new());
         t.handle_input(now, &[NAK]);
         assert_eq!(drain(&mut t, now), second);
+    }
+
+    #[test]
+    fn send_nak_in_crc16_mode_resends_block_1_in_crc16() {
+        // A standard CRC-16 receiver NAKs a damaged block 1 and stays in CRC
+        // mode: the same CRC block again, no switch to checksum.
+        let (mut t, now) = sender(b"x", Config::default());
+        t.handle_input(now, b"C");
+        let first = drain(&mut t, now);
+        assert_eq!(first, vec![block(1, b"x", Check::Crc16)]);
+        t.handle_input(now, &[NAK]);
+        assert_eq!(drain(&mut t, now), first);
+        t.handle_input(now, &[ACK]);
+        assert_eq!(drain(&mut t, now), vec![vec![EOT]]);
+        assert_eq!(
+            events(&mut t)[..1],
+            [Event::Started {
+                check: Check::Crc16
+            }]
+        );
+        assert_eq!(t.check(), Check::Crc16);
+        // A checksum receiver's NAK simply resends too.
+        let (mut t, now) = sender(b"x", Config::default());
+        t.handle_input(now, &[NAK]);
+        let first = drain(&mut t, now);
+        t.handle_input(now, &[NAK]);
+        assert_eq!(drain(&mut t, now), first);
+    }
+
+    #[test]
+    fn repeated_eots_while_lingering_queue_one_ack() {
+        let (mut t, now) = receiving(crc());
+        t.handle_input(now, &[EOT]);
+        assert_eq!(drain(&mut t, now), vec![vec![ACK]]);
+        t.handle_input(now, &[EOT; 10]);
+        assert_eq!(drain(&mut t, now), vec![vec![ACK]]);
+        t.handle_input(now, &[EOT, EOT]);
+        assert_eq!(drain(&mut t, now), vec![vec![ACK]]);
     }
 
     #[test]

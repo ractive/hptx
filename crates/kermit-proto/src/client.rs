@@ -759,12 +759,13 @@ impl Client {
         }
     }
 
-    /// After the final ACK: answer a retransmitted B with the same ACK;
-    /// anything else is ignored.
+    /// After the final ACK: answer a retransmitted B with the same ACK (one
+    /// pending copy at most); anything else is ignored.
     fn on_linger(&mut self, now: Instant, parsed: Result<Packet, FrameError>) {
         if let Ok(p) = parsed
             && p.kind == b'B'
             && p.seq == self.seq
+            && !self.queue.iter().any(|(_, b)| *b == self.last_sent)
         {
             let due = self.paused(now);
             self.queue.push_back((due, self.last_sent.clone()));
@@ -1766,6 +1767,22 @@ mod tests {
         c.handle_input(now + linger, &wire(3, b'B', b"", T3));
         assert_eq!(c.poll_output(now + linger), None);
         assert_eq!(c.poll_event(), None);
+    }
+
+    #[test]
+    fn repeated_bs_while_lingering_queue_one_ack() {
+        let (mut c, now) = get_started(cfg());
+        c.handle_input(now, &wire(1, b'B', b"", T3));
+        let ack = wire(1, b'Y', b"", T3);
+        assert_eq!(c.poll_output(now), Some(ack.clone()));
+        let burst: Vec<u8> = (0..10).flat_map(|_| wire(1, b'B', b"", T3)).collect();
+        c.handle_input(now, &burst);
+        assert_eq!(c.poll_output(now), Some(ack.clone()));
+        assert_eq!(c.poll_output(now), None);
+        // Once it is out, the next repeat gets another.
+        c.handle_input(now, &wire(1, b'B', b"", T3));
+        assert_eq!(c.poll_output(now), Some(ack));
+        assert_eq!(c.poll_output(now), None);
     }
 
     #[test]

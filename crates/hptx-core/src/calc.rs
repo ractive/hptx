@@ -749,6 +749,8 @@ mod tests {
         let transport = MemoryTransport::new(fake_server(Arc::clone(&log), reply));
         let mut kermit = Options::default().kermit;
         kermit.timeout = Duration::from_millis(200);
+        // The fake server never repeats a B: no linger, no wait.
+        kermit.linger = Duration::ZERO;
         let options = Options {
             kermit,
             drain: Duration::ZERO,
