@@ -84,3 +84,37 @@ Each item must be covered by a test. Source: the wiki at `~/devel/hp-literature/
   disturb the running session; it takes effect at the next SERVER. Covered:
   `calc::tests::set_iopar_stores_reals`; verified on the emulated 49G and
   48SX (2026-10-05).
+- XRECV/XSEND cannot be started through the Kermit server: a `C` command
+  answers "Port Not Available" on the 49G and 48GX and the server stays up
+  with the name left on the stack. After a keyboard-started transfer the
+  stack is empty and SERVER must be typed again. Covered: traces
+  `49g-server-xrecv`, `48gx-server-xsend`; e2e `xmodem_round_trip`.
+- 49G XRECV asks `D` every ~3 s (4 times), then NAK every 10 s (~10 times),
+  then "XRECV Error: Receive Error" after ~108 s. `D` = CRC-16/KERMIT, high
+  byte first; the 49G never answers `C`. It takes 1k and 128-byte blocks and
+  sends one 1k block plus 128-byte tail blocks. XSEND pads with memory
+  garbage. XRECV stores `NAME.1` instead of overwriting. Covered: traces
+  `49g-xrecv*`, `49g-xsend*`.
+- 48GX XModem is checksum only: XRECV starts with NAK, ignores `C`/`D` as a
+  sender, NAKs every 1k block and sends CAN CAN CAN after 9 tries; XSEND pads
+  with 0x00; a cancelled XRECV leaves an empty string in the variable.
+  Covered: traces `48gx-*`.
+- The 49G boots in ALG mode; `XRECV` without an argument there is "Invalid
+  Syntax". `-95 CF` switches to RPN. Covered: `prepare_for_xmodem`.
+- Emulator only (saturnng): leaving the server with ON while a Kermit
+  exchange settles can leave the 49G answering "Port Not Available" even to
+  SERVER; the state survives CLOSEIO and a container restart. Use a fresh
+  container.
+- 48GX XRECV onto an existing name stops with "XRECV Error: Name Conflict":
+  no start character, the name stays on the stack, no `.1` fallback (flag
+  -36 untested). hptx refuses such a put before FINISH. The 49G stores
+  `NAME.1` instead. Covered: `prepare_for_xmodem` tests.
+- 49G: `-95 CF` over Kermit, a keyboard XRECV/XSEND, SERVER, then `-95 SF`
+  restores ALG mode. A 3 s reply timeout suffices for 48GX 128-byte
+  checksum blocks at 9600 baud. Covered: e2e `xmodem_round_trip`.
+- After the Kermit server ends, alpha mode can still be on: typing `xsend`
+  on the emulated 49G came out as `SIN(X)!`. Press ON before typing.
+  Covered: e2e typing helpers press ON first.
+- 49G in RPN mode: typing SERVER leaves a tagged `SERVER` and `NOVAL` on
+  the stack (ALG mode and the 48GX leave nothing). Covered: e2e-cli runs
+  CLEAR after the XModem steps.

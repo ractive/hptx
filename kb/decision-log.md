@@ -173,3 +173,43 @@ Decisions already made. Do not re-litigate; add a dated entry to change one.
   pause is time the calculator needs before the next command (a command
   right after the final ACK is lost). The saturnus core is built with
   `opt-level = 3` in the dev profile so the suite does not crawl.
+
+## 2026-10-05 (iteration 5)
+
+- **XModem transfers start on the keyboard, never from the Kermit server.**
+  `'NAME' XRECV`/`XSEND` sent as a `C` host command answers "Port Not
+  Available" on the 49G and 48GX and the server stays up. hptx ends server
+  mode with FINISH (`Calculator::prepare_for_xmodem`), prints the exact
+  command to type, waits up to a bounded start timeout (60 s default) and
+  tells the user to type SERVER afterwards, as `restore` does.
+- **`xmodem-proto` receiver asks with `D` (HP CRC) by default.** `D` is
+  CRC-16/KERMIT (the Saturn CRC) sent high byte first. Neither calculator
+  answers the standard `C`; the 48GX ignores `D` and the receiver falls back
+  to NAK/checksum. The receiver keeps asking for the whole start window
+  (`recv_start_timeout`) so a slow typist does not land in checksum mode.
+- **1k blocks only when the receiver asked for a CRC** (`checksum_1k`
+  default off): the 48GX rejects STX blocks, the 49G takes them. Per-model
+  profiles come from `XmodemOptions::for_model`; the 48S/SX is
+  `Unsupported`.
+- **Received XModem data is stripped with the object walk** and an allowance
+  equal to the block size; `XmodemReceived::stripped` is `None` when the
+  walk failed and the bytes are returned unchanged. The 49G pads XSEND with
+  memory garbage, the 48GX with zeros.
+- **XSERV (49g+/50g) is framing and request builders only**, implemented
+  from the wiki description and unit-tested; the emulated 49G ROM 2.15 has
+  no XSERV, so it is unverified until hardware is available.
+- **The driver has a stall watchdog**: no progress for the configured limit
+  cancels the transfer, so noise during the block phase cannot hang hptx.
+- **CLI XModem surface.** `get`/`put --protocol xmodem` (default stays
+  kermit) with `--start-timeout` (1..=600 s); `--ascii`/`--binary` are
+  refused with xmodem and `--start-timeout` with kermit. `put` refuses an
+  existing name and `--overwrite` (XRECV never replaces: the 49G stores
+  `NAME.1`, the 48G/GX errors). The keyboard instructions go to stderr in
+  text mode; in JSON mode they are available through `--dry-run` (the JSON
+  result carries `keys`, `instructions`, `check`, `model`, `stripped`,
+  `server_mode: false`), because stderr in JSON mode is reserved for
+  `{error,hint}` and a human has to type on the calculator anyway.
+- **`hptx xserv ls|get|put|eval|mem`** is a thin client over
+  `hptx_core::xserv`, marked UNVERIFIED ON HARDWARE in every help page.
+- **Model detection lives in hptx-core** (`Model::from_version`); the CLI's
+  own copy was removed in iteration 5.

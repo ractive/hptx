@@ -169,6 +169,15 @@ fn core_failure(message: String, err: &Error, link: &LinkInfo) -> Failure {
         Error::Object(_) => {
             Some("the file is not an HP binary object; `get` it again in binary mode".into())
         }
+        Error::Xmodem(_) => Some(
+            "the XModem transfer failed; the calculator is out of server mode: press ON if \
+             XRECV/XSEND still runs, type SERVER, check the cable and run the command again"
+                .into(),
+        ),
+        Error::Unsupported(_) => Some(
+            "use Kermit, the default: drop --protocol xmodem (the 48S/SX has no XRECV/XSEND)"
+                .into(),
+        ),
     };
     Failure {
         error: message,
@@ -273,6 +282,22 @@ mod tests {
         let f = describe(&err, &link());
         assert_eq!(f.error, format!("cannot open tcp://h:1: I/O error: {text}"));
         assert!(f.hint.unwrap().contains("emulator"));
+    }
+
+    #[test]
+    fn xmodem_errors_have_hints() {
+        let f = fail(Error::Unsupported(
+            "the HP 48S/SX has no XModem; use Kermit".into(),
+        ));
+        assert_eq!(
+            f.error,
+            "ls: unsupported: the HP 48S/SX has no XModem; use Kermit"
+        );
+        assert!(f.hint.unwrap().contains("drop --protocol xmodem"));
+        let f = fail(Error::Xmodem(
+            hptx_core::xmodem_proto::Error::RemoteCancelled,
+        ));
+        assert!(f.hint.unwrap().contains("SERVER"));
     }
 
     #[test]

@@ -92,6 +92,13 @@ impl Session {
         Session::new(transport::open(addr)?, Options::default())
     }
 
+    /// Give the link back, e.g. for an XModem transfer after
+    /// [`Calculator::prepare_for_xmodem`](crate::Calculator::prepare_for_xmodem)
+    /// ended server mode.
+    pub fn into_transport(self) -> Box<dyn Transport> {
+        self.transport
+    }
+
     /// The Kermit configuration in use.
     pub fn config(&self) -> &Config {
         &self.config

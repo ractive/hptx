@@ -48,20 +48,26 @@ jobs:
       - name: hptx-core end-to-end tests, 48SX
         env:
           HPTX_E2E_ADDR: tcp://localhost:4848
+          HPTX_E2E_CONTAINER: calc
         run: cargo test -p hptx-core --test e2e -- --nocapture
       - name: hptx-core end-to-end tests, 49G
         env:
           HPTX_E2E_ADDR: tcp://localhost:4850
+          HPTX_E2E_CONTAINER: calc49
         run: cargo test -p hptx-core --test e2e -- --nocapture
       - name: CLI end-to-end script, 48SX
         env:
           HPTX_E2E_ADDR: tcp://localhost:4848
           HPTX_E2E_MODEL: 48sx
+          # The 48SX has no XModem: the script checks that it is refused.
+          HPTX_E2E_CONTAINER: calc
         run: scripts/e2e-cli.sh
       - name: CLI end-to-end script, 49G
         env:
           HPTX_E2E_ADDR: tcp://localhost:4850
           HPTX_E2E_MODEL: 49g
+          # XModem steps type XRECV/XSEND/SERVER via docker exec calc49 calc-keys.
+          HPTX_E2E_CONTAINER: calc49
         run: scripts/e2e-cli.sh
       - name: Screens and logs on failure
         if: failure()

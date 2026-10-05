@@ -27,6 +27,13 @@ pub enum Error {
     /// violation, cancelled.
     #[error("kermit: {0}")]
     Kermit(kermit_proto::Error),
+    /// An XModem transfer failed: no start within the start window, retries
+    /// exhausted, or cancelled by the calculator (two CANs).
+    #[error("xmodem: {0}")]
+    Xmodem(xmodem_proto::Error),
+    /// The calculator cannot do what was asked, e.g. XModem on a 48S/SX.
+    #[error("unsupported: {0}")]
+    Unsupported(String),
     /// A host command ran but the calculator reported an error. `stack` is
     /// what the calculator returned with it, level 1 first.
     #[error("calculator error: {message}")]

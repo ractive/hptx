@@ -19,6 +19,8 @@ use crate::object::{KERMIT_PADDING_ALLOWANCE, ObjectType, inspect, strip_padding
 use crate::reply::{Iopar, Listing, StackReply, parse_list, parse_listing, parse_real};
 use crate::reply::{parse_name, parse_stack, parse_string};
 use crate::session::Session;
+use crate::transport::Transport;
+use crate::xmodem::{XmodemDirection, XmodemPlan};
 use crate::{Error, Result};
 
 /// Temporary variable for [`Calculator::screenshot`].
@@ -29,6 +31,59 @@ const BACKUP_VAR: &str = "HPTXBK";
 const RESTORE_VAR: &str = "HPTXRS";
 /// Reply timeout for the final `RESTORE`, which never gets a reply.
 const RESTORE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Calculator model, as far as the ROM version text tells.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Model {
+    /// HP 48S/SX: no `VERSION` command, no XModem.
+    Hp48Sx,
+    /// HP 48G/GX: `HP48-x, Copyright HP 1993`; XModem with checksum only.
+    Hp48Gx,
+    /// HP 49G: XModem with checksum, HP's CRC (`D`) and 1k blocks.
+    Hp49G,
+    /// Anything else.
+    Unknown,
+}
+
+impl Model {
+    /// The model from the `VERSION` text ([`Calculator::version`]): `None`
+    /// is the 48S/SX, which lacks the command; the 48G/GX says
+    /// `HP48-R, Copyright HP 1993`; the 49G also says `HP48-C Revision ...`
+    /// (cut by its display width) and is told apart by its copyright year
+    /// (1999 or later) or an `HP49`.
+    pub fn from_version(version: Option<&str>) -> Model {
+        let Some(v) = version else {
+            return Model::Hp48Sx;
+        };
+        let year = v
+            .rsplit(|c: char| !c.is_ascii_digit())
+            .find(|w| w.len() == 4)
+            .and_then(|w| w.parse::<u32>().ok());
+        if v.contains("HP49") || year.is_some_and(|y| y >= 1999) {
+            Model::Hp49G
+        } else if v.contains("HP48") {
+            Model::Hp48Gx
+        } else {
+            Model::Unknown
+        }
+    }
+
+    /// Display name, e.g. `HP 48G/GX`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Model::Hp48Sx => "HP 48S/SX",
+            Model::Hp48Gx => "HP 48G/GX",
+            Model::Hp49G => "HP 49G",
+            Model::Unknown => "unknown",
+        }
+    }
+
+    /// Whether the model has `XRECV`/`XSEND` (unknown models are given the
+    /// benefit of the doubt).
+    pub fn has_xmodem(self) -> bool {
+        self != Model::Hp48Sx
+    }
+}
 
 /// Kermit transfer format, flag -35 on the calculator.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -438,6 +493,113 @@ impl Calculator {
         self.session.transact(Command::Finish).map(|_| ())
     }
 
+    /// The underlying session, consuming the calculator.
+    pub fn into_session(self) -> Session {
+        self.session
+    }
+
+    /// The open link, consuming the calculator, e.g. for an
+    /// [`XmodemSession`](crate::XmodemSession) after
+    /// [`Calculator::prepare_for_xmodem`].
+    pub fn into_transport(self) -> Box<dyn Transport> {
+        self.session.into_transport()
+    }
+
+    /// The model, from the `VERSION` text (see [`Model::from_version`]).
+    pub fn model(&mut self) -> Result<Model> {
+        Ok(Model::from_version(self.version()?.as_deref()))
+    }
+
+    /// Get the calculator ready for an XModem transfer of variable `name`
+    /// in the current directory and say what the user must type.
+    ///
+    /// `XRECV` and `XSEND` cannot be started through the Kermit server (they
+    /// fail with "Port Not Available" on the 49G and 48GX), so this checks
+    /// the name (it must exist for `XSEND`), switches a 49G in algebraic
+    /// mode to RPN (flag -95; typed `'NAME' XRECV` needs RPN), and ends
+    /// server mode with Kermit FINISH. An existing `NAME` is refused for
+    /// `XRECV` on the 48G/GX ("XRECV Error: Name Conflict"); the 49G stores
+    /// the object as `NAME.1` instead, which the plan's notes say. The user then types
+    /// [`XmodemPlan::keys`] on the calculator while an
+    /// [`XmodemSession`](crate::XmodemSession) on
+    /// [`Calculator::into_transport`] waits. Afterwards the calculator is
+    /// out of server mode with an empty stack: `SERVER` must be typed again.
+    /// Errors for the 48S/SX, which has no XModem.
+    pub fn prepare_for_xmodem(
+        &mut self,
+        direction: XmodemDirection,
+        name: &str,
+    ) -> Result<XmodemPlan> {
+        let quoted = quote(name)?;
+        let model = self.model()?;
+        if !model.has_xmodem() {
+            return Err(Error::Unsupported(format!(
+                "the {} has no XModem; use Kermit",
+                model.name()
+            )));
+        }
+        let exists = self.list()?.entries.iter().any(|e| e.name == name);
+        if direction == XmodemDirection::FromCalculator && !exists {
+            return Err(Error::Reply(format!("{name}: no such variable")));
+        }
+        if direction == XmodemDirection::ToCalculator && exists && model == Model::Hp48Gx {
+            // XRECV stops with "XRECV Error: Name Conflict" before any start
+            // character and leaves the name on the stack (emulated 48GX,
+            // 2026-10-05).
+            return Err(Error::Reply(format!("{name}: already exists")));
+        }
+        let mut switched_to_rpn = false;
+        if model == Model::Hp49G {
+            let flag = self.query("-95. FS?", 1)?;
+            let alg = flag.first().and_then(|v| parse_real(v)) == Some(1.0);
+            if alg {
+                self.exec(&["-95. CF".to_string()])?;
+                switched_to_rpn = true;
+            }
+        }
+        self.finish()?;
+        self.mode = None;
+
+        let command = direction.calculator_command();
+        let mut notes = Vec::new();
+        if direction == XmodemDirection::ToCalculator && exists {
+            notes.push(match model {
+                Model::Hp49G => format!(
+                    "{name} exists: the 49G does not overwrite it but stores the object as {name}.1."
+                ),
+                _ => format!(
+                    "{name} exists: the 49G stores the object as {name}.1 and the 48G/GX \
+                     refuses with \"Name Conflict\"; this model is unknown."
+                ),
+            });
+        }
+        if direction == XmodemDirection::ToCalculator && model == Model::Hp48Gx {
+            notes.push(format!(
+                "If the transfer fails, {name} may be left holding an empty string."
+            ));
+        }
+        if switched_to_rpn {
+            notes.push(
+                "The calculator was in algebraic mode and is now in RPN mode \
+                 (flag -95 cleared); type -95 SF to switch back."
+                    .to_string(),
+            );
+        }
+        notes.push(
+            "The calculator has left server mode; type SERVER on it after the transfer."
+                .to_string(),
+        );
+        Ok(XmodemPlan {
+            model,
+            direction,
+            name: name.to_string(),
+            keys: format!("{quoted} {command}"),
+            switched_to_rpn,
+            exists,
+            notes,
+        })
+    }
+
     /// Fail if `name` exists in the current directory.
     fn refuse_existing(&mut self, name: &str) -> Result<()> {
         if self.list()?.entries.iter().any(|e| e.name == name) {
@@ -543,6 +705,11 @@ mod tests {
                 let p = parse_frame(&frame, check).unwrap();
                 let data = prefix::decode(&p.data, &Quoting::default()).unwrap();
                 match p.kind {
+                    b'G' if data == b"F" => {
+                        // FINISH: a plain ACK.
+                        log.lock().unwrap().push("G F".into());
+                        out.push(wire(&Packet::new(p.seq, b'Y', Vec::new())));
+                    }
                     b'C' | b'G' => {
                         let command = if p.kind == b'G' {
                             format!("G {}", decode(&data))
@@ -666,6 +833,124 @@ mod tests {
             c.version().unwrap().as_deref(),
             Some("Version HP49-C Revision #1.19-6, Copyright HP 2009")
         );
+    }
+
+    #[test]
+    fn model_from_version() {
+        use Model::*;
+        assert_eq!(Model::from_version(None), Hp48Sx);
+        assert_eq!(
+            Model::from_version(Some("Version HP48-R, Copyright HP 1993")),
+            Hp48Gx
+        );
+        assert_eq!(
+            Model::from_version(Some("Version HP48-C Revision #2.15, Copyright HP 2009")),
+            Hp49G
+        );
+        assert_eq!(
+            Model::from_version(Some("Version HP49-C, Copyright HP 2000")),
+            Hp49G
+        );
+        assert_eq!(Model::from_version(Some("something else")), Unknown);
+        assert_eq!(Hp48Gx.name(), "HP 48G/GX");
+        assert!(!Hp48Sx.has_xmodem() && Hp48Gx.has_xmodem() && Hp49G.has_xmodem());
+    }
+
+    const G49_VERSION: &str =
+        "2: \"Version HP48-C\r\nRevision #2.15\r\n1:  \"Copyright HP 2009\"\r\n";
+    const GX_VERSION: &str = "2:     \"Version HP48-R\"\r\n1:  \"Copyright HP 1993\"\r\n";
+
+    #[test]
+    fn prepare_xrecv_on_49g_in_alg_mode() {
+        let (mut c, log) = calc(|cmd| match cmd {
+            "VERSION" => G49_VERSION.into(),
+            "G D" => "{ HOME } 2000.\r\nHPTXX 10.5 String 1234.\r\n".into(),
+            "-95. FS?" => "1:                     1.\r\n".into(),
+            _ => EMPTY.into(),
+        });
+        let plan = c
+            .prepare_for_xmodem(XmodemDirection::ToCalculator, "HPTXX")
+            .unwrap();
+        assert_eq!(
+            sent(&log),
+            [
+                "VERSION", "DROP2", "G D", "-95. FS?", "DROP", "-95. CF", "G F"
+            ]
+        );
+        assert_eq!(plan.model, Model::Hp49G);
+        assert_eq!(plan.keys, "'HPTXX' XRECV");
+        assert!(plan.exists && plan.switched_to_rpn);
+        let text = plan.instructions();
+        assert!(
+            text.starts_with("On the calculator, type 'HPTXX' XRECV"),
+            "{text}"
+        );
+        assert!(text.contains("HPTXX.1"), "{text}");
+        assert!(text.contains("-95 SF"), "{text}");
+        assert!(
+            text.ends_with("type SERVER on it after the transfer."),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn prepare_xsend_on_48gx() {
+        let (mut c, log) = calc(|cmd| match cmd {
+            "VERSION" => GX_VERSION.into(),
+            "G D" => "{ HOME } 2000\r\nHPTXX 10.5 String 1234\r\n".into(),
+            _ => EMPTY.into(),
+        });
+        let plan = c
+            .prepare_for_xmodem(XmodemDirection::FromCalculator, "HPTXX")
+            .unwrap();
+        assert_eq!(sent(&log), ["VERSION", "DROP2", "G D", "G F"]);
+        assert_eq!(plan.keys, "'HPTXX' XSEND");
+        assert!(!plan.switched_to_rpn);
+        assert_eq!(plan.notes.len(), 1);
+    }
+
+    #[test]
+    fn prepare_refuses_existing_name_on_48gx() {
+        let (mut c, log) = calc(|cmd| match cmd {
+            "VERSION" => GX_VERSION.into(),
+            "G D" => "{ HOME } 2000\r\nHPTXX 10.5 String 1234\r\n".into(),
+            _ => EMPTY.into(),
+        });
+        let err = c
+            .prepare_for_xmodem(XmodemDirection::ToCalculator, "HPTXX")
+            .unwrap_err();
+        assert!(matches!(&err, Error::Reply(m) if m == "HPTXX: already exists"));
+        assert_eq!(sent(&log), ["VERSION", "DROP2", "G D"]);
+    }
+
+    #[test]
+    fn prepare_refuses_before_finishing() {
+        // XSEND of a missing variable, and any XModem on a 48SX, fail
+        // without ending server mode.
+        let (mut c, log) = calc(|cmd| match cmd {
+            "VERSION" => GX_VERSION.into(),
+            "G D" => "{ HOME } 2000\r\n".into(),
+            _ => EMPTY.into(),
+        });
+        let err = c
+            .prepare_for_xmodem(XmodemDirection::FromCalculator, "NOSUCH")
+            .unwrap_err();
+        assert!(matches!(&err, Error::Reply(m) if m == "NOSUCH: no such variable"));
+        assert!(!sent(&log).contains(&"G F".to_string()));
+        assert!(matches!(
+            c.prepare_for_xmodem(XmodemDirection::ToCalculator, "A B"),
+            Err(Error::Name(_))
+        ));
+
+        let (mut c, log) = calc(|cmd| match cmd {
+            "VERSION" => "1:  'VERSION'\r\n".into(),
+            _ => EMPTY.into(),
+        });
+        let err = c
+            .prepare_for_xmodem(XmodemDirection::ToCalculator, "X")
+            .unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
+        assert_eq!(sent(&log), ["VERSION", "DROP"]);
     }
 
     #[test]

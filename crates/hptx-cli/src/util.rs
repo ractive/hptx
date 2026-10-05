@@ -53,27 +53,6 @@ pub fn number_text(value: f64) -> String {
     number(value).to_string()
 }
 
-/// The model, as far as the ROM version text tells: `VERSION` is missing on
-/// the 48S/SX and says `HP48-R, Copyright HP 1993` on the 48G/GX. The 49G
-/// also says `HP48-C Revision ...` (cut by its display width), so it is told
-/// apart by its copyright year (1999 or later) or an `HP49`.
-pub fn model(version: Option<&str>) -> &'static str {
-    let Some(v) = version else {
-        return "HP 48S/SX";
-    };
-    let year = v
-        .rsplit(|c: char| !c.is_ascii_digit())
-        .find(|w| w.len() == 4)
-        .and_then(|w| w.parse::<u32>().ok());
-    if v.contains("HP49") || year.is_some_and(|y| y >= 1999) {
-        "HP 49G"
-    } else if v.contains("HP48") {
-        "HP 48G/GX"
-    } else {
-        "unknown"
-    }
-}
-
 /// UTC time as `YYYYMMDD-HHMMSS`, for default file names.
 pub fn timestamp() -> String {
     let secs = SystemTime::now()
@@ -136,21 +115,6 @@ mod tests {
     fn numbers() {
         assert_eq!(number_text(12.0), "12");
         assert_eq!(number_text(29.5), "29.5");
-    }
-
-    #[test]
-    fn models() {
-        assert_eq!(model(None), "HP 48S/SX");
-        assert_eq!(
-            model(Some("Version HP48-R, Copyright HP 1993")),
-            "HP 48G/GX"
-        );
-        assert_eq!(model(Some("Version HP49-C, Copyright HP 2000")), "HP 49G");
-        // Recorded on the emulated 49G (fixtures/49g-version.txt).
-        assert_eq!(
-            model(Some("Version HP48-C Revisi, Copyright HP 2009")),
-            "HP 49G"
-        );
     }
 
     #[test]
