@@ -1,5 +1,5 @@
 //! What a user does with a calculator in Kermit server mode: list, change
-//! directory, get, put, run host commands, screenshot, backup and restore.
+//! directory, get, put, run host commands, fetch PICT, backup and restore.
 //!
 //! Everything is built from `C` host commands, `G D` listings, GET and SEND
 //! (wiki: protocols/server-commands). A host command returns the whole stack
@@ -23,8 +23,8 @@ use crate::transport::Transport;
 use crate::xmodem::{XmodemDirection, XmodemPlan};
 use crate::{Error, Result};
 
-/// Temporary variable for [`Calculator::screenshot`].
-const SCREENSHOT_VAR: &str = "HPTXTMP";
+/// Temporary variable for [`Calculator::pict`].
+const PICT_VAR: &str = "HPTXTMP";
 /// Temporary variable and port-0 object for [`Calculator::backup`].
 const BACKUP_VAR: &str = "HPTXBK";
 /// Temporary variable and port-0 object for [`Calculator::restore`].
@@ -383,14 +383,17 @@ impl Calculator {
             .ok_or_else(|| Error::Reply(format!("SEND {name}: no file stored")))
     }
 
-    /// Grab the display as a 131x64 GROB via `LCD→` and a binary GET of a
-    /// temporary variable `HPTXTMP`, which is purged afterwards. Leaves the
-    /// calculator in binary transfer mode.
-    pub fn screenshot(&mut self) -> Result<Grob> {
-        self.refuse_existing(SCREENSHOT_VAR)?;
-        self.exec(&[format!("LCD\u{2192} '{SCREENSHOT_VAR}' STO")])?;
-        let data = self.get(SCREENSHOT_VAR, TransferMode::Binary);
-        let purge = self.exec(&[format!("'{SCREENSHOT_VAR}' PURGE")]);
+    /// Fetch the graphics screen PICT (plots, drawings) via `PICT RCL`, a
+    /// temporary variable `HPTXTMP` and a binary GET; the variable is purged
+    /// afterwards. A calculator that never drew anything has a 0x0 PICT;
+    /// `ERASE` makes it 131x64. The display itself cannot be captured over
+    /// the link: `LCD→` in server mode only sees the server's own banner.
+    /// Leaves the calculator in binary transfer mode.
+    pub fn pict(&mut self) -> Result<Grob> {
+        self.refuse_existing(PICT_VAR)?;
+        self.exec(&[format!("PICT RCL '{PICT_VAR}' STO")])?;
+        let data = self.get(PICT_VAR, TransferMode::Binary);
+        let purge = self.exec(&[format!("'{PICT_VAR}' PURGE")]);
         let data = data?;
         purge?;
         Grob::from_file(&data)

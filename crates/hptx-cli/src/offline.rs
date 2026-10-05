@@ -534,8 +534,8 @@ fn not_a_grob(label: &str, data: &[u8], why: &str) -> anyhow::Error {
     };
     Hinted::new(
         message,
-        "to-png takes a GROB from `hptx get` (binary or --ascii); `hptx screenshot` saves the \
-         display directly",
+        "to-png takes a GROB from `hptx get` (binary or --ascii); `hptx pict` saves the \
+         graphics screen PICT directly",
     )
     .into()
 }

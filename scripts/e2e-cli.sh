@@ -4,8 +4,8 @@
 #
 # Re-expresses the hptx-core e2e scenarios through the CLI: info, ls, a
 # byte-exact binary put/get round trip of all 256 byte values, run, error
-# paths, screenshot, backup, rm, `ls --json | jq`, and the offline commands
-# on what the calculator sent: `object inspect` (walked size = file size),
+# paths, pict, backup, rm, `ls --json | jq`, `repl` from a pipe, and
+# the offline commands on what the calculator sent: `object inspect` (walked size = file size),
 # `grob to-png`, `object convert` both ways checked through the calculator.
 # On a 49G also a list holding a symbolic matrix (iteration 3 regression).
 # Never runs restore (it ends server mode). Leaves the calculator in HOME and
@@ -66,6 +66,8 @@ verified=0
 server_down=0
 # Set when the script switched a 49G to RPN for XModem.
 xm_switched=0
+# Set while PICT holds the e2e drawing.
+pict_drawn=0
 
 hptx() { "$HPTX_BIN" "$@"; }
 # Object bytes without the 8-byte HPHP4x-x header.
@@ -139,10 +141,11 @@ cleanup() {
         restart_server || true
     fi
     if ((xm_switched)); then hptx run -95 SF >/dev/null 2>&1 || true; fi
+    if ((pict_drawn)); then hptx run ERASE >/dev/null 2>&1 || true; fi
     # Best effort: remove what this script may have created.
     local names
     names=$(hptx --dir HOME ls --jq '.results[].name' 2>/dev/null || true)
-    for n in HPTXCLI HPTXPT HPTXSM HPTXCD HPTXCE HPTXGR HPTXG2 HPTXCV HPTXCW HPTXCX HPTXXM; do
+    for n in HPTXCLI HPTXPT HPTXSM HPTXCD HPTXCE HPTXGR HPTXG2 HPTXCV HPTXCW HPTXCX HPTXXM HPTXR; do
         if grep -qx "$n" <<<"$names"; then
             echo "cleanup: removing $n" >&2
             hptx rm "$n" >/dev/null 2>&1 || true
@@ -265,11 +268,21 @@ hptx --dir HOME ls --jq '.results[] | select(.name == "HPTXCE") | .directory' | 
 hptx rm HPTXCE --json >/dev/null
 ok
 
-step "screenshot (PNG)"
-hptx screenshot -o "$work/screen.png" --json >/dev/null
-[[ $(head -c 8 "$work/screen.png" | od -An -tx1 | tr -d ' \n') == 89504e470d0a1a0a ]] \
+step "pict (PICT as PNG, 131x64)"
+# A fresh PICT is 0x0; ERASE makes it 131x64. Draw one pixel, fetch it.
+pict_drawn=1
+hptx run 'ERASE { # 10d # 10d } PIXON' --json >/dev/null
+pict=$(hptx pict -o "$work/pict.png" --json)
+jq -e '.results.width == 131 and .results.height == 64' <<<"$pict" >/dev/null || fail "$pict"
+[[ $(head -c 8 "$work/pict.png" | od -An -tx1 | tr -d ' \n') == 89504e470d0a1a0a ]] \
     || fail "not a PNG"
-ok "$(wc -c <"$work/screen.png" | tr -d ' ') bytes"
+# IHDR width and height, big-endian, right after the signature and chunk header.
+[[ $(head -c 24 "$work/pict.png" | tail -c 8 | od -An -tx1 | tr -d ' \n') == 0000008300000040 ]] \
+    || fail "PNG is not 131x64"
+if hptx ls --jq '.results[].name' | grep -qx HPTXTMP; then fail "HPTXTMP left over"; fi
+hptx run ERASE --json >/dev/null
+pict_drawn=0
+ok "$(wc -c <"$work/pict.png" | tr -d ' ') bytes"
 
 step "backup (HPHP4 header)"
 hptx backup -o "$work/home.hp" --json >/dev/null
@@ -413,6 +426,48 @@ step "rm --dry-run, rm"
 hptx rm HPTXCLI --dry-run --json | jq -e '.results[0].deleted == false' >/dev/null || fail "dry run"
 hptx rm HPTXCLI --json >/dev/null
 if hptx ls --jq '.results[].name' | grep -qx HPTXCLI; then fail "HPTXCLI still there"; fi
+ok
+
+step "repl: piped RPL and colon commands"
+# One link for the whole session: store, recall, list, delete.
+out=$(printf "42 'HPTXR' STO\nHPTXR\n:ls\n:rm HPTXR\n" | hptx repl 2>"$work/repl.err") \
+    || fail "repl exit $?: $(cat "$work/repl.err")"
+hptx run DROP --json >/dev/null
+[[ ! -s $work/repl.err ]] || fail "repl stderr: $(cat "$work/repl.err")"
+[[ $(grep -cx '1: 42' <<<"$out") == 1 ]] || fail "not one '1: 42': $out"
+grep -Eq '^  HPTXR +[0-9.]+ ' <<<"$out" || fail ":ls has no HPTXR: $out"
+grep -q '^Deleted HPTXR ' <<<"$out" || fail ":rm: $out"
+if hptx ls --json | jq -e '.results | map(.name) | index("HPTXR")' >/dev/null; then
+    fail "HPTXR left after :rm"
+fi
+ok
+
+step "repl: :put refuses, --overwrite replaces"
+# IOPAR's list as HPTXR, then the same again: refused with a REPL hint (not
+# an `hptx put` command line, which cannot run while the REPL holds the
+# link), then replaced with --overwrite, then deleted.
+out=$(printf ':put %s HPTXR\n:put %s HPTXR\n:put %s HPTXR --overwrite\n:rm HPTXR\n' \
+    "$work/iopar.hp" "$work/iopar.hp" "$work/iopar.hp" | hptx repl 2>"$work/repl.err") \
+    || fail "repl exit $?: $(cat "$work/repl.err")"
+grep -q 'error: HPTXR exists' "$work/repl.err" || fail "no refusal: $(cat "$work/repl.err")"
+grep -qF ":put $work/iopar.hp HPTXR --overwrite\` replaces it" "$work/repl.err" \
+    || fail "no REPL hint: $(cat "$work/repl.err")"
+if grep -q 'hptx put' "$work/repl.err"; then fail "CLI hint in the REPL: $(cat "$work/repl.err")"; fi
+grep -q 'HPTXR (.*), replaced the old variable' <<<"$out" || fail "--overwrite: $out"
+[[ $(grep -c '^Deleted HPTXR ' <<<"$out") == 1 ]] || fail ":rm: $out"
+if hptx ls --jq '.results[].name' | grep -qx HPTXR; then fail "HPTXR left over"; fi
+ok
+
+step "repl: errors print and the session goes on"
+out=$(printf "'HPTXNOSUCH' RCL\nDROP\n:nosuch\n6 7 *\nDROP\n" | hptx repl 2>"$work/repl.err") \
+    || fail "repl exit $?: $(cat "$work/repl.err")"
+grep -q 'Undefined Name' "$work/repl.err" || fail "no calculator error: $(cat "$work/repl.err")"
+grep -q 'unknown command :nosuch' "$work/repl.err" || fail "no hint: $(cat "$work/repl.err")"
+grep -qx '1: 42' <<<"$out" || fail "no result after the errors: $out"
+if hptx repl --json </dev/null 2>/dev/null; then fail "repl --json accepted"; fi
+if hptx --port tcp://127.0.0.1:1 repl </dev/null 2>/dev/null; then
+    fail "repl on a dead link exited 0"
+fi
 ok
 
 step "settings --mode ascii"

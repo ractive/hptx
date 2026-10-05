@@ -271,8 +271,9 @@ impl Ctx {
             Command::Mkdir { name } => self.mkdir(&name)?,
             Command::Mv { from, to } => self.mv(&from, &to)?,
             Command::Run { words } => self.run_rpl(&words.join(" "))?,
-            Command::Screenshot { output, force } => {
-                return self.screenshot(output.as_deref(), force);
+            Command::Repl => return self.repl(),
+            Command::Pict { output, force } => {
+                return self.pict(output.as_deref(), force);
             }
             Command::Backup { output, force } => self.backup(output.as_deref(), force)?,
             Command::Restore(args) => self.restore(&args)?,
@@ -407,6 +408,11 @@ impl Ctx {
 
     fn info(&mut self) -> Result<Outcome> {
         let mut calc = self.connect()?;
+        self.info_on(&mut calc)
+    }
+
+    /// `info` on an open link.
+    pub(crate) fn info_on(&self, calc: &mut Calculator) -> Result<Outcome> {
         let version = calc.version().context("VERSION")?;
         let free = calc.mem().context("MEM")?;
         let path = calc.path().context("PATH")?;
@@ -447,13 +453,17 @@ impl Ctx {
 
     fn ls(&mut self, path: Option<&str>) -> Result<Outcome> {
         let mut calc = match path {
-            Some(p) => {
-                let mut calc = self.open_with_cleanup()?;
-                cd(&mut calc, p)?;
-                calc
-            }
+            Some(_) => self.open_with_cleanup()?,
             None => self.connect()?,
         };
+        self.ls_on(&mut calc, path)
+    }
+
+    /// `ls [PATH]` on an open link: change to PATH if given, then list.
+    pub(crate) fn ls_on(&self, calc: &mut Calculator, path: Option<&str>) -> Result<Outcome> {
+        if let Some(p) = path {
+            cd(calc, p)?;
+        }
         let listing = calc.list().context("ls")?;
         // The 48SX listing has no path; ask only when a hint needs it.
         let path: Option<Vec<String>> = match (&listing.path, path, self.global.dir.as_deref()) {
@@ -570,16 +580,25 @@ impl Ctx {
         if !to_stdout {
             refuse_existing_file(&file, args.force)?;
         }
+        let mut calc = self.connect()?;
+        self.get_on(&mut calc, args, &file, to_stdout)
+    }
+
+    /// Kermit `get` on an open link, to `file` (already checked) or stdout.
+    pub(crate) fn get_on(
+        &self,
+        calc: &mut Calculator,
+        args: &GetArgs,
+        file: &Path,
+        to_stdout: bool,
+    ) -> Result<Option<Outcome>> {
         let mode = if args.ascii {
             TransferMode::Ascii
         } else {
             TransferMode::Binary
         };
-        let mut calc = self.connect()?;
         if args.dry_run {
-            return self
-                .get_dry_run(&mut calc, args, &file, to_stdout)
-                .map(Some);
+            return self.get_dry_run(calc, args, file, to_stdout).map(Some);
         }
         let data = calc
             .get(&args.name, mode)
@@ -590,7 +609,7 @@ impl Ctx {
             out.flush().context("writing to stdout")?;
             return Ok(None);
         }
-        write_file(&file, &data, args.force)?;
+        write_file(file, &data, args.force)?;
         let kind = object_type_name(&data, mode);
         let mut text = format!(
             "{} -> {} ({} bytes, {}",
@@ -674,7 +693,9 @@ impl Ctx {
         })
     }
 
-    fn put(&mut self, args: &PutArgs) -> Result<Outcome> {
+    /// The variable name and the bytes for `put`: from the file (or stdin
+    /// for `-`), the name checked.
+    pub(crate) fn put_input(&self, args: &PutArgs) -> Result<(String, Vec<u8>)> {
         let from_stdin = args.file.as_path() == Path::new("-");
         let name = match (&args.name, from_stdin) {
             (Some(n), _) => n.clone(),
@@ -709,6 +730,11 @@ impl Ctx {
             )
             .into());
         }
+        Ok((name, data))
+    }
+
+    fn put(&mut self, args: &PutArgs) -> Result<Outcome> {
+        let (name, data) = self.put_input(args)?;
         args.xmodem
             .check(&[
                 (args.ascii, "--ascii"),
@@ -720,12 +746,22 @@ impl Ctx {
         if args.xmodem.protocol == Protocol::Xmodem {
             return self.put_xmodem(args, &name, &data, &file_label);
         }
-        let mode = if args.ascii || (!args.binary && data.starts_with(b"%%HP:")) {
-            TransferMode::Ascii
-        } else {
-            TransferMode::Binary
-        };
+        let mode = put_mode(args, &data);
         let mut calc = self.connect()?;
+        self.put_on(&mut calc, args, &name, &data, &file_label, mode)
+    }
+
+    /// Kermit `put` on an open link: `data` read from `file_label`, stored
+    /// as `name`.
+    pub(crate) fn put_on(
+        &self,
+        calc: &mut Calculator,
+        args: &PutArgs,
+        name: &str,
+        data: &[u8],
+        file_label: &str,
+        mode: TransferMode,
+    ) -> Result<Outcome> {
         let listing = calc.list().context("ls")?;
         let existing = listing.entries.iter().find(|e| e.name == name).cloned();
         if let Some(e) = &existing {
@@ -747,8 +783,8 @@ impl Ctx {
                         "`{}` replaces it, or choose another name with --as NAME",
                         self.cmd(&format!(
                             "put {} --as {} --overwrite",
-                            shell_quote(&file_label),
-                            shell_quote(&name)
+                            shell_quote(file_label),
+                            shell_quote(name)
                         ))
                     ),
                 )
@@ -786,11 +822,7 @@ impl Ctx {
                 );
             }
             text.push('.');
-            let mut again = format!(
-                "put {} --as {}",
-                shell_quote(&file_label),
-                shell_quote(&name)
-            );
+            let mut again = format!("put {} --as {}", shell_quote(file_label), shell_quote(name));
             if args.overwrite {
                 again.push_str(" --overwrite");
             }
@@ -816,9 +848,9 @@ impl Ctx {
             });
         }
         let stored = if existing.is_some() {
-            self.put_replacing(&mut calc, &name, &data, mode)?
+            self.put_replacing(calc, name, data, mode)?
         } else {
-            calc.put(&name, &data, mode)
+            calc.put(name, data, mode)
                 .with_context(|| format!("put {name}"))?
         };
         let mut text = format!(
@@ -902,6 +934,16 @@ impl Ctx {
             validate_name(name).with_context(|| format!("rm {name}"))?;
         }
         let mut calc = self.connect()?;
+        self.rm_on(&mut calc, names, dry_run)
+    }
+
+    /// `rm` on an open link; the names are checked in the listing first.
+    pub(crate) fn rm_on(
+        &self,
+        calc: &mut Calculator,
+        names: &[String],
+        dry_run: bool,
+    ) -> Result<Outcome> {
         let listing = calc.list().context("ls")?;
         let mut targets = Vec::new();
         let mut missing = Vec::new();
@@ -1019,41 +1061,16 @@ impl Ctx {
         })
     }
 
-    fn screenshot(&mut self, output: Option<&Path>, force: bool) -> Result<Option<Outcome>> {
+    fn pict(&mut self, output: Option<&Path>, force: bool) -> Result<Option<Outcome>> {
         let to_stdout = output == Some(Path::new("-"));
         let file = output
             .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from(format!("hptx-screen-{}.png", util::timestamp())));
+            .unwrap_or_else(pict_default_file);
         if !to_stdout {
             refuse_existing_file(&file, force)?;
         }
         let mut calc = self.connect()?;
-        let grob = calc.screenshot().context("screenshot")?;
-        let png = grob.to_png().context("PNG encoding")?;
-        if to_stdout {
-            let mut out = std::io::stdout().lock();
-            out.write_all(&png).context("writing to stdout")?;
-            out.flush().context("writing to stdout")?;
-            return Ok(None);
-        }
-        write_file(&file, &png, force)?;
-        Ok(Some(Outcome {
-            results: json!({
-                "file": file.display().to_string(),
-                "width": grob.width,
-                "height": grob.height,
-                "bytes": png.len(),
-            }),
-            total: None,
-            dir: None,
-            hints: Vec::new(),
-            text: format!(
-                "Screen ({}x{}) -> {}",
-                grob.width,
-                grob.height,
-                file.display()
-            ),
-        }))
+        pict_on(&mut calc, &file, to_stdout, force)
     }
 
     fn backup(&mut self, output: Option<&Path>, force: bool) -> Result<Outcome> {
@@ -1282,8 +1299,66 @@ impl Ctx {
     }
 }
 
+/// The default `pict` file name.
+pub(crate) fn pict_default_file() -> PathBuf {
+    PathBuf::from(format!("hptx-pict-{}.png", util::timestamp()))
+}
+
+/// `pict` on an open link, to `file` (already checked) or stdout. An empty
+/// (0x0) PICT is an error: nothing was drawn since the last reset.
+pub(crate) fn pict_on(
+    calc: &mut Calculator,
+    file: &Path,
+    to_stdout: bool,
+    force: bool,
+) -> Result<Option<Outcome>> {
+    let grob = calc.pict().context("pict")?;
+    if grob.width == 0 || grob.height == 0 {
+        return Err(Hinted::new(
+            format!("PICT is empty ({}x{})", grob.width, grob.height),
+            "nothing has been drawn since the last reset: plot something on the calculator, \
+             or draw over the link, e.g. `hptx run 'ERASE { # 10d # 10d } PIXON'`",
+        )
+        .into());
+    }
+    let png = grob.to_png().context("PNG encoding")?;
+    if to_stdout {
+        let mut out = std::io::stdout().lock();
+        out.write_all(&png).context("writing to stdout")?;
+        out.flush().context("writing to stdout")?;
+        return Ok(None);
+    }
+    write_file(file, &png, force)?;
+    Ok(Some(Outcome {
+        results: json!({
+            "file": file.display().to_string(),
+            "width": grob.width,
+            "height": grob.height,
+            "bytes": png.len(),
+        }),
+        total: None,
+        dir: None,
+        hints: Vec::new(),
+        text: format!(
+            "PICT ({}x{}) -> {}",
+            grob.width,
+            grob.height,
+            file.display()
+        ),
+    }))
+}
+
+/// The Kermit transfer mode for `put`: ASCII for %%HP: text unless --binary.
+pub(crate) fn put_mode(args: &PutArgs, data: &[u8]) -> TransferMode {
+    if args.ascii || (!args.binary && data.starts_with(b"%%HP:")) {
+        TransferMode::Ascii
+    } else {
+        TransferMode::Binary
+    }
+}
+
 /// Change to `dir` (absolute from HOME).
-fn cd(calc: &mut Calculator, dir: &str) -> Result<()> {
+pub(crate) fn cd(calc: &mut Calculator, dir: &str) -> Result<()> {
     let components = util::parse_dir(dir);
     let mut path: Vec<&str> = vec!["HOME"];
     path.extend(components.iter().map(String::as_str));

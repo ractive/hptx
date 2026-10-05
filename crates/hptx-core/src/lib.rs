@@ -4,7 +4,7 @@
 //! - [`transport`]: serial port, TCP and in-memory links ([`transport::open`]).
 //! - [`session`]: drives a [`kermit_proto::Client`] over a transport.
 //! - [`calc`]: what a user does with a calculator: list, get, put, run host
-//!   commands, screenshot, backup and restore ([`Calculator`]).
+//!   commands, PICT, backup and restore ([`Calculator`]).
 //! - [`reply`]: parsers for the server's text replies (`G D` listings and the
 //!   stack text returned for a `C` host command).
 //! - [`object`]: `HPHP48-x` / `HPHP49-x` binary files, prologs, object

@@ -183,16 +183,21 @@ fn run() -> TestResult {
 }
 
 #[test]
-fn screenshot() -> TestResult {
+fn pict() -> TestResult {
     scenario(|calc| {
-        let grob = calc.screenshot()?;
+        // A fresh PICT is 0x0; ERASE makes it 131x64. One pixel at (10, 10).
+        let reply = calc.run("ERASE { # 10d # 10d } PIXON")?;
+        assert_eq!(reply.error, None);
+        let grob = calc.pict()?;
         assert_eq!((grob.width, grob.height), (131, 64));
-        let pixels: Vec<bool> = (0..64)
+        assert!(grob.pixel(10, 10));
+        let lit = (0..64)
             .flat_map(|y| (0..131).map(move |x| (x, y)))
-            .map(|(x, y)| grob.pixel(x, y))
-            .collect();
-        assert!(pixels.iter().any(|&p| p) && pixels.iter().any(|&p| !p));
+            .filter(|&(x, y)| grob.pixel(x, y))
+            .count();
+        assert_eq!(lit, 1);
         assert!(!names(calc)?.iter().any(|n| n == "HPTXTMP"));
+        calc.run("ERASE")?;
         Ok(())
     })
 }

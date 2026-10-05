@@ -3,8 +3,8 @@
 //! wiki: protocols/hp-object-format "GROB layout": prolog #02B1E, 5-nibble
 //! length, 5-nibble height, 5-nibble width, then the rows. Each row is padded
 //! to a whole number of bytes (an even nibble count); within a nibble the
-//! least significant bit is the leftmost pixel. The screenshot is `LCD→`,
-//! 131x64 on the 48SX, 48GX and 49G.
+//! least significant bit is the leftmost pixel. `LCD→` and an `ERASE`d PICT
+//! are 131x64 on the 48SX, 48GX and 49G.
 
 use crate::object::{BinaryHeader, HEADER_LEN, ObjectType, read_field, unpack};
 use crate::{Error, Result};
