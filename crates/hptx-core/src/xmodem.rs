@@ -70,11 +70,10 @@ impl Default for XmodemOptions {
     /// checksum; send 1k blocks when the receiver asks for a CRC, 128-byte
     /// blocks when it asks for checksum.
     fn default() -> Self {
+        let mut xmodem = Config::default();
+        xmodem.block_size = BlockSize::B1k;
         XmodemOptions {
-            xmodem: Config {
-                block_size: BlockSize::B1k,
-                ..Config::default()
-            },
+            xmodem,
             start_timeout: Duration::from_secs(60),
             drain: Duration::ZERO,
         }
@@ -98,28 +97,24 @@ impl XmodemOptions {
             Model::Hp48Sx => Err(Error::Unsupported(
                 "the HP 48S/SX has no XModem; use Kermit".into(),
             )),
-            Model::Hp49G => Ok(XmodemOptions {
-                xmodem: Config {
-                    check: Check::HpCrc,
-                    // Bounded by the start window, not by the count.
-                    crc_attempts: u32::MAX,
-                    block_size: BlockSize::B1k,
-                    ..base.xmodem
-                },
-                ..base
-            }),
-            Model::Hp48Gx => Ok(XmodemOptions {
-                xmodem: Config {
-                    check: Check::Checksum,
-                    block_size: BlockSize::B128,
-                    // Also the pace of the start NAKs: with 10 s the user
-                    // waits up to 10 s after typing XSEND. Conn4x uses 2 s
-                    // for data (wiki: protocols/xmodem-hp).
-                    timeout: Duration::from_secs(3),
-                    ..base.xmodem
-                },
-                ..base
-            }),
+            Model::Hp49G => {
+                let mut xmodem = base.xmodem.clone();
+                xmodem.check = Check::HpCrc;
+                // Bounded by the start window, not by the count.
+                xmodem.crc_attempts = u32::MAX;
+                xmodem.block_size = BlockSize::B1k;
+                Ok(XmodemOptions { xmodem, ..base })
+            }
+            Model::Hp48Gx => {
+                let mut xmodem = base.xmodem.clone();
+                xmodem.check = Check::Checksum;
+                xmodem.block_size = BlockSize::B128;
+                // Also the pace of the start NAKs: with 10 s the user waits
+                // up to 10 s after typing XSEND. Conn4x uses 2 s for data
+                // (wiki: protocols/xmodem-hp).
+                xmodem.timeout = Duration::from_secs(3);
+                Ok(XmodemOptions { xmodem, ..base })
+            }
             Model::Unknown => Ok(base),
         }
     }
@@ -130,11 +125,10 @@ impl XmodemOptions {
         let start = self
             .start_timeout
             .clamp(MIN_START_TIMEOUT, MAX_START_TIMEOUT);
-        Config {
-            start_timeout: start,
-            recv_start_timeout: Some(start),
-            ..self.xmodem.clone()
-        }
+        let mut config = self.xmodem.clone();
+        config.start_timeout = start;
+        config.recv_start_timeout = Some(start);
+        config
     }
 }
 
@@ -304,6 +298,7 @@ impl XmodemSession {
                         result = Some(Err(Error::Xmodem(xmodem_proto::Error::Timeout)));
                     }
                     Event::Error(e) => result = Some(Err(Error::Xmodem(e))),
+                    _ => {}
                 }
             }
             if result.is_some() && xfer.next_timeout().is_none() {
@@ -671,7 +666,7 @@ mod tests {
             while data.len() < 128 {
                 data.push(fill(data.len()));
             }
-            let mut block = encode_block(st.blk, BlockSize::B128, &data, 0, check);
+            let mut block = encode_block(st.blk, BlockSize::B128, &data, 0, check).unwrap();
             if self.behaviour.corrupt_block == Some(st.blk) && !st.mangled.contains(&st.blk) {
                 st.mangled.push(st.blk);
                 block[10] ^= 0xFF;
@@ -999,7 +994,7 @@ mod tests {
     fn continuous_noise_still_ends() {
         let mut options = fast(XmodemOptions::default());
         options.xmodem.retries = 1;
-        let first = encode_block(1, BlockSize::B128, b"x", 0, Check::HpCrc);
+        let first = encode_block(1, BlockSize::B128, b"x", 0, Check::HpCrc).unwrap();
         let line = NoisyLine {
             reads: 0,
             first: Some(first),

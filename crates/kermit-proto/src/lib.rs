@@ -24,13 +24,18 @@
 //! - [`Client::poll_event`] yields [`Event`]s: file starts, data, progress,
 //!   server text and finally exactly one `Done` or `Error`.
 //! - [`Client::next_timeout`] is the earliest instant at which the client wants
-//!   to be called again: a delayed packet becomes due (`packet_pause`) or the
-//!   retransmit deadline expires. Use it as the read timeout.
+//!   to be called again: a delayed packet becomes due (`packet_pause`), the
+//!   retransmit deadline expires or the linger after a receive ends. Use it
+//!   as the read timeout.
 //!
 //! Every call that can queue output takes `now`, so delays and deadlines are
 //! computed from the caller's clock. After `Done` or `Error` keep calling
 //! `poll_output` until it returns `None`: the final ACK or an E packet may
-//! still be queued.
+//! still be queued. After a receive (`Get`, or a long reply to `Host` or
+//! `Directory`) the client lingers for [`Config::linger`] to re-ACK a
+//! retransmitted `B` in case the final ACK was lost; keep driving it until
+//! [`Client::next_timeout`] is `None`, or [`Client::start`] the next command,
+//! which ends the linger.
 //!
 //! In server mode the HP periodically NAKs packet 0 while idle, so a stale NAK
 //! can be in the pipe right after connecting. Discarding input for about

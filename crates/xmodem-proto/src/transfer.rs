@@ -6,12 +6,16 @@ use std::fmt;
 use std::time::{Duration, Instant};
 
 use crate::codec::{
-    ACK, BlockSize, CAN, CR_KERMIT, Check, EOT, NAK, SOH, STX, SUB, decode_block, encode_block,
+    ACK, BlockSize, CAN, CR_KERMIT, Check, EOT, NAK, SOH, STX, SUB, decode_block, frame_block,
     frame_len,
 };
 
 /// Tunables of a [`Transfer`].
+///
+/// Non-exhaustive: start from [`Config::default`] and set the fields you
+/// need.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct Config {
     /// Receiver: the check asked for first. [`Check::HpCrc`] (default) sends
     /// `D`, [`Check::Crc16`] sends `C`; both fall back to NAK (checksum)
@@ -44,8 +48,8 @@ pub struct Config {
     /// Sender with 1k blocks: send the tail of the file in 128-byte blocks once
     /// no more than 896 bytes (7 x 128) remain, so no block carries 128 or
     /// more bytes of padding (default true). The 49G does not convert a
-    /// received object with more than about 255 bytes of padding (wiki:
-    /// protocols/xmodem-hp, Conn4x).
+    /// received object with more than about 255 bytes of padding (as HP's
+    /// Conn4x source notes).
     pub short_tail: bool,
     /// Sender: padding byte for the last block (default 0x1A, SUB).
     pub pad: u8,
@@ -71,7 +75,24 @@ pub struct Config {
     /// a transfer a human starts on the calculator keyboard. The switch
     /// from `C`/`D` to NAK still happens after [`Config::crc_attempts`].
     pub recv_start_timeout: Option<Duration>,
+    /// Receiver: after we ACK the EOT, keep answering a retransmitted EOT
+    /// with ACK for this long (default 1 s), in case our ACK was damaged or
+    /// lost. `FileEnd` and `Done` are emitted when the ACK is queued; the
+    /// linger emits nothing. [`Transfer::is_idle`] is false while it lasts;
+    /// [`Transfer::start`] ends it early. `Duration::ZERO` turns it off. A
+    /// sender that only retransmits after its reply timeout is caught only
+    /// by a linger that long.
+    pub linger: Duration,
+    /// Receiver: most data bytes (padding included) accepted; a block that
+    /// would go beyond fails the transfer with [`Error::TooLarge`] and CANs.
+    /// Default 4 MiB, well above the largest HP object; `None` means no
+    /// limit. XModem has no length field and block numbers wrap, so without
+    /// a limit a peer can grow the buffer without bound.
+    pub max_size: Option<usize>,
 }
+
+/// Default [`Config::max_size`]: 4 MiB.
+const DEFAULT_MAX_SIZE: usize = 4 << 20;
 
 impl Default for Config {
     fn default() -> Self {
@@ -89,12 +110,15 @@ impl Default for Config {
             purge: Duration::from_secs(1),
             retries: 10,
             recv_start_timeout: None,
+            linger: Duration::from_secs(1),
+            max_size: Some(DEFAULT_MAX_SIZE),
         }
     }
 }
 
 /// One transfer.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Command {
     /// We are the sender (the calculator runs `XRECV`); the whole file.
     Send(Vec<u8>),
@@ -104,9 +128,11 @@ pub enum Command {
 
 /// Something that happened during a transfer.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Event {
     /// The check the transfer runs with is settled: sender, on the receiver's
-    /// start character; receiver, on the first block.
+    /// start character, and again if a later start character before the
+    /// first ACK asks for a different check; receiver, on the first block.
     Started {
         /// The block check in use.
         check: Check,
@@ -122,7 +148,12 @@ pub enum Event {
     /// Receive: EOT acknowledged; the file as received.
     FileEnd {
         /// Every data byte received, padding of the last block included:
-        /// stripping it is the caller's job (`hptx_core::object::strip_padding`).
+        /// stripping it is the caller's job. XModem carries no file length.
+        /// For an HP object (the calculators send binary objects: an 8-byte
+        /// `HPHP48-x`/`HPHP49-x` header, then the object), the real end is
+        /// found by walking the object: read its prolog and the size its
+        /// type implies (a length field for strings, code and the like, the
+        /// nested objects for composites), and cut there.
         data: Vec<u8>,
         /// Size of the last block (128 or 1024; 0 for an empty transfer):
         /// the most padding the file can carry.
@@ -136,12 +167,14 @@ pub enum Event {
     },
     /// Terminal failure; the machine is idle.
     Error(Error),
-    /// Terminal success; the machine is idle.
+    /// Terminal success. The machine is idle, or, as receiver, lingers
+    /// after the final ACK ([`Config::linger`]).
     Done,
 }
 
 /// Why a transfer failed.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// Retries exhausted, or no start character within `start_timeout`.
     Timeout,
@@ -151,6 +184,11 @@ pub enum Error {
     Protocol(String),
     /// [`Transfer::cancel`] was called; we sent CANs.
     Cancelled,
+    /// The received data exceeded [`Config::max_size`]; we sent CANs.
+    TooLarge {
+        /// The limit that was exceeded.
+        limit: usize,
+    },
 }
 
 impl fmt::Display for Error {
@@ -160,6 +198,9 @@ impl fmt::Display for Error {
             Error::RemoteCancelled => f.write_str("cancelled by the peer"),
             Error::Protocol(msg) => write!(f, "protocol error: {msg}"),
             Error::Cancelled => f.write_str("cancelled"),
+            Error::TooLarge { limit } => {
+                write!(f, "received data exceeds the limit of {limit} bytes")
+            }
         }
     }
 }
@@ -168,6 +209,7 @@ impl std::error::Error for Error {}
 
 /// Why [`Transfer::start`] refused a command.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum StartError {
     /// A transfer is already running.
     Busy,
@@ -210,6 +252,9 @@ enum Phase {
     RecvStart,
     /// Receiver: blocks flowing.
     RecvBlocks,
+    /// Receiver: EOT acknowledged; re-ACK a retransmitted EOT until
+    /// `deadline`.
+    RecvLinger,
 }
 
 /// Sans-IO XModem transfer, sender or receiver. See the crate documentation
@@ -247,6 +292,9 @@ pub struct Transfer {
     /// Receive: when [`Transfer::start`] ran (for
     /// [`Config::recv_start_timeout`]).
     started_at: Option<Instant>,
+    /// Receive, starting: the start-character deadline, held while a block
+    /// arrives (the byte timeout governs it) and restored if it is dropped.
+    held_deadline: Option<Instant>,
 }
 
 const CANCEL: [u8; 3] = [CAN, CAN, CAN];
@@ -277,17 +325,23 @@ impl Transfer {
             purging: false,
             last_block: 0,
             started_at: None,
+            held_deadline: None,
         }
     }
 
     /// Begin a transfer. A sender waits for the receiver's start character
     /// (nothing to write yet); a receiver's first start character is available
     /// from `poll_output(now)` at once.
+    ///
+    /// Output and events of the previous transfer that were not polled yet
+    /// are dropped; a linger after it ([`Config::linger`]) ends.
     pub fn start(&mut self, now: Instant, command: Command) -> Result<(), StartError> {
-        if !self.is_idle() {
+        if !matches!(self.phase, Phase::Idle | Phase::RecvLinger) {
             return Err(StartError::Busy);
         }
         self.queue.clear();
+        self.events.clear();
+        self.held_deadline = None;
         self.pos = 0;
         self.blk = 1;
         self.acked_any = false;
@@ -329,6 +383,9 @@ impl Transfer {
                     self.on_send_byte(now, b)
                 }
                 Phase::RecvStart | Phase::RecvBlocks => self.on_recv_byte(now, b),
+                // A retransmitted EOT: our ACK was lost or damaged.
+                Phase::RecvLinger if b == EOT => self.push(vec![ACK], Wait::None),
+                Phase::RecvLinger => {}
             }
         }
     }
@@ -346,7 +403,14 @@ impl Transfer {
             Phase::SendStart { .. } => self.finish(Event::Error(Error::Timeout)),
             Phase::SendBlock { .. } | Phase::SendEot => self.resend(),
             Phase::RecvStart => {
-                self.buf.clear();
+                if !self.buf.is_empty() {
+                    // A block stalled: drop it and resume the start-character
+                    // interval that was running when it began.
+                    self.drop_partial();
+                    if self.deadline.is_some_and(|d| now < d) {
+                        return;
+                    }
+                }
                 self.purging = false;
                 self.send_start_char(now);
             }
@@ -358,6 +422,7 @@ impl Transfer {
                 }
                 self.nak();
             }
+            Phase::RecvLinger => self.phase = Phase::Idle,
         }
     }
 
@@ -366,7 +431,8 @@ impl Transfer {
     /// until `None`: a final ACK or the CANs may still be queued.
     pub fn poll_output(&mut self, now: Instant) -> Option<Vec<u8>> {
         let (bytes, wait) = self.queue.pop_front()?;
-        if !self.is_idle() {
+        // The linger's deadline is fixed when it starts.
+        if !matches!(self.phase, Phase::Idle | Phase::RecvLinger) {
             let span = match wait {
                 Wait::None => None,
                 Wait::Reply => Some(self.config.timeout),
@@ -399,7 +465,8 @@ impl Transfer {
         }
     }
 
-    /// No transfer running (output may still be queued).
+    /// No transfer running and no linger after one (output may still be
+    /// queued).
     pub fn is_idle(&self) -> bool {
         matches!(self.phase, Phase::Idle)
     }
@@ -411,12 +478,17 @@ impl Transfer {
     }
 
     /// Abort: queue the CAN sequence, emit `Error(Cancelled)`, go idle.
-    /// No-op when idle.
+    /// No-op when idle. During the linger after `Done` it only ends the
+    /// linger: no CANs, no event.
     pub fn cancel(&mut self, _now: Instant) {
-        if self.is_idle() {
-            return;
+        match self.phase {
+            Phase::Idle => {}
+            Phase::RecvLinger => {
+                self.phase = Phase::Idle;
+                self.deadline = None;
+            }
+            _ => self.fail(Error::Cancelled, true),
         }
-        self.fail(Error::Cancelled, true);
     }
 
     // ---- helpers ----
@@ -500,7 +572,7 @@ impl Transfer {
         }
         let (size, len) = self.block_len();
         let chunk = self.data.get(self.pos..self.pos + len).unwrap_or_default();
-        let bytes = encode_block(self.blk, size, chunk, self.config.pad, self.check);
+        let bytes = frame_block(self.blk, size, chunk, self.config.pad, self.check);
         self.phase = Phase::SendBlock { len };
         self.send(bytes);
     }
@@ -544,6 +616,24 @@ impl Transfer {
             }
             // A reply cannot answer a write that is still queued.
             _ if !self.queue.is_empty() => {}
+            // Before the first ACK the receiver is still starting: a start
+            // character (NAK, `C` or `D`) asks for block 1 again, in the check
+            // it names. The 49G's XRECV falls back from `D` to NAK; a
+            // standard CRC receiver repeats `C` for a bad first block.
+            Phase::SendBlock { .. } if !self.acked_any && Check::from_start_char(b).is_some() => {
+                let Some(check) = Check::from_start_char(b) else {
+                    return;
+                };
+                if self.retry() {
+                    if check != self.check {
+                        self.check = check;
+                        self.events.push_back(Event::Started { check });
+                    }
+                    // Re-encoded: the check (and with it the block size)
+                    // may have changed.
+                    self.send_block();
+                }
+            }
             Phase::SendBlock { len } => match b {
                 ACK => {
                     self.retries = 0;
@@ -557,8 +647,6 @@ impl Transfer {
                     self.send_block();
                 }
                 NAK => self.resend(),
-                // Extra start characters before the first ACK count as NAK.
-                _ if !self.acked_any && Check::from_start_char(b).is_some() => self.resend(),
                 _ => {}
             },
             Phase::SendEot => match b {
@@ -606,6 +694,16 @@ impl Transfer {
         }
     }
 
+    /// Starting: drop the partial frame and restore the start-character
+    /// deadline held while it arrived.
+    fn drop_partial(&mut self) {
+        self.buf.clear();
+        self.last_byte = None;
+        if let Some(d) = self.held_deadline.take() {
+            self.deadline = Some(d);
+        }
+    }
+
     /// Bad frame while blocks flow: discard input until the line is quiet,
     /// then NAK (from `handle_timeout`).
     fn purge(&mut self, now: Instant) {
@@ -628,8 +726,14 @@ impl Transfer {
                 SOH | STX => {
                     self.buf.push(b);
                     self.last_byte = Some(now);
+                    if matches!(self.phase, Phase::RecvStart) {
+                        // A block may be arriving: the byte timeout governs
+                        // it, not the start-character interval, which would
+                        // otherwise discard it (or switch the check) halfway.
+                        self.held_deadline = self.deadline.take();
+                    }
                 }
-                EOT if matches!(self.phase, Phase::RecvBlocks) => self.on_eot(),
+                EOT if matches!(self.phase, Phase::RecvBlocks) => self.on_eot(now),
                 // Line noise or a Kermit packet before the transfer.
                 _ => {}
             }
@@ -640,8 +744,7 @@ impl Transfer {
         if self.buf.len() == 3 && self.buf.get(1).map(|n| !n) != self.buf.get(2).copied() {
             // Not a block header: noise, or a Kermit packet (SOH LEN SEQ ..).
             if matches!(self.phase, Phase::RecvStart) {
-                self.buf.clear();
-                self.last_byte = None;
+                self.drop_partial();
             } else {
                 self.purge(now);
             }
@@ -665,6 +768,7 @@ impl Transfer {
             Err(_) => {
                 if matches!(self.phase, Phase::RecvStart) {
                     // The check we asked for does not fit; keep asking.
+                    self.drop_partial();
                     return;
                 }
                 self.purge(now);
@@ -673,9 +777,16 @@ impl Transfer {
         };
         if matches!(self.phase, Phase::RecvStart) {
             self.phase = Phase::RecvBlocks;
+            self.held_deadline = None;
             self.events.push_back(Event::Started { check: self.check });
         }
         if block.num == self.blk {
+            if let Some(limit) = self.config.max_size
+                && self.data.len().saturating_add(block.data.len()) > limit
+            {
+                self.fail(Error::TooLarge { limit }, true);
+                return;
+            }
             self.retries = 0;
             self.blk = self.blk.wrapping_add(1);
             self.data.extend_from_slice(&block.data);
@@ -699,7 +810,7 @@ impl Transfer {
         }
     }
 
-    fn on_eot(&mut self) {
+    fn on_eot(&mut self, now: Instant) {
         self.push(vec![ACK], Wait::None);
         let data = std::mem::take(&mut self.data);
         let last_block = self.last_block;
@@ -718,6 +829,13 @@ impl Transfer {
             padding,
         });
         self.finish(Event::Done);
+        // A linger that overflows `Instant` would never end: skip it.
+        if let Some(end) = now.checked_add(self.config.linger)
+            && !self.config.linger.is_zero()
+        {
+            self.phase = Phase::RecvLinger;
+            self.deadline = Some(end);
+        }
     }
 }
 
@@ -725,7 +843,7 @@ impl Transfer {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::codec::{STX, crc16};
+    use crate::codec::{STX, crc16, encode_block};
 
     fn t0() -> Instant {
         Instant::now()
@@ -740,7 +858,7 @@ mod tests {
     }
 
     fn block(num: u8, data: &[u8], check: Check) -> Vec<u8> {
-        encode_block(num, BlockSize::B128, data, SUB, check)
+        encode_block(num, BlockSize::B128, data, SUB, check).unwrap()
     }
 
     fn sender(data: &[u8], config: Config) -> (Transfer, Instant) {
@@ -835,13 +953,7 @@ mod tests {
         let out = drain(&mut t, now);
         assert_eq!(
             out,
-            vec![encode_block(
-                1,
-                BlockSize::B1k,
-                &data[..1024],
-                SUB,
-                Check::HpCrc
-            )]
+            vec![encode_block(1, BlockSize::B1k, &data[..1024], SUB, Check::HpCrc).unwrap()]
         );
         let crc = crate::codec::hp_crc(&data[..1024]);
         assert_eq!(&out[0][1027..], &crc.to_be_bytes());
@@ -884,7 +996,7 @@ mod tests {
         drain(&mut t, now);
         t.handle_input(
             now,
-            &encode_block(1, BlockSize::B1k, b"hp", 0, Check::HpCrc),
+            &encode_block(1, BlockSize::B1k, b"hp", 0, Check::HpCrc).unwrap(),
         );
         assert_eq!(drain(&mut t, now), vec![vec![ACK]]);
     }
@@ -1332,7 +1444,7 @@ mod tests {
         drain(&mut t, now);
         t.handle_input(
             now,
-            &encode_block(1, BlockSize::B1k, &[9; 1024], 0, Check::Crc16),
+            &encode_block(1, BlockSize::B1k, &[9; 1024], 0, Check::Crc16).unwrap(),
         );
         t.handle_input(now, &block(2, &[0; 3], Check::Crc16));
         assert_eq!(drain(&mut t, now), vec![vec![ACK]; 2]);
@@ -1359,6 +1471,224 @@ mod tests {
         t.handle_input(now, &[EOT]);
         assert_eq!(t.poll_output(now), None);
         assert!(!t.is_idle());
+    }
+
+    /// A CRC receiver that has accepted block 1 ("one").
+    fn receiving(config: Config) -> (Transfer, Instant) {
+        let (mut t, now) = receiver(config);
+        drain(&mut t, now);
+        t.handle_input(now, &block(1, b"one", Check::Crc16));
+        assert_eq!(drain(&mut t, now), vec![vec![ACK]]);
+        (t, now)
+    }
+
+    #[test]
+    fn lost_final_ack_is_answered_while_lingering() {
+        let cfg = crc();
+        let linger = cfg.linger;
+        let (mut t, now) = receiving(cfg);
+        t.handle_input(now, &[EOT]);
+        assert_eq!(drain(&mut t, now), vec![vec![ACK]]);
+        let ev = events(&mut t);
+        assert!(matches!(
+            ev.as_slice(),
+            [.., Event::FileEnd { .. }, Event::Done]
+        ));
+        assert!(!t.is_idle());
+        assert_eq!(t.next_timeout(), Some(now + linger));
+        // The sender did not get our ACK and repeats EOT: ACK again, no
+        // second FileEnd or Done. Other bytes are ignored.
+        let at = now + linger / 2;
+        t.handle_input(at, &[EOT]);
+        assert_eq!(drain(&mut t, at), vec![vec![ACK]]);
+        t.handle_input(at, &block(2, b"x", Check::Crc16));
+        assert_eq!(drain(&mut t, at), Vec::<Vec<u8>>::new());
+        assert_eq!(events(&mut t), vec![]);
+        // The linger is bounded: the re-ACK does not extend it.
+        assert_eq!(t.next_timeout(), Some(now + linger));
+        t.handle_timeout(now + linger);
+        assert!(t.is_idle());
+        assert_eq!(t.next_timeout(), None);
+        t.handle_input(now + linger, &[EOT]);
+        assert_eq!(t.poll_output(now + linger), None);
+        assert_eq!(events(&mut t), vec![]);
+    }
+
+    #[test]
+    fn start_and_cancel_end_the_linger() {
+        let (mut t, now) = receiving(crc());
+        t.handle_input(now, &[EOT]);
+        assert_eq!(drain(&mut t, now), vec![vec![ACK]]);
+        events(&mut t);
+        t.cancel(now);
+        assert!(t.is_idle());
+        assert_eq!(t.poll_output(now), None, "no CANs after Done");
+        assert_eq!(events(&mut t), vec![]);
+
+        let (mut t, now) = receiving(crc());
+        t.handle_input(now, &[EOT]);
+        t.start(now, Command::Receive).unwrap();
+        assert_eq!(drain(&mut t, now), vec![b"C".to_vec()]);
+        assert_eq!(events(&mut t), vec![], "the old events are dropped");
+    }
+
+    #[test]
+    fn zero_linger_goes_idle_at_once() {
+        let cfg = Config {
+            linger: Duration::ZERO,
+            ..crc()
+        };
+        let (mut t, now) = receiving(cfg);
+        t.handle_input(now, &[EOT]);
+        assert!(t.is_idle());
+        assert_eq!(drain(&mut t, now), vec![vec![ACK]]);
+        assert_eq!(t.next_timeout(), None);
+    }
+
+    #[test]
+    fn block_straddling_the_start_interval_is_kept() {
+        // The last `D` before the switch to checksum goes out at 0; a 1k
+        // HP-CRC block starts at 2.5 s and ends at 3.9 s, past the 3 s
+        // interval. The byte timeout governs the block, so the check stays.
+        let cfg = Config {
+            crc_attempts: 1,
+            ..Config::default()
+        };
+        let interval = cfg.crc_interval;
+        let (mut t, now) = receiver(cfg);
+        assert_eq!(drain(&mut t, now), vec![b"D".to_vec()]);
+        assert_eq!(t.next_timeout(), Some(now + interval));
+        let b = encode_block(1, BlockSize::B1k, b"hp", 0, Check::HpCrc).unwrap();
+        let ms = |n| now + Duration::from_millis(n);
+        t.handle_input(ms(2500), &b[..400]);
+        assert_eq!(t.next_timeout(), Some(ms(3500)));
+        t.handle_timeout(ms(3000));
+        assert_eq!(t.poll_output(ms(3000)), None);
+        t.handle_input(ms(3200), &b[400..800]);
+        t.handle_timeout(ms(3500));
+        assert_eq!(t.poll_output(ms(3500)), None);
+        t.handle_input(ms(3900), &b[800..]);
+        assert_eq!(drain(&mut t, ms(3900)), vec![vec![ACK]]);
+        assert_eq!(
+            events(&mut t)[0],
+            Event::Started {
+                check: Check::HpCrc
+            }
+        );
+    }
+
+    #[test]
+    fn stalled_first_block_resumes_the_start_interval() {
+        let cfg = crc();
+        let (mut t, now) = receiver(cfg);
+        assert_eq!(drain(&mut t, now), vec![b"C".to_vec()]);
+        let ms = |n| now + Duration::from_millis(n);
+        // A fragment at 0.5 s, then silence: dropped after the byte timeout
+        // (1.5 s); the interval running since 0 still ends at 3 s.
+        t.handle_input(ms(500), &block(1, b"x", Check::Crc16)[..20]);
+        assert_eq!(t.next_timeout(), Some(ms(1500)));
+        t.handle_timeout(ms(1500));
+        assert_eq!(t.poll_output(ms(1500)), None);
+        assert_eq!(t.next_timeout(), Some(ms(3000)));
+        t.handle_timeout(ms(3000));
+        assert_eq!(drain(&mut t, ms(3000)), vec![b"C".to_vec()]);
+        // A fragment that stalls past the interval: the next start character
+        // goes out when it is dropped.
+        t.handle_input(ms(5500), &block(1, b"x", Check::Crc16)[..20]);
+        t.handle_timeout(ms(6500));
+        assert_eq!(drain(&mut t, ms(6500)), vec![b"C".to_vec()]);
+        // A Kermit packet (not a block header) restores the interval too.
+        t.handle_input(ms(7000), b"\x01# N3\r");
+        assert_eq!(t.next_timeout(), Some(ms(9500)));
+    }
+
+    #[test]
+    fn send_start_character_reselects_the_check() {
+        // The receiver's first `D` gets a 1k HP-CRC block; before any ACK it
+        // falls back to NAK (checksum): block 1 again, as a 128-byte checksum
+        // block. A later `C` switches to CRC-16 with 1k blocks again.
+        let cfg = Config {
+            block_size: BlockSize::B1k,
+            short_tail: false,
+            ..Config::default()
+        };
+        let data = vec![7u8; 2000];
+        let (mut t, now) = sender(&data, cfg);
+        t.handle_input(now, b"D");
+        let out = drain(&mut t, now);
+        assert_eq!(out[0].len(), 3 + 1024 + 2);
+        t.handle_input(now, &[NAK]);
+        assert_eq!(
+            drain(&mut t, now),
+            vec![block(1, &data[..128], Check::Checksum)]
+        );
+        t.handle_input(now, b"C");
+        assert_eq!(
+            drain(&mut t, now),
+            vec![encode_block(1, BlockSize::B1k, &data[..1024], SUB, Check::Crc16).unwrap()]
+        );
+        // The same character again only resends.
+        t.handle_input(now, b"C");
+        assert_eq!(drain(&mut t, now)[0].len(), 3 + 1024 + 2);
+        assert_eq!(
+            events(&mut t),
+            vec![
+                Event::Started {
+                    check: Check::HpCrc
+                },
+                Event::Started {
+                    check: Check::Checksum
+                },
+                Event::Started {
+                    check: Check::Crc16
+                },
+            ]
+        );
+        // After the first ACK, NAK means resend and `C`/`D` are ignored.
+        t.handle_input(now, &[ACK]);
+        let second = drain(&mut t, now);
+        t.handle_input(now, b"D");
+        assert_eq!(drain(&mut t, now), Vec::<Vec<u8>>::new());
+        t.handle_input(now, &[NAK]);
+        assert_eq!(drain(&mut t, now), second);
+    }
+
+    #[test]
+    fn send_start_characters_count_as_retries() {
+        let cfg = Config {
+            retries: 1,
+            ..Config::default()
+        };
+        let (mut t, now) = sender(b"x", cfg);
+        t.handle_input(now, b"D");
+        drain(&mut t, now);
+        t.handle_input(now, &[NAK]);
+        assert_eq!(drain(&mut t, now), vec![block(1, b"x", Check::Checksum)]);
+        t.handle_input(now, &[NAK]);
+        assert_eq!(drain(&mut t, now), vec![CANCEL.to_vec()]);
+        assert_eq!(events(&mut t).last(), Some(&Event::Error(Error::Timeout)));
+    }
+
+    #[test]
+    fn receive_size_cap() {
+        let cfg = Config {
+            max_size: Some(256),
+            ..crc()
+        };
+        let (mut t, now) = receiving(cfg);
+        t.handle_input(now, &block(2, b"two", Check::Crc16));
+        assert_eq!(drain(&mut t, now), vec![vec![ACK]]);
+        // A duplicate is not counted.
+        t.handle_input(now, &block(2, b"two", Check::Crc16));
+        assert_eq!(drain(&mut t, now), vec![vec![ACK]]);
+        t.handle_input(now, &block(3, b"three", Check::Crc16));
+        assert_eq!(drain(&mut t, now), vec![CANCEL.to_vec()]);
+        assert_eq!(
+            events(&mut t).last(),
+            Some(&Event::Error(Error::TooLarge { limit: 256 }))
+        );
+        assert!(t.is_idle());
+        assert_eq!(Config::default().max_size, Some(4 << 20));
     }
 
     #[test]

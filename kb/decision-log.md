@@ -235,3 +235,55 @@ Decisions already made. Do not re-litigate; add a dated entry to change one.
   can only ever capture the server banner; `pict` fetches the graphics
   screen with `PICT RCL` (via `HPTXTMP`). The display itself is captured by
   hand (`LCD→ 'S' STO` before SERVER, then `get` and `grob to-png`).
+
+## 2026-10-05 (publishing and the emulator dependency)
+
+- **Only `kermit-proto` and `xmodem-proto` are published to crates.io.**
+  hptx-cli stays git-only (release binaries, `cargo install --git`):
+  publishing it would chain every hptx release behind a saturnus release,
+  because crates.io requires every dependency to be published, for the
+  small gain of `cargo install hptx`. Considered and dropped (user).
+- **The saturnus transport leaves hptx-core.** It becomes `hptx-saturnus`, an
+  adapter crate in this repository (the `Transport` impl, boot choreography,
+  framebuffer access) that hptx-cli depends on unconditionally: no feature
+  flag, one binary. hptx-core then has no dependency on the emulator, so the
+  crate graph is acyclic (saturnus-mcp depends on hptx-core; hptx-cli depends
+  on saturnus). saturnus-mcp keeps its own in-process transport: sharing one
+  adapter across the two repositories would need a published trait crate
+  (`hptx-transport`) or a `[patch]` redirect, which is not worth it for about
+  300 lines. If the two time models drift painfully, that is the fix.
+- **Two repositories, not a monorepo.** Discussed and rejected: different
+  products, cadences and knowledge bases; the cycle was a layering problem.
+- **Whole-crate audits at milestones** (user): before publishing a crate,
+  before the hardware iteration and before a release, a review-only vehicle
+  PR branched from the iteration 1 merge with the current sources copied on
+  is reviewed by all three reviewers; one regression test per finding; no
+  fuzz or adversarial suites.
+
+## 2026-10-05 (iteration 10)
+
+- **Linger after the final ACK.** Both protocol machines keep answering a
+  retransmitted `B` (Kermit) or EOT (XModem) for `Config::linger` after the
+  final ACK (default 1 s, `ZERO` off, deadline fixed at the start); `Done`
+  is emitted once; `is_idle()` is false meanwhile; `start()` ends it. The
+  HP retransmits a lost-ACK `B` only after the TIME it was sent (20 s), so
+  the default catches an immediately damaged ACK, not a long silence.
+  `Session` sets the Kermit linger to its turnaround (200 ms) and starts the
+  turnaround at `Done`, so no transaction got slower.
+- **Receive size caps.** `Config::max_size` (default 4 MiB) in both crates;
+  `Error::TooLarge { limit }`, CAN CAN CAN or an E packet.
+- **A `B` before the file's `Z`, or with `X` text buffered, is a protocol
+  error**, not `Done`.
+- **PADC**: a blank Send-Init field is the default (NUL), per the Kermit
+  manual; a reviewer's claim that a space means pad byte 0x60 was rejected.
+- **`Packet::encode` and `encode_block` return `Result`** with
+  `codec::EncodeError`; `#[non_exhaustive]` on every public enum and config
+  of both crates (so `Config { x, ..Default::default() }` is no longer
+  possible downstream; set fields on a default value instead); `start()`
+  drops the previous transaction's queue, events and peer parameters.
+- **XModem sender before the first ACK** re-selects the check and block size
+  from any start character (49G falls back D -> NAK); the receiver holds the
+  start-character deadline while a block is arriving.
+- **Publishing**: `cargo publish --dry-run -p kermit-proto -p xmodem-proto`
+  is the verification and the publish command (both at once); the user
+  publishes. No `rust-version` until an MSRV is verified.

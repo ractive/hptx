@@ -9,7 +9,8 @@
 //!   server. TEXT takes the trace escapes. Note that `XRECV`/`XSEND` started
 //!   this way fail with "Port Not Available" (49G, 48GX); for a transfer, put
 //!   the name on the stack, leave the server and type the command on the
-//!   calculator, then run this without `--host`.
+//!   calculator, then run this without `--host`. TEXT must fit in one
+//!   packet (77 encoded bytes, the server's default MAXL of 80).
 //! - `--1k`: send 1k blocks (with the 128-byte short tail) when the receiver
 //!   asks for a CRC; add `--checksum-1k` to send them in checksum mode too
 //!   (how `48gx-xrecv-1k` was recorded).
@@ -25,11 +26,19 @@
 //! Every byte in and out is logged, including Kermit packets before, during
 //! or after the transfer. The line `# xmodem start` marks where the XModem
 //! machine takes over; replay tests start there.
+//!
+//! Input that is already waiting when we connect is logged as `# stale` and
+//! dropped (the idle server's NAKs, start characters a waiting `XRECV` sent
+//! long ago), except, when sending without `--host`, a start character that
+//! ends it: that one is live, so it goes to the machine after
+//! `# xmodem start`.
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
+use kermit_proto::codec::{BlockCheck, Framing, Packet};
+use kermit_proto::prefix::{self, Quoting};
 use kermit_proto::trace::{escape, unescape};
 use xmodem_proto::{BlockSize, Check, Command, Config, Event, Transfer};
 
@@ -98,47 +107,40 @@ fn parse_args(args: &[String]) -> Result<Args, Box<dyn std::error::Error>> {
     }
 }
 
-/// A Kermit `C` packet, sequence 0, block check 1, control prefix `#`.
-fn kermit_host_packet(text: &[u8]) -> Vec<u8> {
-    let mut data = Vec::new();
-    for &b in text {
-        let low = b & 0x7F;
-        if low < 0x20 || low == 0x7F {
-            data.push(b'#');
-            data.push(b ^ 0x40);
-        } else if low == b'#' {
-            data.push(b'#');
-            data.push(b);
-        } else {
-            data.push(b);
-        }
+/// A Kermit `C` packet, sequence 0, block check 1, control prefix `#`; an
+/// error if TEXT does not fit in one packet under the server's default MAXL.
+fn kermit_host_packet(text: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let data = prefix::encode_all(text, &Quoting::default());
+    let max = Packet::max_data(80, BlockCheck::Type1);
+    if data.len() > max {
+        return Err(format!(
+            "--host text too long: {} encoded bytes, at most {max} fit in one packet",
+            data.len()
+        )
+        .into());
     }
-    let tochar = |n: usize| (n as u8).wrapping_add(32);
-    let mut body = vec![tochar(data.len() + 3), tochar(0), b'C'];
-    body.extend_from_slice(&data);
-    let s: u32 = body.iter().map(|&b| u32::from(b)).sum();
-    let check = tochar(((s + ((s & 192) >> 6)) & 63) as usize);
-    let mut packet = vec![0x01];
-    packet.extend_from_slice(&body);
-    packet.push(check);
-    packet.push(b'\r');
-    packet
+    Ok(Packet::new(0, b'C', data).encode(BlockCheck::Type1, &Framing::default())?)
 }
 
-/// Read and log everything until the line has been quiet for `quiet`.
+/// Read and log everything until the line has been quiet for `quiet`;
+/// returns what was read.
 fn log_until_quiet(
     stream: &mut TcpStream,
     quiet: Duration,
     prefix: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let mut buf = [0u8; 2048];
+    let mut seen = Vec::new();
     stream.set_read_timeout(Some(quiet.max(Duration::from_millis(1))))?;
     loop {
         match stream.read(&mut buf) {
             Ok(0) => return Err("connection closed".into()),
-            Ok(n) => println!("{prefix}{}", escape(&buf[..n])),
+            Ok(n) => {
+                println!("{prefix}{}", escape(&buf[..n]));
+                seen.extend_from_slice(&buf[..n]);
+            }
             Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                return Ok(());
+                return Ok(seen);
             }
             Err(e) => return Err(e.into()),
         }
@@ -148,6 +150,7 @@ fn log_until_quiet(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let a = parse_args(&args)?;
+    let host_packet = a.host.as_deref().map(kermit_host_packet).transpose()?;
     println!(
         "# record-xmodem {}",
         escape(args.get(1..).unwrap_or_default().join(" ").as_bytes())
@@ -155,18 +158,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut stream = TcpStream::connect(&a.addr)?;
     // Drain stale input (the idle server's periodic NAKs, start characters
-    // already sent) for 500 ms.
-    log_until_quiet(&mut stream, Duration::from_millis(500), "# stale: ")?;
+    // already sent) until the line has been quiet for 500 ms.
+    let stale = log_until_quiet(&mut stream, Duration::from_millis(500), "# stale: ")?;
+    // The newest start character of a waiting XRECV is live: the receiver
+    // sends the next one only after its interval, and may give up first.
+    let live = match (&host_packet, &a.command, stale.last()) {
+        (None, Command::Send(_), Some(&b)) if Check::from_start_char(b).is_some() => Some(b),
+        _ => None,
+    };
 
-    if let Some(text) = &a.host {
-        let packet = kermit_host_packet(text);
-        stream.write_all(&packet)?;
-        println!("> {}", escape(&packet));
+    if let Some(packet) = &host_packet {
+        stream.write_all(packet)?;
+        println!("> {}", escape(packet));
     }
     println!("# xmodem start");
 
     let mut xfer = Transfer::new(a.config);
     xfer.start(Instant::now(), a.command)?;
+    if let Some(b) = live {
+        println!("< {}", escape(&[b]));
+        xfer.handle_input(Instant::now(), &[b]);
+    }
     let mut buf = [0u8; 2048];
     let mut outcome: Option<bool> = None;
     loop {

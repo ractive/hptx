@@ -128,11 +128,24 @@ impl Packet {
 
     /// NPAD x PADC, SOH, LEN, SEQ, TYPE, DATA, CHECK, EOL.
     ///
-    /// The data field must fit: `data.len() <= Packet::max_data(MAX_LEN, check)`.
-    /// Callers guarantee this; violating it is a bug, caught by a debug
-    /// assertion. In release builds the LEN byte saturates at `~` instead of
-    /// wrapping into a different, valid-looking length.
-    pub fn encode(&self, check: BlockCheck, framing: &Framing) -> Vec<u8> {
+    /// Fails if the data field does not fit in a (short) packet:
+    /// `data.len()` must be at most `Packet::max_data(MAX_LEN, check)`.
+    pub fn encode(&self, check: BlockCheck, framing: &Framing) -> Result<Vec<u8>, EncodeError> {
+        let max = Packet::max_data(MAX_LEN, check);
+        if self.data.len() > max {
+            return Err(EncodeError {
+                len: self.data.len(),
+                max,
+            });
+        }
+        Ok(self.wire(check, framing))
+    }
+
+    /// [`Packet::encode`] for data the caller has already fitted (the
+    /// client sizes every data field with [`Packet::max_data`]). Should the
+    /// invariant break, LEN saturates at `~` rather than wrapping into a
+    /// different, valid-looking length.
+    pub(crate) fn wire(&self, check: BlockCheck, framing: &Framing) -> Vec<u8> {
         let len = 2 + self.data.len() + check.len();
         debug_assert!(
             len <= MAX_LEN,
@@ -153,6 +166,27 @@ impl Packet {
         out
     }
 }
+
+/// [`Packet::encode`] was given a data field that does not fit in a packet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EncodeError {
+    /// Length of the data field.
+    pub len: usize,
+    /// Longest data field that fits with the block check used.
+    pub max: usize,
+}
+
+impl std::fmt::Display for EncodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "packet data too long: {} bytes, at most {} fit",
+            self.len, self.max
+        )
+    }
+}
+
+impl std::error::Error for EncodeError {}
 
 /// What the peer asked us to put around each packet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -206,35 +240,44 @@ impl Deframer {
     /// unchar(LEN) is < 3 or > 94, drop that SOH and rescan; if another SOH appears
     /// before the frame is complete, restart at the new SOH (all control chars are
     /// prefixed, so a bare SOH always starts a packet). Returns None if incomplete.
+    ///
+    /// Linear in the buffered input: the scan moves a cursor and the buffer is
+    /// shifted once per call, so a long run of SOH bytes costs no more than
+    /// any other noise.
     pub fn next_frame(&mut self) -> Option<Vec<u8>> {
+        let mut from = 0;
         loop {
-            match self.buf.iter().position(|&b| b == SOH) {
-                Some(i) => {
-                    self.buf.drain(..i);
-                }
-                None => {
-                    self.buf.clear();
-                    return None;
-                }
-            }
-            if self.buf.len() < 2 {
+            let Some(s) = self
+                .buf
+                .get(from..)
+                .and_then(|rest| rest.iter().position(|&b| b == SOH))
+                .map(|i| from + i)
+            else {
+                self.buf.clear();
                 return None;
-            }
-            let len = usize::from(unchar(self.buf[1]));
+            };
+            let Some(&len_byte) = self.buf.get(s + 1) else {
+                self.buf.drain(..s);
+                return None;
+            };
+            let len = usize::from(unchar(len_byte));
             if !(3..=94).contains(&len) {
-                self.buf.remove(0);
+                from = s + 1;
                 continue;
             }
             let total = 2 + len;
-            let end = total.min(self.buf.len());
-            if let Some(j) = self.buf[1..end].iter().position(|&b| b == SOH) {
-                self.buf.drain(..=j);
+            let end = (s + total).min(self.buf.len());
+            if let Some(j) = self.buf[s + 1..end].iter().position(|&b| b == SOH) {
+                from = s + 1 + j;
                 continue;
             }
-            if self.buf.len() < total {
+            if self.buf.len() < s + total {
+                self.buf.drain(..s);
                 return None;
             }
-            return Some(self.buf.drain(..total).collect());
+            let frame = self.buf[s..s + total].to_vec();
+            self.buf.drain(..s + total);
+            return Some(frame);
         }
     }
 
@@ -351,7 +394,10 @@ mod tests {
             let frame = &wire[..wire.len() - 1];
             let p = parse_frame(frame, BlockCheck::Type1).unwrap();
             assert_eq!(p, Packet::new(seq, kind, data.to_vec()), "{wire:?}");
-            assert_eq!(p.encode(BlockCheck::Type1, &Framing::default()), wire);
+            assert_eq!(
+                p.encode(BlockCheck::Type1, &Framing::default()),
+                Ok(wire.to_vec())
+            );
         }
     }
 
@@ -360,7 +406,7 @@ mod tests {
         let p = Packet::new(70, b'D', b"hello #M#J world".to_vec());
         assert_eq!(p.seq, 6);
         for t in [BlockCheck::Type1, BlockCheck::Type2, BlockCheck::Type3] {
-            let wire = p.encode(t, &Framing::default());
+            let wire = p.encode(t, &Framing::default()).unwrap();
             let frame = &wire[..wire.len() - 1];
             assert_eq!(parse_frame(frame, t).unwrap(), p);
         }
@@ -373,18 +419,21 @@ mod tests {
         assert_eq!(Packet::max_data(200, BlockCheck::Type3), 89);
         assert_eq!(Packet::max_data(3, BlockCheck::Type3), 0);
         let p = Packet::new(0, b'D', vec![b'x'; 89]);
-        let wire = p.encode(BlockCheck::Type3, &Framing::default());
+        let wire = p.encode(BlockCheck::Type3, &Framing::default()).unwrap();
         assert_eq!(wire[1], b'~');
         let frame = &wire[..wire.len() - 1];
         assert_eq!(parse_frame(frame, BlockCheck::Type3).unwrap(), p);
     }
 
     #[test]
-    #[should_panic(expected = "packet data too long")]
-    #[cfg(debug_assertions)]
-    fn oversized_packet_is_caught() {
+    fn oversized_packet_is_an_error() {
         let p = Packet::new(0, b'D', vec![b'x'; 90]);
-        let _ = p.encode(BlockCheck::Type3, &Framing::default());
+        let err = p.encode(BlockCheck::Type3, &Framing::default());
+        assert_eq!(err, Err(EncodeError { len: 90, max: 89 }));
+        let p = Packet::new(0, b'D', vec![b'x'; 91]);
+        assert!(p.encode(BlockCheck::Type1, &Framing::default()).is_ok());
+        let p = Packet::new(0, b'D', vec![b'x'; 92]);
+        assert!(p.encode(BlockCheck::Type1, &Framing::default()).is_err());
     }
 
     #[test]
@@ -394,14 +443,17 @@ mod tests {
             padc: 0,
             eol: b'\n',
         };
-        let wire = Packet::new(1, b'Y', vec![]).encode(BlockCheck::Type1, &f);
+        let wire = Packet::new(1, b'Y', vec![])
+            .encode(BlockCheck::Type1, &f)
+            .unwrap();
         assert_eq!(wire, b"\0\0\x01#!Y?\n");
     }
 
     #[test]
     fn bad_check_detected() {
-        let wire =
-            Packet::new(3, b'D', b"abcdef".to_vec()).encode(BlockCheck::Type3, &Framing::default());
+        let wire = Packet::new(3, b'D', b"abcdef".to_vec())
+            .encode(BlockCheck::Type3, &Framing::default())
+            .unwrap();
         let mut frame = wire[..wire.len() - 1].to_vec();
         frame[6] ^= 1;
         assert_eq!(
@@ -431,7 +483,7 @@ mod tests {
     fn nak_check_length_heuristic() {
         let nak = Packet::new(5, b'N', vec![]);
         for t in [BlockCheck::Type1, BlockCheck::Type2, BlockCheck::Type3] {
-            let wire = nak.encode(t, &Framing::default());
+            let wire = nak.encode(t, &Framing::default()).unwrap();
             let frame = &wire[..wire.len() - 1];
             assert_eq!(parse_frame(frame, BlockCheck::Type1).unwrap(), nak);
             assert_eq!(parse_frame(frame, BlockCheck::Type3).unwrap(), nak);
@@ -487,6 +539,26 @@ mod tests {
         assert_eq!(d.next_frame(), None);
         d.push(b"\x01#!Y?\r");
         assert_eq!(drain(&mut d), vec![b"\x01#!Y?".to_vec()]);
+    }
+
+    #[test]
+    fn deframer_soh_run_is_linear() {
+        // 1 MiB of SOH: every LEN byte is SOH (invalid). Quadratic resync
+        // would take minutes; one linear pass is milliseconds.
+        let mut d = Deframer::new();
+        d.push(&vec![SOH; 1 << 20]);
+        let t = std::time::Instant::now();
+        assert_eq!(d.next_frame(), None);
+        assert!(t.elapsed() < std::time::Duration::from_secs(2));
+        // The trailing SOH may still start a packet.
+        d.push(b"#!Y?\r");
+        assert_eq!(drain(&mut d), vec![b"\x01#!Y?".to_vec()]);
+        // A run of valid-looking SOH LEN pairs, each cut short by the next SOH.
+        let mut d = Deframer::new();
+        d.push(&b"\x01~".repeat(1 << 19));
+        let t = std::time::Instant::now();
+        assert_eq!(d.next_frame(), None);
+        assert!(t.elapsed() < std::time::Duration::from_secs(2));
     }
 
     #[test]

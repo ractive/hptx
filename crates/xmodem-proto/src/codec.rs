@@ -3,7 +3,6 @@
 //! A block is `SOH|STX, blk, 255-blk, data, check`: 128 data bytes after SOH,
 //! 1024 after STX; the check is one byte (sum of the data mod 256) or two
 //! bytes (CRC-16, high byte first; standard or HP's own, see [`Check`]).
-//! wiki: protocols/xmodem, protocols/xmodem-hp.
 
 /// Start of a 128-byte block.
 pub const SOH: u8 = 0x01;
@@ -31,7 +30,7 @@ pub const SUB: u8 = 0x1A;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Check {
     /// One byte: the sum of the data bytes mod 256. The only mode the 48G
-    /// series knows (wiki: protocols/xmodem-hp).
+    /// series knows.
     Checksum,
     /// Two bytes, high byte first: CRC-16 with polynomial #1021, MSB first,
     /// initial value 0 ("CRC-16/XMODEM"). Not the Kermit type-3 check, which
@@ -41,8 +40,7 @@ pub enum Check {
     /// CRC-16 the Saturn hardware and Kermit's type-3 check use (polynomial
     /// #1081 per nibble, LSB first, initial value 0, i.e. "CRC-16/KERMIT").
     /// The 49G's `XRECV` asks for it first (three `D`s, then NAK) and
-    /// accepts 1k and 128-byte blocks with it; verified on the emulated 49G
-    /// (wiki: questions/xmodem-hp-crc-mode).
+    /// accepts 1k and 128-byte blocks with it; verified on the emulated 49G.
     HpCrc,
 }
 
@@ -170,8 +168,26 @@ pub fn frame_len(size: BlockSize, check: Check) -> usize {
 }
 
 /// Encode block number `num` holding `data`, padded with `pad` to the full
-/// block size. `data` longer than the block is cut (callers never pass that).
-pub fn encode_block(num: u8, size: BlockSize, data: &[u8], pad: u8, check: Check) -> Vec<u8> {
+/// block size. Fails if `data` is longer than the block.
+pub fn encode_block(
+    num: u8,
+    size: BlockSize,
+    data: &[u8],
+    pad: u8,
+    check: Check,
+) -> Result<Vec<u8>, EncodeError> {
+    if data.len() > size.len() {
+        return Err(EncodeError {
+            len: data.len(),
+            max: size.len(),
+        });
+    }
+    Ok(frame_block(num, size, data, pad, check))
+}
+
+/// [`encode_block`] for data the caller has already cut to the block size
+/// (the sender always does); longer data is cut.
+pub(crate) fn frame_block(num: u8, size: BlockSize, data: &[u8], pad: u8, check: Check) -> Vec<u8> {
     let n = size.len();
     let mut out = Vec::with_capacity(frame_len(size, check));
     out.push(size.header());
@@ -184,6 +200,27 @@ pub fn encode_block(num: u8, size: BlockSize, data: &[u8], pad: u8, check: Check
     out.extend_from_slice(&check_bytes);
     out
 }
+
+/// [`encode_block`] was given more data than fits in the block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EncodeError {
+    /// Length of the data.
+    pub len: usize,
+    /// The block size.
+    pub max: usize,
+}
+
+impl std::fmt::Display for EncodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "block data too long: {} bytes, the block holds {}",
+            self.len, self.max
+        )
+    }
+}
+
+impl std::error::Error for EncodeError {}
 
 /// A complete block decoded from the wire.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -278,7 +315,7 @@ mod tests {
 
     #[test]
     fn encode_checksum_block_bytes() {
-        let b = encode_block(1, BlockSize::B128, b"AB", SUB, Check::Checksum);
+        let b = encode_block(1, BlockSize::B128, b"AB", SUB, Check::Checksum).unwrap();
         assert_eq!(b.len(), 132);
         assert_eq!(&b[..5], &[SOH, 0x01, 0xFE, b'A', b'B']);
         assert!(b[5..131].iter().all(|&x| x == SUB));
@@ -289,7 +326,7 @@ mod tests {
     #[test]
     fn encode_crc_block_bytes() {
         let data: Vec<u8> = (0..128).collect();
-        let b = encode_block(0xFF, BlockSize::B128, &data, 0, Check::Crc16);
+        let b = encode_block(0xFF, BlockSize::B128, &data, 0, Check::Crc16).unwrap();
         assert_eq!(b.len(), 133);
         assert_eq!(&b[..3], &[SOH, 0xFF, 0x00]);
         let crc = crc16(&data);
@@ -298,7 +335,7 @@ mod tests {
 
     #[test]
     fn encode_1k_block() {
-        let b = encode_block(2, BlockSize::B1k, &[7; 1000], 0, Check::Crc16);
+        let b = encode_block(2, BlockSize::B1k, &[7; 1000], 0, Check::Crc16).unwrap();
         assert_eq!(b.len(), 1029);
         assert_eq!(&b[..3], &[STX, 2, 0xFD]);
         assert_eq!(b[1002], 7);
@@ -306,8 +343,17 @@ mod tests {
     }
 
     #[test]
+    fn oversized_block_is_an_error() {
+        assert_eq!(
+            encode_block(1, BlockSize::B128, &[0; 129], SUB, Check::Crc16),
+            Err(EncodeError { len: 129, max: 128 })
+        );
+        assert!(encode_block(1, BlockSize::B1k, &[0; 1024], SUB, Check::Crc16).is_ok());
+    }
+
+    #[test]
     fn decode_round_trip_and_errors() {
-        let b = encode_block(3, BlockSize::B128, b"hello", SUB, Check::Crc16);
+        let b = encode_block(3, BlockSize::B128, b"hello", SUB, Check::Crc16).unwrap();
         let got = decode_block(&b, Check::Crc16).unwrap();
         assert_eq!(got.num, 3);
         assert!(got.data.starts_with(b"hello"));

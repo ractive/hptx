@@ -18,7 +18,7 @@
 //! HP specifics live in the caller: starting `XRECV`/`XSEND` on the
 //! calculator, and stripping the padding of the last block (the receiver hands
 //! back every byte it received; [`Event::FileEnd`] says how much padding there
-//! can be). wiki: protocols/xmodem, protocols/xmodem-hp.
+//! can be).
 //!
 //! # Starting a transfer on the calculator
 //!
@@ -48,12 +48,16 @@
 //!   receiver's `FileEnd`, and finally exactly one `Done` or `Error`.
 //! - [`Transfer::next_timeout`] is the earliest instant at which the machine
 //!   wants to be called again (reply deadline, start-character interval,
-//!   inter-byte timeout, quiet line before a NAK). Use it as the read timeout.
+//!   inter-byte timeout, quiet line before a NAK, end of the linger). Use it
+//!   as the read timeout.
 //!
 //! Every call that can queue output takes `now`, so retransmit deadlines are
 //! computed from the caller's clock. After `Done` or `Error` keep calling
 //! `poll_output` until it returns `None`: the final ACK or the CANs may still
-//! be queued.
+//! be queued. A receiver then lingers for [`Config::linger`] to re-ACK a
+//! retransmitted EOT in case the final ACK was lost; keep driving it until
+//! [`Transfer::next_timeout`] is `None`, or [`Transfer::start`] the next
+//! transfer, which ends the linger.
 //!
 //! # Driver loop
 //!

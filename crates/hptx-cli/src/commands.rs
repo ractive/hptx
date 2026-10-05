@@ -333,14 +333,9 @@ impl Ctx {
         let addr = crate::port::resolve(self.global.port.as_deref())?;
         self.link.addr = Some(addr.clone());
         let link = transport::open(&addr).with_context(|| format!("cannot open {addr}"))?;
-        let options = Options {
-            kermit: kermit_proto::Config {
-                timeout: self.link.timeout,
-                retries: self.link.retries,
-                ..kermit_proto::Config::default()
-            },
-            ..Options::default()
-        };
+        let mut options = Options::default();
+        options.kermit.timeout = self.link.timeout;
+        options.kermit.retries = self.link.retries;
         let session = Session::new(link, options).with_context(|| format!("cannot open {addr}"))?;
         Ok(Calculator::new(session))
     }

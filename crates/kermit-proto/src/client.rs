@@ -10,7 +10,11 @@ use crate::params::{InitParams, Negotiated, negotiate};
 use crate::prefix::{self, Quoting};
 
 /// Tunables of a [`Client`].
+///
+/// Non-exhaustive: start from [`Config::default`] and set the fields you
+/// need.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct Config {
     /// Block check we offer in our Send-Init (default type 3).
     pub block_check: BlockCheck,
@@ -29,6 +33,19 @@ pub struct Config {
     /// is tolerated before we resend (default 1 s); such a NAK is usually a
     /// stale one from the idle server.
     pub nak_grace: Duration,
+    /// After we ACK the final `B` packet of a receive, keep answering a
+    /// retransmitted `B` with the same ACK for this long (default 1 s), in
+    /// case our ACK was damaged or lost. `Done` is emitted when the ACK is
+    /// queued; the linger emits nothing. [`Client::is_idle`] is false while
+    /// it lasts; [`Client::start`] ends it early. `Duration::ZERO` turns it
+    /// off. A peer that only retransmits after its own timeout (the TIME
+    /// we send, [`Config::timeout`]) is caught only by a linger that long.
+    pub linger: Duration,
+    /// Receive: most decoded data bytes accepted in one transaction (all
+    /// files and server text together); more fails the transaction with
+    /// [`Error::TooLarge`] and an E packet. Default 4 MiB, well above the
+    /// largest HP object; `None` means no limit.
+    pub max_size: Option<usize>,
 }
 
 impl Default for Config {
@@ -41,9 +58,14 @@ impl Default for Config {
             retries: 5,
             packet_pause: Duration::ZERO,
             nak_grace: Duration::from_secs(1),
+            linger: Duration::from_secs(1),
+            max_size: Some(DEFAULT_MAX_SIZE),
         }
     }
 }
+
+/// Default [`Config::max_size`]: 4 MiB.
+const DEFAULT_MAX_SIZE: usize = 4 << 20;
 
 /// A file to send: the name the server should store it under, and its bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,6 +78,7 @@ pub struct OutgoingFile {
 
 /// One client transaction.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Command {
     /// I exchange (parameters only).
     Info,
@@ -75,6 +98,7 @@ pub enum Command {
 
 /// Something that happened during a transaction.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Event {
     /// A file starts. Receive: the name from the F packet. Send: the name from
     /// the ACK to F if non-empty, else the name we sent.
@@ -100,12 +124,14 @@ pub enum Event {
     ServerText(Vec<u8>),
     /// Terminal failure; the client is idle.
     Error(Error),
-    /// Terminal success; the client is idle.
+    /// Terminal success. The client is idle, or lingers after the final ACK
+    /// of a receive ([`Config::linger`]).
     Done,
 }
 
 /// Why a transaction failed.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// Decoded data of an E packet from the peer.
     Remote(Vec<u8>),
@@ -115,6 +141,11 @@ pub enum Error {
     Protocol(String),
     /// [`Client::cancel`] was called.
     Cancelled,
+    /// The received data exceeded [`Config::max_size`]; we sent an E packet.
+    TooLarge {
+        /// The limit that was exceeded.
+        limit: usize,
+    },
 }
 
 impl fmt::Display for Error {
@@ -124,6 +155,9 @@ impl fmt::Display for Error {
             Error::Timeout => f.write_str("timed out: too many retries"),
             Error::Protocol(msg) => write!(f, "protocol error: {msg}"),
             Error::Cancelled => f.write_str("cancelled"),
+            Error::TooLarge { limit } => {
+                write!(f, "received data exceeds the limit of {limit} bytes")
+            }
         }
     }
 }
@@ -135,6 +169,7 @@ const DEFAULT_MAXL: usize = 80;
 
 /// Why [`Client::start`] refused a command.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum StartError {
     /// A transaction is already running.
     Busy,
@@ -193,11 +228,16 @@ enum Phase {
     Idle,
     /// Waiting for the reply to the command packet (seq 0).
     Await(Kind),
-    /// Receiving a transfer; `text` is Some while in X (text) mode.
+    /// Receiving a transfer; `text` is Some while in X (text) mode, `file`
+    /// is true between an F and its Z.
     Receive {
         text: Option<Vec<u8>>,
+        file: bool,
     },
     Send(Sending),
+    /// The final ACK of a receive is out; re-ACK a retransmitted B (seq
+    /// `self.seq`) until `self.deadline`.
+    Linger,
 }
 
 /// Sans-IO Kermit client. See the crate documentation for the driver loop.
@@ -216,6 +256,8 @@ pub struct Client {
     events: VecDeque<Event>,
     deadline: Option<Instant>,
     retries: u32,
+    /// Receive: decoded data bytes accepted in this transaction.
+    received: usize,
 }
 
 impl Client {
@@ -245,17 +287,23 @@ impl Client {
             events: VecDeque::new(),
             deadline: None,
             retries: 0,
+            received: 0,
         }
     }
 
-    /// Begin a transaction. Clears buffered input. First packet is available
-    /// from `poll_output(now)` immediately.
+    /// Begin a transaction. First packet is available from
+    /// `poll_output(now)` immediately.
+    ///
+    /// Starts from a clean slate: buffered input, output and events of the
+    /// previous transaction that were not polled yet are dropped, and
+    /// [`Client::peer_params`] is cleared. A linger after the previous
+    /// transaction ([`Config::linger`]) ends.
     ///
     /// Fails with [`StartError::Busy`] while a transaction is running and with
     /// [`StartError::TooLong`] if the encoded command data does not fit in one
     /// packet; the client is unchanged in both cases.
     pub fn start(&mut self, now: Instant, command: Command) -> Result<(), StartError> {
-        if !self.is_idle() {
+        if !matches!(self.phase, Phase::Idle | Phase::Linger) {
             return Err(StartError::Busy);
         }
         let q = Quoting::default();
@@ -290,12 +338,16 @@ impl Client {
             });
         }
         self.deframer.clear();
+        self.queue.clear();
+        self.events.clear();
         self.neg = None;
+        self.peer = None;
         self.seq = 0;
         self.retries = 0;
+        self.received = 0;
         self.deadline = None;
         self.phase = phase;
-        let bytes = Packet::new(0, kind, data).encode(BlockCheck::Type1, &Framing::default());
+        let bytes = Packet::new(0, kind, data).wire(BlockCheck::Type1, &Framing::default());
         self.last_sent = bytes.clone();
         self.queue.push_back((now, bytes));
         Ok(())
@@ -324,6 +376,7 @@ impl Client {
                 Phase::Await(kind) => self.on_await(now, kind, parsed),
                 Phase::Receive { .. } => self.on_receive(now, parsed),
                 Phase::Send(_) => self.on_send(now, parsed, raw_seq),
+                Phase::Linger => self.on_linger(now, parsed),
             }
         }
         if self.is_idle() {
@@ -340,12 +393,14 @@ impl Client {
             && now >= d
         {
             self.deadline = None;
-            if matches!(self.phase, Phase::Receive { .. }) {
+            match self.phase {
+                Phase::Linger => self.end_linger(),
                 // Receiving: NAK the packet we expect (Kermit), not the last ACK.
-                let nak = self.nak();
-                self.retry_with(now, now, nak);
-            } else {
-                self.retry(now, now);
+                Phase::Receive { .. } => {
+                    let nak = self.nak();
+                    self.retry_with(now, now, nak);
+                }
+                _ => self.retry(now, now),
             }
         }
     }
@@ -360,7 +415,8 @@ impl Client {
             _ => return None,
         }
         let (_, bytes) = self.queue.pop_front()?;
-        if !self.is_idle() {
+        // The linger's deadline is fixed when it starts.
+        if !matches!(self.phase, Phase::Idle | Phase::Linger) {
             // Overflow (absurdly large timeout) means no deadline.
             self.deadline = now.checked_add(self.config.timeout);
         }
@@ -381,21 +437,25 @@ impl Client {
         }
     }
 
-    /// No transaction running (output may still be queued).
+    /// No transaction running and no linger after one (output may still be
+    /// queued).
     pub fn is_idle(&self) -> bool {
         matches!(self.phase, Phase::Idle)
     }
 
     /// Abort: queue an E packet "Cancelled", emit Error(Cancelled), go idle.
-    /// No-op when idle.
+    /// No-op when idle. During the linger after `Done` it only ends the
+    /// linger: no E packet, no event.
     pub fn cancel(&mut self, now: Instant) {
-        if self.is_idle() {
-            return;
+        match self.phase {
+            Phase::Idle => {}
+            Phase::Linger => self.end_linger(),
+            _ => self.fail(now, Error::Cancelled, Some(b"Cancelled")),
         }
-        self.fail(now, Error::Cancelled, Some(b"Cancelled"));
     }
 
-    /// Parameters the peer sent in its last S, or ACK to our S/I.
+    /// Parameters the peer sent in its S, or ACK to our S/I, in the current
+    /// (or last finished) transaction; cleared by [`Client::start`].
     pub fn peer_params(&self) -> Option<InitParams> {
         self.peer
     }
@@ -426,7 +486,7 @@ impl Client {
 
     /// NAK for the expected seq with the negotiated check and framing.
     fn nak(&self) -> Vec<u8> {
-        Packet::new(self.seq, b'N', Vec::new()).encode(self.check(), &self.framing())
+        Packet::new(self.seq, b'N', Vec::new()).wire(self.check(), &self.framing())
     }
 
     /// Queue a new packet in reply to input; it becomes the retransmit copy.
@@ -438,7 +498,7 @@ impl Client {
     }
 
     fn reply_packet(&mut self, now: Instant, seq: u8, kind: u8, data: Vec<u8>) {
-        let bytes = Packet::new(seq, kind, data).encode(self.check(), &self.framing());
+        let bytes = Packet::new(seq, kind, data).wire(self.check(), &self.framing());
         self.reply(now, bytes);
     }
 
@@ -473,13 +533,38 @@ impl Client {
         self.deadline = None;
     }
 
+    /// Done after the final ACK to B (queued at `now`): linger for
+    /// [`Config::linger`] after it goes out, or go idle at once.
+    fn finish_lingering(&mut self, now: Instant) {
+        self.finish(Event::Done);
+        // A linger that overflows `Instant` would never end: skip it.
+        if let Some(end) = self.paused(now).checked_add(self.config.linger)
+            && !self.config.linger.is_zero()
+        {
+            self.phase = Phase::Linger;
+            self.deadline = Some(end);
+        }
+    }
+
+    fn end_linger(&mut self) {
+        self.phase = Phase::Idle;
+        self.deadline = None;
+        self.deframer.clear();
+    }
+
+    /// Drop queued copies of `bytes` that have not gone out yet: the reply
+    /// that made them obsolete has arrived.
+    fn drop_queued(&mut self, bytes: &[u8]) {
+        self.queue.retain(|(_, b)| b.as_slice() != bytes);
+    }
+
     /// Queue an E packet (if `text`), emit Error, go idle. Output still queued
     /// (a held-back ACK, D or F) is dropped first so nothing follows the E.
     fn fail(&mut self, now: Instant, err: Error, text: Option<&[u8]>) {
         self.queue.clear();
         if let Some(text) = text {
             let data = prefix::encode_all(text, &self.send_quoting());
-            let bytes = Packet::new(self.seq, b'E', data).encode(self.check(), &self.framing());
+            let bytes = Packet::new(self.seq, b'E', data).wire(self.check(), &self.framing());
             self.queue.push_back((now, bytes));
         }
         self.finish(Event::Error(err));
@@ -524,12 +609,15 @@ impl Client {
                 self.peer = Some(theirs);
                 // The ACK to S uses type 1 but already the peer's framing.
                 let bytes =
-                    Packet::new(0, b'Y', self.ours.encode()).encode(BlockCheck::Type1, &n.framing);
+                    Packet::new(0, b'Y', self.ours.encode()).wire(BlockCheck::Type1, &n.framing);
                 self.reply(now, bytes);
                 self.neg = Some(n);
                 self.seq = 1;
                 self.retries = 0;
-                self.phase = Phase::Receive { text: None };
+                self.phase = Phase::Receive {
+                    text: None,
+                    file: false,
+                };
             }
             b'Y' if p.seq == 0 => match kind {
                 Kind::Info => {
@@ -561,9 +649,8 @@ impl Client {
             Err(FrameError::BadCheck) => {
                 // Not stored as last_sent: a duplicate still gets the last ACK.
                 let nak = self.nak();
-                self.deadline = None;
                 let due = self.paused(now);
-                self.queue.push_back((due, nak));
+                self.retry_with(now, due, nak);
                 return;
             }
             Err(FrameError::BadLength) => return,
@@ -582,19 +669,27 @@ impl Client {
             }
             return;
         }
+        if p.kind != b'N' {
+            // Packet n arrived: a NAK for it still queued is obsolete.
+            let nak = self.nak();
+            self.drop_queued(&nak);
+        }
         let q = self.recv_quoting();
         match p.kind {
             b'F' | b'D' | b'Z' => {
                 let Some(data) = self.decode(now, &p.data, &q) else {
                     return;
                 };
-                let text = match &mut self.phase {
-                    Phase::Receive { text } => text,
-                    _ => return,
+                if p.kind == b'D' && !self.accept(now, data.len()) {
+                    return;
+                }
+                let Phase::Receive { text, file } = &mut self.phase else {
+                    return;
                 };
                 match (p.kind, text.as_mut()) {
                     (b'F', _) => {
                         *text = None;
+                        *file = true;
                         self.events.push_back(Event::FileStart { name: data });
                     }
                     (b'D', Some(buf)) => buf.extend_from_slice(&data),
@@ -603,20 +698,37 @@ impl Client {
                         let buf = text.take().unwrap_or_default();
                         self.events.push_back(Event::ServerText(buf));
                     }
-                    (_, None) => self.events.push_back(Event::FileEnd {
-                        discarded: data == b"D",
-                    }),
+                    (_, None) => {
+                        *file = false;
+                        self.events.push_back(Event::FileEnd {
+                            discarded: data == b"D",
+                        });
+                    }
                 }
             }
             b'X' => {
-                if let Phase::Receive { text } = &mut self.phase {
+                if let Phase::Receive { text, .. } = &mut self.phase {
                     *text = Some(Vec::new());
                 }
             }
             b'A' => {}
             b'B' => {
+                let open = match &self.phase {
+                    Phase::Receive { text, file } => *file || text.is_some(),
+                    _ => false,
+                };
+                if open {
+                    // Acknowledging it would pass off a truncated file (or
+                    // reply text) as a success.
+                    self.protocol(
+                        now,
+                        "B before the Z of the current file".to_string(),
+                        b"Unexpected B",
+                    );
+                    return;
+                }
                 self.reply_packet(now, n, b'Y', Vec::new());
-                self.finish(Event::Done);
+                self.finish_lingering(now);
                 return;
             }
             b'N' => return,
@@ -632,6 +744,31 @@ impl Client {
         self.reply_packet(now, n, b'Y', Vec::new());
         self.seq = (n + 1) % 64;
         self.retries = 0;
+    }
+
+    /// Count `len` received data bytes against [`Config::max_size`]; false
+    /// (and the transaction failed) if they do not fit.
+    fn accept(&mut self, now: Instant, len: usize) -> bool {
+        self.received = self.received.saturating_add(len);
+        match self.config.max_size {
+            Some(limit) if self.received > limit => {
+                self.fail(now, Error::TooLarge { limit }, Some(b"Too large"));
+                false
+            }
+            _ => true,
+        }
+    }
+
+    /// After the final ACK: answer a retransmitted B with the same ACK;
+    /// anything else is ignored.
+    fn on_linger(&mut self, now: Instant, parsed: Result<Packet, FrameError>) {
+        if let Ok(p) = parsed
+            && p.kind == b'B'
+            && p.seq == self.seq
+        {
+            let due = self.paused(now);
+            self.queue.push_back((due, self.last_sent.clone()));
+        }
     }
 
     // ---- sending ----
@@ -658,8 +795,14 @@ impl Client {
                 let q = self.recv_quoting();
                 self.remote(&p.data, &q);
             }
-            b'Y' if p.seq == n => self.on_ack(now, &p.data),
-            b'N' if p.seq == (n + 1) % 64 => self.on_ack(now, &[]),
+            b'Y' if p.seq == n => {
+                self.drop_obsolete_retry();
+                self.on_ack(now, &p.data);
+            }
+            b'N' if p.seq == (n + 1) % 64 => {
+                self.drop_obsolete_retry();
+                self.on_ack(now, &[]);
+            }
             b'N' if p.seq == n => {
                 if init {
                     self.stale_nak(now);
@@ -670,6 +813,15 @@ impl Client {
             }
             _ => {}
         }
+    }
+
+    /// Packet n is acknowledged: a retransmission of it still queued (from a
+    /// NAK or damaged reply in the same input, or held back by
+    /// `packet_pause`) would only delay the next packet.
+    fn drop_obsolete_retry(&mut self) {
+        let sent = std::mem::take(&mut self.last_sent);
+        self.drop_queued(&sent);
+        self.last_sent = sent;
     }
 
     fn send_next(&mut self, now: Instant, kind: u8, data: Vec<u8>) {
@@ -863,7 +1015,9 @@ mod tests {
     const OURS: &[u8] = b"~4 @-#Y3~";
 
     fn wire(seq: u8, kind: u8, data: &[u8], check: BlockCheck) -> Vec<u8> {
-        Packet::new(seq, kind, data.to_vec()).encode(check, &Framing::default())
+        Packet::new(seq, kind, data.to_vec())
+            .encode(check, &Framing::default())
+            .unwrap()
     }
 
     fn out(seq: u8, kind: u8, data: &[u8], check: BlockCheck) -> String {
@@ -1558,6 +1712,272 @@ mod tests {
         assert_eq!(c.poll_output(now), Some(ack));
         c.handle_timeout(now);
         assert_eq!(c.poll_output(now), None);
+        assert_eq!(c.poll_event(), None);
+    }
+
+    /// [`get_started`], then F(1) "F" with its ACK.
+    fn get_file_open(config: Config) -> (Client, Instant) {
+        let (mut c, now) = get_started(config);
+        c.handle_input(now, &wire(1, b'F', b"F", T3));
+        assert_eq!(c.poll_output(now), Some(wire(1, b'Y', b"", T3)));
+        (c, now)
+    }
+
+    fn all_events(c: &mut Client) -> Vec<Event> {
+        std::iter::from_fn(|| c.poll_event()).collect()
+    }
+
+    #[test]
+    fn lost_final_ack_is_answered_while_lingering() {
+        let config = cfg();
+        let linger = config.linger;
+        let (mut c, now) = get_file_open(config);
+        c.handle_input(now, &wire(2, b'Z', b"", T3));
+        assert_eq!(c.poll_output(now), Some(wire(2, b'Y', b"", T3)));
+        c.handle_input(now, &wire(3, b'B', b"", T3));
+        let ack = wire(3, b'Y', b"", T3);
+        assert_eq!(c.poll_output(now), Some(ack.clone()));
+        assert_eq!(
+            all_events(&mut c),
+            vec![
+                Event::FileStart {
+                    name: b"F".to_vec()
+                },
+                Event::FileEnd { discarded: false },
+                Event::Done
+            ]
+        );
+        assert!(!c.is_idle());
+        assert_eq!(c.next_timeout(), Some(now + linger));
+        // Our ACK was lost: the server sends B again and gets the same ACK,
+        // without a second Done. Other packets are ignored.
+        let t = now + linger / 2;
+        c.handle_input(t, &wire(3, b'B', b"", T3));
+        assert_eq!(c.poll_output(t), Some(ack.clone()));
+        c.handle_input(t, &wire(2, b'Z', b"", T3));
+        c.handle_input(t, b"\x01# N3\r");
+        assert_eq!(c.poll_output(t), None);
+        assert_eq!(c.poll_event(), None);
+        // The re-ACK does not extend the linger.
+        assert_eq!(c.next_timeout(), Some(now + linger));
+        c.handle_timeout(now + linger);
+        assert!(c.is_idle());
+        assert_eq!(c.next_timeout(), None);
+        c.handle_input(now + linger, &wire(3, b'B', b"", T3));
+        assert_eq!(c.poll_output(now + linger), None);
+        assert_eq!(c.poll_event(), None);
+    }
+
+    #[test]
+    fn start_and_cancel_end_the_linger() {
+        let (mut c, now) = get_started(cfg());
+        c.handle_input(now, &wire(1, b'B', b"", T3));
+        assert_eq!(c.poll_output(now), Some(wire(1, b'Y', b"", T3)));
+        assert_eq!(all_events(&mut c), vec![Event::Done]);
+        c.cancel(now);
+        assert!(c.is_idle());
+        assert_eq!(c.poll_output(now), None);
+        assert_eq!(c.poll_event(), None);
+
+        let (mut c, now) = get_started(cfg());
+        c.handle_input(now, &wire(1, b'B', b"", T3));
+        assert!(!c.is_idle());
+        c.start(now, Command::Finish).unwrap();
+        assert_eq!(c.poll_output(now), Some(wire(0, b'G', b"F", T1)));
+        assert_eq!(c.poll_output(now), None);
+        assert_eq!(c.poll_event(), None);
+    }
+
+    #[test]
+    fn zero_linger_goes_idle_at_once() {
+        let config = Config {
+            linger: Duration::ZERO,
+            ..cfg()
+        };
+        let (mut c, now) = get_started(config);
+        c.handle_input(now, &wire(1, b'B', b"", T3));
+        assert!(c.is_idle());
+        assert_eq!(c.poll_output(now), Some(wire(1, b'Y', b"", T3)));
+        assert_eq!(c.next_timeout(), None);
+    }
+
+    #[test]
+    fn b_before_z_is_a_protocol_error() {
+        let (mut c, now) = get_file_open(cfg());
+        c.handle_input(now, &wire(2, b'D', b"abc", T3));
+        assert_eq!(c.poll_output(now), Some(wire(2, b'Y', b"", T3)));
+        c.handle_input(now, &wire(3, b'B', b"", T3));
+        assert_eq!(c.poll_output(now), Some(wire(3, b'E', b"Unexpected B", T3)));
+        let ev = all_events(&mut c);
+        assert!(matches!(
+            ev.as_slice(),
+            [_, Event::Data(_), Event::Error(Error::Protocol(_))]
+        ));
+        assert!(c.is_idle());
+    }
+
+    #[test]
+    fn b_with_text_buffered_is_a_protocol_error() {
+        let (mut c, now) = get_started(cfg());
+        c.handle_input(now, &wire(1, b'X', b"", T3));
+        assert_eq!(c.poll_output(now), Some(wire(1, b'Y', b"", T3)));
+        c.handle_input(now, &wire(2, b'D', b"partial", T3));
+        assert_eq!(c.poll_output(now), Some(wire(2, b'Y', b"", T3)));
+        c.handle_input(now, &wire(3, b'B', b"", T3));
+        assert_eq!(c.poll_output(now), Some(wire(3, b'E', b"Unexpected B", T3)));
+        assert!(matches!(
+            all_events(&mut c).as_slice(),
+            [Event::Error(Error::Protocol(_))]
+        ));
+    }
+
+    #[test]
+    fn ack_drops_a_queued_retransmission() {
+        let pause = Duration::from_millis(100);
+        let config = Config {
+            packet_pause: pause,
+            ..cfg()
+        };
+        let now = Instant::now();
+        let mut c = Client::new(config);
+        c.start(now, Command::Send(vec![file(b"A", b"x")])).unwrap();
+        assert_eq!(c.poll_output(now), Some(wire(0, b'S', OURS, T1)));
+        c.handle_input(now, &wire(0, b'Y', PEER_SMALL, T1));
+        let t = now + pause;
+        assert_eq!(c.poll_output(t), Some(wire(1, b'F', b"A", T3)));
+        // A NAK and the ACK for F in one read: the resend the NAK queued
+        // (held back by the pause) is dropped, D goes out next.
+        let mut input = wire(1, b'N', b"", T3);
+        input.extend(wire(1, b'Y', b"", T3));
+        c.handle_input(t, &input);
+        let t = t + pause;
+        assert_eq!(c.poll_output(t), Some(wire(2, b'D', b"x", T3)));
+        assert_eq!(c.poll_output(t), None);
+        // Same with a NAK for n + 1 as the ACK.
+        let mut input = wire(2, b'N', b"", T3);
+        input.extend(wire(3, b'N', b"", T3));
+        c.handle_input(t, &input);
+        let t = t + pause;
+        assert_eq!(c.poll_output(t), Some(wire(3, b'Z', b"", T3)));
+        assert_eq!(c.poll_output(t), None);
+    }
+
+    #[test]
+    fn packet_drops_a_queued_nak() {
+        let pause = Duration::from_millis(100);
+        let config = Config {
+            packet_pause: pause,
+            ..cfg()
+        };
+        let now = Instant::now();
+        let mut c = Client::new(config);
+        c.start(now, Command::Get(b"F".to_vec())).unwrap();
+        assert!(c.poll_output(now).is_some());
+        c.handle_input(now, &wire(0, b'S', b"~* @-#Y3", T1));
+        assert_eq!(c.poll_output(now + pause), Some(wire(0, b'Y', OURS, T1)));
+        // A damaged F, then the good retransmission in the same read.
+        let mut bad = wire(1, b'F', b"F", T3);
+        bad[5] ^= 1;
+        bad.extend(wire(1, b'F', b"F", T3));
+        c.handle_input(now + pause, &bad);
+        let t = now + pause * 2;
+        assert_eq!(c.poll_output(t), Some(wire(1, b'Y', b"", T3)));
+        assert_eq!(c.poll_output(t), None);
+    }
+
+    #[test]
+    fn bad_check_naks_count_as_retries() {
+        let config = Config {
+            retries: 2,
+            ..cfg()
+        };
+        let (mut c, now) = get_file_open(config);
+        let mut bad = wire(2, b'D', b"abc", T3);
+        bad[5] ^= 1;
+        for _ in 0..2 {
+            c.handle_input(now, &bad);
+            assert_eq!(c.poll_output(now), Some(wire(2, b'N', b"", T3)));
+        }
+        c.handle_input(now, &bad);
+        assert_eq!(
+            c.poll_output(now),
+            Some(wire(2, b'E', b"Too many retries", T3))
+        );
+        assert_eq!(
+            all_events(&mut c).last(),
+            Some(&Event::Error(Error::Timeout))
+        );
+        // A good packet in between resets the count.
+        let config = Config {
+            retries: 1,
+            ..cfg()
+        };
+        let (mut c, now) = get_file_open(config);
+        c.handle_input(now, &bad);
+        assert_eq!(c.poll_output(now), Some(wire(2, b'N', b"", T3)));
+        c.handle_input(now, &wire(2, b'D', b"abc", T3));
+        assert_eq!(c.poll_output(now), Some(wire(2, b'Y', b"", T3)));
+        let mut bad = wire(3, b'D', b"def", T3);
+        bad[5] ^= 1;
+        c.handle_input(now, &bad);
+        assert_eq!(c.poll_output(now), Some(wire(3, b'N', b"", T3)));
+    }
+
+    #[test]
+    fn receive_size_cap() {
+        let config = Config {
+            max_size: Some(5),
+            ..cfg()
+        };
+        let (mut c, now) = get_file_open(config);
+        c.handle_input(now, &wire(2, b'D', b"abc", T3));
+        assert_eq!(c.poll_output(now), Some(wire(2, b'Y', b"", T3)));
+        c.handle_input(now, &wire(3, b'D', b"de", T3));
+        assert_eq!(c.poll_output(now), Some(wire(3, b'Y', b"", T3)));
+        c.handle_input(now, &wire(4, b'D', b"f", T3));
+        assert_eq!(c.poll_output(now), Some(wire(4, b'E', b"Too large", T3)));
+        assert_eq!(
+            all_events(&mut c).last(),
+            Some(&Event::Error(Error::TooLarge { limit: 5 }))
+        );
+        assert!(c.is_idle());
+        // Server text counts too.
+        let config = Config {
+            max_size: Some(2),
+            ..cfg()
+        };
+        let (mut c, now) = get_started(config);
+        c.handle_input(now, &wire(1, b'X', b"", T3));
+        assert_eq!(c.poll_output(now), Some(wire(1, b'Y', b"", T3)));
+        c.handle_input(now, &wire(2, b'D', b"abc", T3));
+        assert_eq!(c.poll_output(now), Some(wire(2, b'E', b"Too large", T3)));
+        assert_eq!(Config::default().max_size, Some(4 << 20));
+    }
+
+    #[test]
+    fn start_clears_the_previous_transaction() {
+        let pause = Duration::from_millis(100);
+        let config = Config {
+            packet_pause: pause,
+            ..cfg()
+        };
+        let now = Instant::now();
+        let mut c = Client::new(config);
+        c.start(now, Command::Info).unwrap();
+        assert!(c.poll_output(now).is_some());
+        c.handle_input(now, b"\x01+ Y~& @-# 3,\r");
+        assert!(c.peer_params().is_some());
+        assert!(c.is_idle());
+        // Done not polled; a failed transaction leaves an E packet queued.
+        c.start(now, Command::Host(b"X".to_vec())).unwrap();
+        assert_eq!(c.peer_params(), None);
+        assert_eq!(c.poll_event(), None);
+        assert!(c.poll_output(now).is_some());
+        c.handle_input(now, b"\x01+ S~* @-#Y3$\r");
+        c.cancel(now);
+        c.start(now, Command::Finish).unwrap();
+        assert_eq!(c.poll_output(now + pause), Some(wire(0, b'G', b"F", T1)));
+        assert_eq!(c.poll_output(now + pause), None);
         assert_eq!(c.poll_event(), None);
     }
 
