@@ -21,6 +21,10 @@ fmt:
 e2e:
     HPTX_E2E_ADDR={{e2e_addr}} cargo test -p hptx-core --test e2e -- --nocapture
 
+# e2e suite against the in-process saturnus emulator (HP 48SX ROM J path)
+e2e-saturnus rom="../saturnus/roms/sxrom-j":
+    HPTX_E2E_ADDR=saturnus://$(cd "$(dirname {{rom}})" && pwd)/$(basename {{rom}}) cargo test -p hptx-core --features saturnus --test e2e -- --nocapture
+
 # e.g. `just record-trace dir > crates/kermit-proto/traces/48sx-dir.trace`
 # Record a Kermit trace from the running emulator to stdout
 record-trace +args:

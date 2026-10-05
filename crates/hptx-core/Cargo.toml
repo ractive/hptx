@@ -13,3 +13,8 @@ kermit-proto = { version = "0.1.0", path = "../kermit-proto" }
 png = "0.18.1"
 serialport = { version = "4.10.1", default-features = false }
 thiserror = "2.0.21"
+# The saturnus HP 48SX emulator, in-process (`saturnus://ROM` addresses).
+saturnus = { git = "https://github.com/ractive/saturnus", rev = "4fc75738d8410d3693e64e37592bcc5e0454add2", optional = true }
+
+[features]
+saturnus = ["dep:saturnus"]
