@@ -144,7 +144,21 @@ impl Calculator {
     fn sync_with(&mut self, marker: &str) -> Result<()> {
         let command = format!("\"{marker}\"");
         for attempt in 0..2 {
-            let reply = match self.host(&command) {
+            // The first attempt gets one timeout period and no retries, so
+            // a stalled exchange costs one `timeout` (20 s by default), not
+            // the whole retry budget; the second has the normal budget.
+            let result = if attempt == 0 {
+                let normal = self.session.config().clone();
+                let mut once = normal.clone();
+                once.retries = 0;
+                self.session.set_config(once);
+                let result = self.host(&command);
+                self.session.set_config(normal);
+                result
+            } else {
+                self.host(&command)
+            };
+            let reply = match result {
                 // The calculator aborted a transfer left over from the dead
                 // client (seen: "Transfer Failed" on the 48SX): an odd
                 // reply like any other.
@@ -1000,6 +1014,11 @@ mod tests {
         });
         c.sync_with(MARKER).unwrap();
         assert_eq!(sent(&log), [MARKER_CMD, MARKER_CMD, "DROP2"]);
+        // The normal budget is back for everything after the sync.
+        assert_eq!(
+            c.session().config().retries,
+            Options::default().kermit.retries
+        );
 
         let (mut c, log) = calc(|_| "SILENT".into());
         let err = c.sync_with(MARKER).unwrap_err();
@@ -1007,9 +1026,10 @@ mod tests {
             matches!(err, Error::Kermit(kermit_proto::Error::Timeout)),
             "{err:?}"
         );
-        // Two transactions of 1 + 5 retransmissions each; only the marker.
+        // The first attempt is one try (no retransmission), the second the
+        // normal budget (1 + 5); only the marker is ever sent.
         let log = sent(&log);
-        assert_eq!(log.len(), 12, "{log:?}");
+        assert_eq!(log.len(), 1 + 6, "{log:?}");
         assert!(log.iter().all(|c| c == MARKER_CMD), "{log:?}");
     }
 

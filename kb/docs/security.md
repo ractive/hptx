@@ -133,9 +133,10 @@ binary; the calculator's own memory (hptx runs what the user tells it to).
   symlink planted at that path. The data directory is the user's own, so
   this needs write access to it already; still, refuse a symlink or open
   with `O_NOFOLLOW` where the platform has it.
-- **Sync limits**: a first marker attempt that times out is retried once,
-  so a crossed exchange costs a full Kermit retry budget (20 s × 6 tries)
-  before the second attempt; a calculator busy for longer than two budgets
-  fails the connect with a timeout. If neither reply shows the marker
+- **Sync limits**: the first marker attempt has one timeout period and no
+  retries, so a crossed exchange costs one `--timeout` (20 s by default)
+  before the second attempt, which has the normal budget (20 s × 6
+  tries); a calculator busy for longer than that fails the connect with a
+  timeout. If neither reply shows the marker
   (two odd replies in a row) nothing is dropped, so a marker command that
   ran without its reply arriving leaves its string on the stack.

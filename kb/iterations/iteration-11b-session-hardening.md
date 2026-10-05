@@ -24,11 +24,14 @@ SERVER) and the security discussion of the same day.
   both host commands and `G D` answer with text, so a late reply cannot be
   told apart by sequence or kind, and resending a command after discarding
   a reply would repeat mutations (`DROP`, arbitrary RPL). Rule: at session
-  start, after the 0.5 s drain, run one sacrificial idempotent query (the
-  `PATH` query, which already cleans up after itself) and accept whatever
-  reply arrives, with a second attempt if the first reply is not a PATH
-  answer; after that the session is in sync. Never resend a `run` or any
-  mutating command. Cover with an in-memory transport test that injects a
+  start, after the 0.5 s drain, push a session-unique marker string
+  (`HPTX-` and six random hex digits); a reply showing it at level 1 is
+  ours and only the marker copies on top are dropped; any other reply, an
+  E packet or a first-attempt timeout (one timeout period, no retries)
+  sends the marker once more with the normal budget. A `PATH` query was
+  the first design, rejected in the PR #16 review (the 49G cuts long
+  paths; a path-shaped late reply would be dropped). Never resend a `run`
+  or any mutating command. Cover with an in-memory transport test that injects a
   stale stack reply before the first answer, and with an e2e scenario on
   the 48SX (Ctrl-C a piped REPL mid `1 1000000 START NEXT`, then `hptx ls`).
 - [x] REPL JSON-lines mode for agents: `hptx repl --json` with piped stdin

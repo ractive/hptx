@@ -353,7 +353,10 @@ Decisions already made. Do not re-litigate; add a dated entry to change one.
   dropped; any other reply was a late one and our command was eaten, so
   the marker command is sent once more. An E packet, or a timeout on the
   first attempt (late reply and marker crossed; seen on the emulated 49G
-  under load), counts as an odd reply too. Nothing but the marker is ever
+  under load), counts as an odd reply too. The first attempt gets one
+  timeout period and no retries, so a stalled first exchange costs one
+  `--timeout` (20 s by default) before the second attempt, which has the
+  normal budget. Nothing but the marker is ever
   dropped and an odd reply is never an error. (A `PATH` query was the
   first design; the PR #16 review rejected it: the 49G cuts a long path at
   the display width, and a path-shaped late reply would have been dropped.)
