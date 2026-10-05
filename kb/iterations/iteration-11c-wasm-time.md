@@ -2,7 +2,7 @@
 type: iteration
 title: "Iteration 11c: web-time on wasm32 for the proto crates"
 date: 2026-10-05
-status: in-progress
+status: completed
 tags: [iteration, protocol]
 branch: iter-11c/wasm-time
 ---

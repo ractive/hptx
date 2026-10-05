@@ -337,3 +337,14 @@ Decisions already made. Do not re-litigate; add a dated entry to change one.
 - **Measured** (2026-10-05): check job 55 s ubuntu, 45 s macos, 63 s
   windows on a warm cache (33-43 s on ubuntu before cargo-deny); release
   binaries 5.5-6.8 MB.
+
+## 2026-10-05 (iteration 11c)
+
+- **Clock types for the proto crates.** `kermit-proto` and `xmodem-proto`
+  take `Duration` and `Instant` from a public `time` module:
+  `std::time` on every target except wasm32, `web_time` (web-time 1.x, a
+  wasm32-only dependency) on `wasm32`. The native API is unchanged; wasm
+  callers name `kermit_proto::time::Instant`. Reason: the crates never read
+  a clock, but a browser cannot construct `std::time::Instant`, and the
+  saturnus web UI will use kermit-proto as a wasm dependency. CI checks
+  both crates for `wasm32-unknown-unknown` on the Linux leg.
