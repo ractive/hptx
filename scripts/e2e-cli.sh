@@ -163,7 +163,20 @@ trap cleanup EXIT
 echo "hptx e2e against $addr, expecting the $expected_model"
 
 step "info: the expected model"
-info=$(hptx info --json)
+# The first command after another suite can find the calculator out of
+# server mode (the XModem scenario ends with a keyboard SERVER restart that
+# occasionally does not take). With a container at hand, restart the
+# server once and retry with a short timeout before giving up.
+if ! info=$(hptx --timeout 5 --retries 1 info --json 2>/dev/null); then
+    if [[ -n $container ]]; then
+        echo "no answer; restarting SERVER on the calculator" >&2
+        keys "\\"
+        sleep 1
+        type_word server
+        sleep 3
+    fi
+    info=$(hptx info --json)
+fi
 model=$(jq -r '.results.model' <<<"$info")
 [[ $model == "$expected_model" ]] \
     || fail "$addr answers as the $model, expected the $expected_model (HPTX_E2E_MODEL=${HPTX_E2E_MODEL:-unset}); is another emulator on this port? Nothing was changed."
@@ -503,6 +516,7 @@ step "late reply of an aborted command is skipped"
 # script ignores SIGINT. The REPL reads a FIFO whose writer (`exec sleep`,
 # so its pid is the sleeper's) keeps stdin open; both are killed here and,
 # should the script stop midway, by the exit trap.
+hptx run CLEAR >/dev/null   # start from a known stack: DEPTH is checked below
 mkfifo "$work/repl.fifo"
 hptx repl <"$work/repl.fifo" >/dev/null 2>&1 &
 repl_pid=$!
