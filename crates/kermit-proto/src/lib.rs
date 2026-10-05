@@ -2,7 +2,7 @@
 //!
 //! The crate never touches a port, a clock or a file. The caller owns all
 //! three: it reads and writes the link, supplies the current [`Instant`]
-//! (`std::time::Instant`) and loads or stores file contents. [`Client`] is a
+//! ([`time::Instant`]) and loads or stores file contents. [`Client`] is a
 //! pure state machine in between.
 //!
 //! Only client mode is implemented: we are the host (user Kermit), the
@@ -45,6 +45,17 @@
 //! 0.5 s after opening the link is the transport's job; the state machine
 //! also tolerates a stale NAK that slips through (it waits
 //! [`Config::nak_grace`] before resending).
+//!
+//! # Time and WebAssembly
+//!
+//! The state machine never reads a clock: every call that needs the time
+//! takes `now` from the caller. The type is [`time::Instant`], which is
+//! `std::time::Instant` on every target except `wasm32`, where it is
+//! `web_time::Instant` from the [`web-time`](https://docs.rs/web-time) crate
+//! (`std::time::Instant::now()` panics on `wasm32-unknown-unknown`). A wasm
+//! caller names it as `kermit_proto::time::Instant` and creates it with
+//! `Instant::now()`, which `web-time` backs with `performance.now()` in the
+//! browser. [`time::Duration`] is `core::time::Duration` everywhere.
 //!
 //! # Driver loop
 //!
@@ -98,7 +109,7 @@
 //! block checks), [`prefix`] (control/8th-bit/repeat prefixing), [`params`]
 //! (Send-Init negotiation) and [`trace`] (the text trace format).
 //!
-//! [`Instant`]: std::time::Instant
+//! [`Instant`]: time::Instant
 
 mod client;
 pub mod codec;
@@ -107,6 +118,16 @@ pub mod prefix;
 pub mod trace;
 #[cfg(test)]
 mod trace_tests;
+
+/// The clock types of the seam: `std::time` everywhere except `wasm32`,
+/// where they come from `web-time` (see the crate docs, "Time and
+/// WebAssembly").
+pub mod time {
+    #[cfg(not(target_arch = "wasm32"))]
+    pub use std::time::{Duration, Instant};
+    #[cfg(target_arch = "wasm32")]
+    pub use web_time::{Duration, Instant};
+}
 
 pub use client::{Client, Command, Config, Error, Event, OutgoingFile, StartError};
 pub use codec::BlockCheck;

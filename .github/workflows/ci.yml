@@ -31,6 +31,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
           components: rustfmt, clippy
+          # The wasm32 check of the protocol crates runs on Linux only.
+          targets: ${{ runner.os == 'Linux' && 'wasm32-unknown-unknown' || '' }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # Formatting and the dependency audit are platform-independent: once.
       - if: runner.os == 'Linux'
@@ -43,6 +45,11 @@ jobs:
         with:
           command: check
           arguments: --all-features --locked
+      # The sans-IO protocol crates must build for the browser (saturnus web
+      # UI); on wasm32 their clock type is web_time::Instant.
+      - name: Check the protocol crates on wasm32
+        if: runner.os == 'Linux'
+        run: cargo check -p kermit-proto -p xmodem-proto --target wasm32-unknown-unknown --locked
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo test --locked --workspace -q
       # The in-process saturnus transport (git dependency on the public
