@@ -56,12 +56,29 @@ Ctrl-C clears the line, Ctrl-D or :quit leaves. History is kept in
   Windows  %APPDATA%\\hptx\\history.txt
 
 From a pipe hptx reads the lines without prompt or editing and exits at the
-end of the input: 0, or 1 if the link failed. --json and --jq do not apply.
+end of the input: 0, or 1 if the link failed.
+
+JSON lines (--json, piped input only): exactly one compact JSON object per
+input line on stdout, in input order:
+  RPL                {\"stack\": [level 1, level 2, ...]}   ([] when empty)
+  calculator error   {\"error\": ..., \"hint\": ..., \"stack\": [...]}
+  colon command      {\"results\": ...} as `hptx <command> --json` has them
+  other error        {\"error\": ..., \"hint\": ...}
+  blank line         {}
+  :help / :quit      {\"help\": ...} / {\"quit\": true}, then the stream ends
+Errors are on stdout too, unlike the other commands, so a reader sees results
+and errors in order; a link failure is the last object and hptx exits 1. An
+error before the first line (no link) goes to stderr as {\"error\", \"hint\"}.
+This is the way for an agent to drive real hardware: one process and one
+link for many commands, no reconnect per call and no late reply from an
+aborted command landing on the next one. --jq does not apply to the REPL;
+filter the stream instead.
 
 Examples:
   hptx repl
   hptx --port tcp://localhost:4848 repl
-  printf '6 7 *\\n:ls\\n' | hptx repl"
+  printf '6 7 *\\n:ls\\n' | hptx repl
+  printf '6 7 *\\nDROP\\n:ls\\n' | hptx repl --json"
 );
 
 /// What a line of input is.
@@ -365,26 +382,120 @@ enum Flow {
     Quit,
 }
 
+/// How results are shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Output {
+    /// The stack and command results as text; errors to stderr.
+    Text,
+    /// One JSON object per input line on stdout, errors included.
+    JsonLines,
+}
+
+/// Choose the output from the format flags (`--json`, `--format`, `--jq`)
+/// and whether stdin is a terminal. JSON lines need piped input: on a
+/// terminal the REPL is for a person. `--jq` is refused: a reader filters
+/// the stream itself.
+pub fn output_mode(
+    json: bool,
+    format: Option<Format>,
+    jq: bool,
+    stdin_is_terminal: bool,
+) -> std::result::Result<Output, Hinted> {
+    if jq {
+        return Err(Hinted::new(
+            "--jq does not apply to the REPL",
+            "with piped input `hptx repl --json` prints one JSON object per line; \
+             filter that stream, e.g. `| jq -c .stack`",
+        ));
+    }
+    let wants_json = json || format == Some(Format::Json);
+    match (wants_json, stdin_is_terminal) {
+        (false, _) => Ok(Output::Text),
+        (true, false) => Ok(Output::JsonLines),
+        (true, true) => Err(Hinted::new(
+            "repl --json needs piped input: on a terminal the REPL prints text",
+            "pipe the lines in, e.g. `printf '6 7 *\\n' | hptx repl --json`, or drop --json",
+        )),
+    }
+}
+
+/// What one input line produced.
+#[derive(Debug)]
+pub enum Shown {
+    /// A blank line.
+    Blank,
+    /// The stack after an RPL line, level 1 first.
+    Stack(Vec<String>),
+    /// The calculator answered `Error:`; the session goes on.
+    CalculatorError { message: String, stack: Vec<String> },
+    /// A colon command's result, as the CLI command reports it.
+    Outcome(Outcome),
+    /// `:help`.
+    Help,
+    /// `:quit`.
+    Quit,
+}
+
+/// `shown` as one JSON object (one line in JSON-lines mode).
+pub fn shown_json(shown: &Shown) -> serde_json::Value {
+    match shown {
+        Shown::Blank => serde_json::json!({}),
+        Shown::Stack(levels) => serde_json::json!({ "stack": levels }),
+        Shown::CalculatorError { message, stack } => {
+            let failure = calculator_failure(message.clone(), stack.clone());
+            serde_json::json!({
+                "error": failure.error,
+                "hint": failure.hint,
+                "stack": stack,
+            })
+        }
+        Shown::Outcome(outcome) => serde_json::json!({ "results": outcome.results }),
+        Shown::Help => serde_json::json!({ "help": repl_commands!() }),
+        Shown::Quit => serde_json::json!({ "quit": true }),
+    }
+}
+
+/// A failure as one JSON object: `{error, hint?, stack?}`.
+pub fn failure_json(failure: &Failure) -> serde_json::Value {
+    serde_json::to_value(failure).unwrap_or_else(|_| serde_json::json!({ "error": failure.error }))
+}
+
+/// The REPL already wrote its last error to stdout (JSON-lines mode): exit
+/// 1 without printing it again.
+#[derive(Debug)]
+pub struct Reported;
+
+impl std::fmt::Display for Reported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the REPL session ended with a link error")
+    }
+}
+
+impl std::error::Error for Reported {}
+
 impl Ctx {
     /// `hptx repl`. Returns an error only when the session cannot start or
     /// the link fails; everything else is printed and the session goes on.
     pub(crate) fn repl(&mut self) -> Result<Option<Outcome>> {
-        if self.global.json || self.global.format == Some(Format::Json) || self.global.jq.is_some()
-        {
-            return Err(Hinted::new(
-                "repl prints text: --json, --format json and --jq do not apply",
-                "for JSON run single commands, e.g. `hptx run '6 7 *' --json`; \
-                 pipe lines into `hptx repl` for the text",
-            )
-            .into());
-        }
-        self.format = Format::Text;
+        let stdin_is_terminal = std::io::stdin().is_terminal();
+        let output = output_mode(
+            self.global.json,
+            self.global.format,
+            self.global.jq.is_some(),
+            stdin_is_terminal,
+        )?;
+        // Errors before the first line (no link) go to stderr as usual,
+        // in this format.
+        self.format = match output {
+            Output::Text => Format::Text,
+            Output::JsonLines => Format::Json,
+        };
         let mut calc = self.connect()?;
         // --dir applied once at the start; :cd changes it from then on.
         self.global.dir = None;
-        match input_mode(std::io::stdin().is_terminal()) {
+        match input_mode(stdin_is_terminal) {
             InputMode::Editor => self.repl_editor(&mut calc)?,
-            InputMode::Plain => self.repl_plain(&mut calc)?,
+            InputMode::Plain => self.repl_plain(&mut calc, output)?,
         }
         Ok(None)
     }
@@ -419,7 +530,7 @@ impl Ctx {
                             }
                         }
                     }
-                    match self.repl_line(calc, &line)? {
+                    match self.repl_line(calc, &line, Output::Text)? {
                         Flow::Continue => {}
                         Flow::Quit => return Ok(()),
                     }
@@ -431,7 +542,7 @@ impl Ctx {
         }
     }
 
-    fn repl_plain(&mut self, calc: &mut Calculator) -> Result<()> {
+    fn repl_plain(&mut self, calc: &mut Calculator, output: Output) -> Result<()> {
         let mut input = std::io::stdin().lock();
         let mut buf = Vec::new();
         loop {
@@ -440,51 +551,74 @@ impl Ctx {
                 return Ok(());
             }
             let line = String::from_utf8_lossy(&buf);
-            if let Flow::Quit = self.repl_line(calc, &line)? {
+            if let Flow::Quit = self.repl_line(calc, &line, output)? {
                 return Ok(());
             }
         }
     }
 
-    /// Run one line. `Err` only for a link failure.
-    fn repl_line(&mut self, calc: &mut Calculator, line: &str) -> Result<Flow> {
-        let result = match classify(line) {
-            Line::Empty => return Ok(Flow::Continue),
-            Line::Rpl(rpl) => self.repl_rpl(calc, rpl),
-            Line::Meta(text) => match parse_meta(text) {
-                Ok(Meta::Quit) => return Ok(Flow::Quit),
-                Ok(meta) => self.repl_meta(calc, meta),
-                Err(e) => Err(e.into()),
-            },
-        };
-        match result {
-            Ok(()) => Ok(Flow::Continue),
-            Err(e) if is_link_failure(&e) => Err(e),
-            Err(e) => {
+    /// Run one line and show the result. `Err` only for a link failure; in
+    /// JSON-lines mode it is written as the line's object first.
+    fn repl_line(&mut self, calc: &mut Calculator, line: &str, output: Output) -> Result<Flow> {
+        match (self.repl_eval(calc, line), output) {
+            (Ok(shown), Output::Text) => {
+                show_text(&shown)?;
+                Ok(flow(&shown))
+            }
+            (Ok(shown), Output::JsonLines) => {
+                print_json(&shown_json(&shown))?;
+                Ok(flow(&shown))
+            }
+            (Err(e), Output::Text) if is_link_failure(&e) => Err(e),
+            (Err(e), Output::JsonLines) if is_link_failure(&e) => {
+                print_json(&failure_json(&repl_failure(&e, &self.link)))?;
+                Err(e.context(Reported))
+            }
+            (Err(e), Output::Text) => {
                 eprintln!("{}", repl_failure(&e, &self.link).render(Format::Text));
+                Ok(Flow::Continue)
+            }
+            (Err(e), Output::JsonLines) => {
+                print_json(&failure_json(&repl_failure(&e, &self.link)))?;
                 Ok(Flow::Continue)
             }
         }
     }
 
-    fn repl_rpl(&mut self, calc: &mut Calculator, rpl: &str) -> Result<()> {
-        let reply = calc.run(rpl)?;
-        if let Some(message) = reply.error {
-            eprintln!(
-                "{}",
-                calculator_failure(message, reply.levels).render(Format::Text)
-            );
-            return Ok(());
+    /// Run one line. A calculator `Error:` reply is
+    /// [`Shown::CalculatorError`]; `Err` is everything else that failed.
+    fn repl_eval(&mut self, calc: &mut Calculator, line: &str) -> Result<Shown> {
+        match classify(line) {
+            Line::Empty => Ok(Shown::Blank),
+            Line::Rpl(rpl) => {
+                let reply = calc.run(rpl)?;
+                Ok(match reply.error {
+                    Some(message) => Shown::CalculatorError {
+                        message,
+                        stack: reply.levels,
+                    },
+                    None => Shown::Stack(reply.levels),
+                })
+            }
+            Line::Meta(text) => match parse_meta(text)? {
+                Meta::Quit => Ok(Shown::Quit),
+                Meta::Help => Ok(Shown::Help),
+                meta => self.repl_meta(calc, meta).map(Shown::Outcome),
+            },
         }
-        print_text(&stack_text(&reply.levels))
     }
 
-    fn repl_meta(&mut self, calc: &mut Calculator, meta: Meta) -> Result<()> {
-        let outcome = match meta {
+    fn repl_meta(&mut self, calc: &mut Calculator, meta: Meta) -> Result<Outcome> {
+        Ok(match meta {
             Meta::Ls(path) => self.ls_on(calc, path.as_deref())?,
             Meta::Cd(path) => {
                 cd(calc, &path)?;
-                return print_text(&util::dir_string(&util::parse_dir(&path)));
+                let dir = util::dir_string(&util::parse_dir(&path));
+                Outcome {
+                    results: serde_json::json!({ "dir": dir }),
+                    text: dir,
+                    ..Outcome::default()
+                }
             }
             Meta::Get { name, file, force } => {
                 validate_name(&name).with_context(|| format!("get {name}"))?;
@@ -498,10 +632,8 @@ impl Ctx {
                     xmodem: kermit(),
                     dry_run: false,
                 };
-                match self.get_on(calc, &args, &file, false)? {
-                    Some(outcome) => outcome,
-                    None => return Ok(()),
-                }
+                // `None` only when writing to stdout, which the REPL refuses.
+                self.get_on(calc, &args, &file, false)?.unwrap_or_default()
             }
             Meta::Put {
                 file,
@@ -531,18 +663,43 @@ impl Ctx {
             Meta::Pict { file, force } => {
                 let file = file.unwrap_or_else(pict_default_file);
                 refuse_existing(&file, force, ":pict FILE")?;
-                match pict_on(calc, &file, false, force)? {
-                    Some(outcome) => outcome,
-                    None => return Ok(()),
-                }
+                pict_on(calc, &file, false, force)?.unwrap_or_default()
             }
             Meta::Info => self.info_on(calc)?,
-            Meta::Help => return print_text(repl_commands!()),
-            Meta::Quit => return Ok(()),
-        };
-        // Hints name shell commands; the REPL shows the result only.
-        print_text(&outcome.text)
+            // Answered by repl_eval.
+            Meta::Help | Meta::Quit => Outcome::default(),
+        })
     }
+}
+
+fn flow(shown: &Shown) -> Flow {
+    match shown {
+        Shown::Quit => Flow::Quit,
+        _ => Flow::Continue,
+    }
+}
+
+/// Text mode: the stack or result to stdout, a calculator error to stderr.
+fn show_text(shown: &Shown) -> Result<()> {
+    match shown {
+        Shown::Blank | Shown::Quit => Ok(()),
+        Shown::Stack(levels) => print_text(&stack_text(levels)),
+        Shown::CalculatorError { message, stack } => {
+            eprintln!(
+                "{}",
+                calculator_failure(message.clone(), stack.clone()).render(Format::Text)
+            );
+            Ok(())
+        }
+        // Hints name shell commands; the REPL shows the result only.
+        Shown::Outcome(outcome) => print_text(&outcome.text),
+        Shown::Help => print_text(repl_commands!()),
+    }
+}
+
+/// One compact JSON object and a newline on stdout.
+fn print_json(value: &serde_json::Value) -> Result<()> {
+    output::print_stdout(&value.to_string()).context("writing to stdout")
 }
 
 fn kermit() -> XmodemArgs {
@@ -891,6 +1048,101 @@ mod tests {
         );
         let empty = calculator_failure("Too Few Arguments".into(), Vec::new());
         assert!(!empty.render(Format::Text).contains("\n  stack:"));
+    }
+
+    #[test]
+    fn json_lines_only_from_a_pipe() {
+        assert_eq!(output_mode(false, None, false, true).unwrap(), Output::Text);
+        assert_eq!(
+            output_mode(false, None, false, false).unwrap(),
+            Output::Text
+        );
+        assert_eq!(
+            output_mode(false, Some(Format::Text), false, false).unwrap(),
+            Output::Text
+        );
+        assert_eq!(
+            output_mode(true, None, false, false).unwrap(),
+            Output::JsonLines
+        );
+        assert_eq!(
+            output_mode(false, Some(Format::Json), false, false).unwrap(),
+            Output::JsonLines
+        );
+        // A person at a terminal gets text; --json there is refused.
+        let tty = output_mode(true, None, false, true).unwrap_err();
+        assert!(tty.message.contains("piped input"), "{}", tty.message);
+        assert!(output_mode(false, Some(Format::Json), false, true).is_err());
+        // --jq never applies.
+        for (json, tty) in [(false, false), (true, false), (true, true)] {
+            let e = output_mode(json, None, true, tty).unwrap_err();
+            assert!(e.message.contains("--jq"), "{}", e.message);
+        }
+    }
+
+    #[test]
+    fn json_line_objects() {
+        use serde_json::json;
+        assert_eq!(shown_json(&Shown::Blank), json!({}));
+        assert_eq!(shown_json(&Shown::Stack(Vec::new())), json!({"stack": []}));
+        assert_eq!(
+            shown_json(&Shown::Stack(vec!["42".into(), "'X'".into()])),
+            json!({"stack": ["42", "'X'"]})
+        );
+        let err = shown_json(&Shown::CalculatorError {
+            message: "Infinite Result".into(),
+            stack: vec!["0".into(), "1".into()],
+        });
+        assert_eq!(err["error"], "calculator error: Infinite Result");
+        assert_eq!(err["hint"], CALC_ERROR_HINT);
+        assert_eq!(err["stack"], json!(["0", "1"]));
+        // An empty stack is still there, as a list.
+        let err = shown_json(&Shown::CalculatorError {
+            message: "Too Few Arguments".into(),
+            stack: Vec::new(),
+        });
+        assert_eq!(err["stack"], json!([]));
+        let outcome = Outcome {
+            results: json!([{"name": "X"}]),
+            total: Some(1),
+            hints: vec![crate::output::Hint::cmd("Download X", "hptx get X")],
+            text: "X".into(),
+            ..Outcome::default()
+        };
+        // The CLI's results, without the envelope's total and hints.
+        assert_eq!(
+            shown_json(&Shown::Outcome(outcome)),
+            json!({"results": [{"name": "X"}]})
+        );
+        assert_eq!(shown_json(&Shown::Quit), json!({"quit": true}));
+        assert!(
+            shown_json(&Shown::Help)["help"]
+                .as_str()
+                .unwrap()
+                .contains(":ls")
+        );
+        // Each object is one line.
+        assert!(!shown_json(&Shown::Help).to_string().contains('\n'));
+    }
+
+    #[test]
+    fn json_line_failures() {
+        let link = crate::error::LinkInfo::default();
+        let missing = anyhow::Error::new(Hinted::new(
+            "no such variable in the current directory: X",
+            "nothing was deleted; `hptx ls` lists the names",
+        ));
+        let value = failure_json(&repl_failure(&missing, &link));
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "error": "no such variable in the current directory: X",
+                "hint": "nothing was deleted; `:ls` lists the names",
+            })
+        );
+        let reported =
+            anyhow::Error::new(Error::Kermit(kermit_proto::Error::Timeout)).context(Reported);
+        assert!(reported.downcast_ref::<Reported>().is_some());
     }
 
     #[test]

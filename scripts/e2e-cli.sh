@@ -4,7 +4,8 @@
 #
 # Re-expresses the hptx-core e2e scenarios through the CLI: info, ls, a
 # byte-exact binary put/get round trip of all 256 byte values, run, error
-# paths, pict, backup, rm, `ls --json | jq`, `repl` from a pipe, and
+# paths, pict, backup, rm, `ls --json | jq`, `repl` from a pipe (text and
+# JSON lines), the late reply of a killed REPL's command, and
 # the offline commands on what the calculator sent: `object inspect` (walked size = file size),
 # `grob to-png`, `object convert` both ways checked through the calculator.
 # On a 49G also a list holding a symbolic matrix (iteration 3 regression).
@@ -464,10 +465,52 @@ out=$(printf "'HPTXNOSUCH' RCL\nDROP\n:nosuch\n6 7 *\nDROP\n" | hptx repl 2>"$wo
 grep -q 'Undefined Name' "$work/repl.err" || fail "no calculator error: $(cat "$work/repl.err")"
 grep -q 'unknown command :nosuch' "$work/repl.err" || fail "no hint: $(cat "$work/repl.err")"
 grep -qx '1: 42' <<<"$out" || fail "no result after the errors: $out"
-if hptx repl --json </dev/null 2>/dev/null; then fail "repl --json accepted"; fi
+if hptx repl --jq . </dev/null 2>/dev/null; then fail "repl --jq accepted"; fi
 if hptx --port tcp://127.0.0.1:1 repl </dev/null 2>/dev/null; then
     fail "repl on a dead link exited 0"
 fi
+ok
+
+step "repl --json: one object per line"
+# CLEAR, RPL, blank, calculator error (1 0 / is an error on the 48s and
+# gives ∞ on the 49G), CLEAR, colon command, colon error, :quit; the line
+# after :quit is never read.
+printf "CLEAR\n6 7 *\n\n'HPTXNOSUCH' RCL\nCLEAR\n:ls\n:nosuch\n:quit\n99\n" \
+    | hptx repl --json >"$work/repl.jsonl" 2>"$work/repl.err" \
+    || fail "repl --json exit $?: $(cat "$work/repl.err")"
+[[ ! -s $work/repl.err ]] || fail "repl --json stderr: $(cat "$work/repl.err")"
+[[ $(wc -l <"$work/repl.jsonl" | tr -d ' ') == 8 ]] || fail "not 8 lines: $(cat "$work/repl.jsonl")"
+jq -e -s '
+    .[0] == {stack: []}
+    and (.[1].stack | length) == 1 and (.[1].stack[0] | test("^42\\.?$"))
+    and .[2] == {}
+    and (.[3].error | test("Undefined Name")) and (.[3].hint | length > 0)
+        and (.[3].stack | length) == 2
+    and .[4] == {stack: []}
+    and (.[5].results | map(.name) | index("IOPAR")) != null
+    and (.[6].error | test("unknown command :nosuch")) and (.[6] | has("stack") | not)
+    and .[7] == {quit: true}' "$work/repl.jsonl" >/dev/null \
+    || fail "repl --json: $(cat "$work/repl.jsonl")"
+ok
+
+step "late reply of an aborted command is skipped"
+# A REPL killed (as by Ctrl-C) while the calculator runs a long loop: the
+# calculator finishes it and offers the reply for about a minute. The next
+# hptx must not take that reply for its own (`bad directory line: "Empty
+# Stack"` before iteration 11b). SIGTERM, since a background job in a
+# script ignores SIGINT.
+{ echo '1 1000000 START NEXT 4711'; sleep 60; } | hptx repl >/dev/null 2>&1 &
+repl_pid=$!
+sleep 3
+kill -TERM "$repl_pid" 2>/dev/null || true
+wait "$repl_pid" 2>/dev/null || true
+late=$(hptx ls --json) || fail "ls after an aborted command: $late"
+jq -e '.results | map(.name) | index("IOPAR")' <<<"$late" >/dev/null || fail "ls: $late"
+# The loop's result is on the stack, nothing of hptx's own.
+stack=$(hptx run DEPTH --json)
+jq -e '.results.stack | length == 2 and (.[0] | test("^1\\.?$")) and (.[1] | test("^4711\\.?$"))' \
+    <<<"$stack" >/dev/null || fail "stack after the late reply: $stack"
+hptx run CLEAR >/dev/null
 ok
 
 step "settings --mode ascii"

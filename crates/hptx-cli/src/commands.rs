@@ -233,6 +233,8 @@ pub fn main_entry() -> ExitCode {
             }
         },
         Ok(None) => ExitCode::SUCCESS,
+        // The REPL's JSON-lines stream already ends with the error.
+        Err(err) if err.downcast_ref::<crate::repl::Reported>().is_some() => ExitCode::FAILURE,
         Err(err) if err.downcast_ref::<PartialFailure>().is_some() => {
             // Some of several files failed: print every result, then fail.
             if let Some(partial) = err.downcast_ref::<PartialFailure>()
