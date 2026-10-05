@@ -316,3 +316,24 @@ Decisions already made. Do not re-litigate; add a dated entry to change one.
 - **Publishing**: `cargo publish --dry-run -p kermit-proto -p xmodem-proto`
   is the verification and the publish command (both at once); the user
   publishes. No `rust-version` until an MSRV is verified.
+
+## 2026-10-05 (iteration 11a)
+
+- **Supply chain and release shape.** cargo-deny gates every PR and push to
+  main: advisories with no ignores; sources are crates.io plus the saturnus
+  repository only; permissive licences (MIT, Apache-2.0 incl. LLVM
+  exception, BSD-2-Clause, Zlib, Unicode-3.0, BSL-1.0 for rustyline's
+  Windows-only crates) plus serialport's MPL-2.0 as a crate-scoped
+  exception; duplicate versions warn; `[graph] all-features = true` so the
+  optional saturnus subtree is checked. Actions are SHA-pinned with the
+  version in a comment, every CI cargo call is `--locked`, workflows run
+  with `contents: read`. The check job is a three-OS matrix (ubuntu, macos,
+  windows: clippy and the fast tests; fmt and cargo-deny on Linux only).
+  The release workflow builds `hptx` for macOS arm64 and x86_64, Linux
+  x86_64 and Windows x86_64, tests each and uploads artifacts; it triggers
+  on tags `v*`, `workflow_dispatch`, and a PR that changes the workflow
+  file (the dry run); publishing a GitHub Release or
+  installers is a later iteration, after the hardware iteration.
+- **Measured** (2026-10-05): check job 55 s ubuntu, 45 s macos, 63 s
+  windows on a warm cache (33-43 s on ubuntu before cargo-deny); release
+  binaries 5.5-6.8 MB.
