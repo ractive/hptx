@@ -2,7 +2,7 @@
 type: iteration
 title: "Iteration 11b: session hardening and threat model"
 date: 2026-10-05
-status: in-progress
+status: completed
 tags:
   - iteration
   - core
@@ -69,7 +69,7 @@ SERVER) and the security discussion of the same day.
   or unbounded allocation on crafted input; `--jq` has no I/O); supply chain
   (lockfile, cargo-deny). Verify each invariant against the code while
   writing it and list what is not yet true as tasks for the audit.
-- [ ] Decision-log entry: the stale-reply rule and the JSON-lines REPL.
+- [x] Decision-log entry: the stale-reply rule and the JSON-lines REPL.
 
 ## Acceptance criteria
 

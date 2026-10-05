@@ -2,7 +2,7 @@
 type: backlog
 title: Resync after a late reply from an aborted host command
 date: 2026-10-05
-status: planned
+status: completed
 priority: medium
 ---
 

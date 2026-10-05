@@ -301,3 +301,39 @@ Decisions already made. Do not re-litigate; add a dated entry to change one.
 - **Publishing**: `cargo publish --dry-run -p kermit-proto -p xmodem-proto`
   is the verification and the publish command (both at once); the user
   publishes. No `rust-version` until an MSRV is verified.
+
+## 2026-10-05 (iteration 11b)
+
+- **Sync on connect, never resend.** A host command whose client died is
+  still finished by the calculator, and its reply (an S packet offered every
+  5 s for about a minute) is taken as the answer to the next client's first
+  command. Packet sequences restart at zero for every command and host
+  commands and `G D` both answer with text, so a late reply cannot be told
+  apart on the wire. Every connection (`Calculator::open`, every CLI
+  command, the REPL) starts with `Calculator::sync`: a sacrificial `PATH`
+  query whose first reply is accepted whatever it is, asked once more if
+  that reply is not a path; only a path answer is dropped. hptx never
+  resends `run` or any mutating command. Cost: two short transactions per
+  connection. Closes `backlog/stale-reply-after-abort`.
+- **REPL JSON lines.** `hptx repl --json` with piped stdin writes exactly one
+  compact JSON object per input line on stdout, in order: `{"stack": [...]}`
+  (level 1 first, `[]` when empty); `{"error","hint","stack"}` for a
+  calculator error; `{"error","hint"}` for other errors; `{"results": ...}`
+  for a colon command (the CLI command's results value, wrapped so a line is
+  always an object; no `total` or `hints`, whose `hptx ...` wording is wrong
+  inside the REPL); `{}` for a blank line; `{"quit": true}` for `:quit`.
+  Errors go to stdout deliberately, unlike the CLI rule, so a reader sees
+  results and errors in order; a link failure is the last object and hptx
+  exits 1. `--jq` stays refused, and so does `--json` on a terminal. This is
+  the agent pattern on real hardware: one process, no reconnect per call.
+  Supersedes the iteration 9 entry "`--json`/`--jq` are refused in the REPL".
+- **`saturnus://MODEL@ROM` boots the 48SX, 48GX or 49G.** The model is part
+  of the address because a ROM path alone is ambiguous (the 38G and 48GX are
+  both 512 KB); names are `48sx`, `48gx`, `49g`, and a bare path means
+  `48sx`. hptx-core boots through `saturnus_drive::autostart` at saturnus
+  rev `a6e7e95` and refuses the 42S (no serial port) and the 38G/39G/40G (no
+  Kermit server) with `Error::Emulator`. `just e2e-saturnus MODEL` picks the
+  ROM. Replaces the iteration 8 entry "Address `saturnus://ROM-PATH` boots an
+  HP 48SX".
+- **Threat model** lives in `docs/security.md`; its "Not yet true" list is
+  the input for the next whole-hptx audit.
