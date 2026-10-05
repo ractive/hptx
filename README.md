@@ -70,6 +70,23 @@ and agents:
 Deleted X (Real Number, 16 bytes)
 ```
 
+For an agent on real hardware, `hptx repl --json` with piped input is the
+way to go: one process and one link for many commands, no reconnect per
+call, and no late reply from an aborted command landing on the next one.
+Each input line gives exactly one JSON object on stdout, in order:
+`{"stack": [...]}` (level 1 first), `{"error", "hint", "stack"}` for a
+calculator error (on stdout too, unlike the other commands, so results and
+errors stay in order), `{"results": ...}` for a colon command, `{}` for a
+blank line and `{"quit": true}` for `:quit`:
+
+```sh
+$ printf "6 7 *\n1 0 /\nCLEAR\n:ls\n" | hptx repl --json
+{"stack":["42"]}
+{"error":"calculator error: Infinite Result","hint":"...","stack":["0","1","42"]}
+{"stack":[]}
+{"results":[{"checksum":8861,"directory":false,"name":"IOPAR","size":29.5,"type":"List"}]}
+```
+
 XModem is the alternative to Kermit on the 48G/GX and 49G (the 48S/SX has
 none): `hptx put prg.hp --protocol xmodem` or `hptx get PRG --protocol
 xmodem`. The Kermit server cannot start XRECV/XSEND, so hptx ends server

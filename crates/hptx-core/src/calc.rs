@@ -111,9 +111,81 @@ impl Calculator {
         }
     }
 
-    /// Open `addr` (see [`crate::transport::open`]) with default options.
+    /// Open `addr` (see [`crate::transport::open`]) with default options
+    /// and [`sync`](Calculator::sync).
     pub fn open(addr: &str) -> Result<Self> {
-        Ok(Calculator::new(Session::open(addr)?))
+        let mut calc = Calculator::new(Session::open(addr)?);
+        calc.sync()?;
+        Ok(calc)
+    }
+
+    /// Get in step with the server at the start of a session.
+    ///
+    /// When a client dies while a host command runs, the calculator still
+    /// finishes the command and offers its reply (an S packet repeated
+    /// every 5 s for about a minute). The next client's first command is
+    /// eaten as a bad ACK and the late reply arrives in its place. Sequence
+    /// numbers restart at zero for every command and host commands and
+    /// `G D` both answer with text, so the late reply cannot be told apart
+    /// on the wire, and repeating an arbitrary command would repeat its
+    /// effect. Instead the session starts with a sacrificial command that
+    /// pushes a marker string unique to this session ([`sync_marker`],
+    /// short enough that no model truncates it). A reply whose level 1 is
+    /// the marker is ours: the marker is dropped (every copy of it on top
+    /// of the stack, in case an earlier attempt was not eaten after all).
+    /// Any other reply was a late one and our command was eaten: the marker
+    /// command is sent once more. Nothing but the marker is ever dropped,
+    /// nothing else is ever resent, and an odd reply is never an error;
+    /// link errors are returned.
+    pub fn sync(&mut self) -> Result<()> {
+        self.sync_with(&sync_marker())
+    }
+
+    fn sync_with(&mut self, marker: &str) -> Result<()> {
+        let command = format!("\"{marker}\"");
+        for attempt in 0..2 {
+            // The first attempt gets one timeout period and no retries, so
+            // a stalled exchange costs one `timeout` (20 s by default), not
+            // the whole retry budget; the second has the normal budget.
+            let result = if attempt == 0 {
+                let normal = self.session.config().clone();
+                let mut once = normal.clone();
+                once.retries = 0;
+                self.session.set_config(once);
+                let result = self.host(&command);
+                self.session.set_config(normal);
+                result
+            } else {
+                self.host(&command)
+            };
+            let reply = match result {
+                // The calculator aborted a transfer left over from the dead
+                // client (seen: "Transfer Failed" on the 48SX): an odd
+                // reply like any other.
+                Err(Error::Remote(_)) => continue,
+                // The late reply and our command crossed and the exchange
+                // stalled (seen on the emulated 49G under load: the marker
+                // ran, its reply never came). Once more: the second reply
+                // shows both markers and both are dropped.
+                Err(Error::Kermit(kermit_proto::Error::Timeout)) if attempt == 0 => continue,
+                reply => reply?,
+            };
+            let ours = reply
+                .levels
+                .iter()
+                .take_while(|level| parse_string(level).as_deref() == Some(marker))
+                .count();
+            if reply.error.is_none() && ours > 0 {
+                let mut left = ours;
+                while left > 0 {
+                    let n = left.min(2);
+                    self.drop_levels(n)?;
+                    left -= n;
+                }
+                return Ok(());
+            }
+        }
+        Ok(())
     }
 
     /// The underlying session. Forgets the cached transfer mode, since the
@@ -613,6 +685,20 @@ impl Calculator {
     }
 }
 
+/// The string [`Calculator::sync`] pushes: `HPTX-` and six random hex
+/// digits (13 characters with the quotes, far below every model's display
+/// width), plain ASCII without RPL delimiters.
+pub fn sync_marker() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    // RandomState is seeded per process from the OS; mix in the time so two
+    // states in one process differ too.
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    if let Ok(since) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        hasher.write_u128(since.as_nanos());
+    }
+    format!("HPTX-{:06x}", hasher.finish() & 0xFF_FFFF)
+}
+
 /// Turn a reply with an error into [`Error::Calculator`].
 fn checked(reply: StackReply) -> Result<StackReply> {
     match reply.error {
@@ -718,7 +804,19 @@ mod tests {
                             decode(&data)
                         };
                         log.lock().unwrap().push(command.clone());
-                        let text = encode(&reply(&command)).unwrap();
+                        let reply = reply(&command);
+                        // `SILENT` never answers (the client times out);
+                        // `E:message` plays an E packet instead of a reply.
+                        if reply == "SILENT" {
+                            queue.clear();
+                            continue;
+                        }
+                        if let Some(message) = reply.strip_prefix("E:") {
+                            queue.clear();
+                            out.push(wire(&Packet::new(0, b'E', message.as_bytes().to_vec())));
+                            continue;
+                        }
+                        let text = encode(&reply).unwrap();
                         queue = vec![Packet::new(1, b'X', Vec::new())];
                         let mut rest = text.as_slice();
                         while !rest.is_empty() {
@@ -737,6 +835,8 @@ mod tests {
                             out.push(wire(next));
                         }
                     }
+                    // The client gave up (timeout).
+                    b'E' => queue.clear(),
                     kind => panic!("unexpected packet {}", char::from(kind)),
                 }
             }
@@ -787,6 +887,162 @@ mod tests {
         });
         assert_eq!(c.path().unwrap(), ["HOME", "D1"]);
         assert_eq!(sent(&log), ["G D"]);
+    }
+
+    const MARKER: &str = "HPTX-0a1b2c";
+    const MARKER_CMD: &str = "\"HPTX-0a1b2c\"";
+
+    /// Sync with [`MARKER`] against a server whose replies to the marker
+    /// command are `replies` in order (then an empty stack); the log of
+    /// what was sent.
+    fn sync_against(replies: Vec<&'static str>) -> Vec<String> {
+        let mut replies = replies.into_iter();
+        let (mut c, log) = calc(move |cmd| match cmd {
+            MARKER_CMD => replies.next().unwrap_or(EMPTY).into(),
+            "DROP" | "DROP2" => EMPTY.into(),
+            _ => panic!("unexpected {cmd}"),
+        });
+        c.sync_with(MARKER).unwrap();
+        sent(&log)
+    }
+
+    #[test]
+    fn sync_marker_is_short_and_plain() {
+        let m = sync_marker();
+        assert_eq!(m.len(), 11, "{m}");
+        assert!(m.starts_with("HPTX-"));
+        assert!(m[5..].chars().all(|c| c.is_ascii_hexdigit()), "{m}");
+        assert_ne!(sync_marker(), sync_marker());
+    }
+
+    #[test]
+    fn sync_in_step_costs_two_transactions() {
+        let one = "1:      \"HPTX-0a1b2c\"\r\n";
+        assert_eq!(sync_against(vec![one]), [MARKER_CMD, "DROP"]);
+    }
+
+    /// The first command after an aborted client is eaten by the server and
+    /// answered with the late reply of the aborted command (here a stack
+    /// display): sync sends the marker again and drops only the marker.
+    #[test]
+    fn sync_skips_a_stale_reply() {
+        let stale = "2:                  1\r\n1:                  2\r\n";
+        let ours = "3:                  1\r\n2:                  2\r\n1:      \"HPTX-0a1b2c\"\r\n";
+        assert_eq!(
+            sync_against(vec![stale, ours]),
+            [MARKER_CMD, MARKER_CMD, "DROP"]
+        );
+    }
+
+    /// A late reply that is a 49G path cut at the display width (no closing
+    /// brace, fixture `49g-vars.txt` style) is not taken for ours.
+    #[test]
+    fn sync_skips_a_truncated_path_reply() {
+        let stale = "1: {HOME,HPTXAAAA,HPTXBB\r\n";
+        let ours = "2: {HOME,HPTXAAAA,HPTXBB\r\n1:      \"HPTX-0a1b2c\"\r\n";
+        assert_eq!(
+            sync_against(vec![stale, ours]),
+            [MARKER_CMD, MARKER_CMD, "DROP"]
+        );
+    }
+
+    /// The aborted command's own result was a path: it stays on the stack.
+    #[test]
+    fn sync_keeps_a_path_shaped_stale_result() {
+        let stale = "1:          { HOME }\r\n";
+        let ours = "2:          { HOME }\r\n1:      \"HPTX-0a1b2c\"\r\n";
+        // One DROP for the marker; the path at level 2 is the user's.
+        assert_eq!(
+            sync_against(vec![stale, ours]),
+            [MARKER_CMD, MARKER_CMD, "DROP"]
+        );
+    }
+
+    /// In a deep 49G directory the stack shows truncated values; the marker
+    /// at level 1 is recognised all the same and only it is dropped.
+    #[test]
+    fn sync_in_a_deep_49g_directory() {
+        let ours = "2: {D1,G,TG,B,C,A,P,L,S,R\r\n1: \"HPTX-0a1b2c\"\r\n";
+        assert_eq!(sync_against(vec![ours]), [MARKER_CMD, "DROP"]);
+    }
+
+    /// Our first marker command was not eaten after all: both copies are
+    /// ours and both go.
+    #[test]
+    fn sync_drops_every_copy_of_its_marker() {
+        let stale = "Error: Bad Argument Type\r\n";
+        let ours =
+            "3:                  7\r\n2:      \"HPTX-0a1b2c\"\r\n1:      \"HPTX-0a1b2c\"\r\n";
+        assert_eq!(
+            sync_against(vec![stale, ours]),
+            [MARKER_CMD, MARKER_CMD, "DROP2"]
+        );
+    }
+
+    /// An E packet (the calculator aborting a leftover transfer) is an odd
+    /// reply, not an error: the marker goes again.
+    #[test]
+    fn sync_survives_an_error_packet() {
+        let ours = "1:      \"HPTX-0a1b2c\"\r\n";
+        assert_eq!(
+            sync_against(vec!["E:Transfer Failed", ours]),
+            [MARKER_CMD, MARKER_CMD, "DROP"]
+        );
+        assert_eq!(
+            sync_against(vec!["E:Transfer Failed", "E:Transfer Failed"]),
+            [MARKER_CMD, MARKER_CMD]
+        );
+    }
+
+    /// The first marker command ran but its reply never came (timeout): the
+    /// second reply shows both markers and both go. A second timeout is a
+    /// link failure.
+    #[test]
+    fn sync_retries_once_after_a_timeout() {
+        let mut n = 0;
+        let (mut c, log) = calc(move |cmd| {
+            n += 1;
+            match (cmd, n) {
+                (MARKER_CMD, 1) => "SILENT".into(),
+                (MARKER_CMD, _) => {
+                    "3:                  7\r\n2:      \"HPTX-0a1b2c\"\r\n1:      \"HPTX-0a1b2c\"\r\n"
+                        .into()
+                }
+                ("DROP2", _) => EMPTY.into(),
+                _ => panic!("unexpected {cmd}"),
+            }
+        });
+        c.sync_with(MARKER).unwrap();
+        assert_eq!(sent(&log), [MARKER_CMD, MARKER_CMD, "DROP2"]);
+        // The normal budget is back for everything after the sync.
+        assert_eq!(
+            c.session().config().retries,
+            Options::default().kermit.retries
+        );
+
+        let (mut c, log) = calc(|_| "SILENT".into());
+        let err = c.sync_with(MARKER).unwrap_err();
+        assert!(
+            matches!(err, Error::Kermit(kermit_proto::Error::Timeout)),
+            "{err:?}"
+        );
+        // The first attempt is one try (no retransmission), the second the
+        // normal budget (1 + 5); only the marker is ever sent.
+        let log = sent(&log);
+        assert_eq!(log.len(), 1 + 6, "{log:?}");
+        assert!(log.iter().all(|c| c == MARKER_CMD), "{log:?}");
+    }
+
+    #[test]
+    fn sync_never_drops_what_it_did_not_push() {
+        // A late error reply, then an empty stack: accepted, nothing
+        // dropped, no error, no third attempt. A marker below level 1 or
+        // another marker is not ours to drop either.
+        let error = "Error: Bad Argument Type\r\n1:                  1\r\n";
+        assert_eq!(sync_against(vec![error, EMPTY]), [MARKER_CMD, MARKER_CMD]);
+        let below = "2:      \"HPTX-0a1b2c\"\r\n1:                  1\r\n";
+        let other = "1:      \"HPTX-ffffff\"\r\n";
+        assert_eq!(sync_against(vec![below, other]), [MARKER_CMD, MARKER_CMD]);
     }
 
     #[test]

@@ -233,6 +233,8 @@ pub fn main_entry() -> ExitCode {
             }
         },
         Ok(None) => ExitCode::SUCCESS,
+        // The REPL's JSON-lines stream already ends with the error.
+        Err(err) if err.downcast_ref::<crate::repl::Reported>().is_some() => ExitCode::FAILURE,
         Err(err) if err.downcast_ref::<PartialFailure>().is_some() => {
             // Some of several files failed: print every result, then fail.
             if let Some(partial) = err.downcast_ref::<PartialFailure>()
@@ -337,7 +339,11 @@ impl Ctx {
         options.kermit.timeout = self.link.timeout;
         options.kermit.retries = self.link.retries;
         let session = Session::new(link, options).with_context(|| format!("cannot open {addr}"))?;
-        Ok(Calculator::new(session))
+        let mut calc = Calculator::new(session);
+        // A late reply from an aborted client lands on this query, not on
+        // the command the user asked for.
+        calc.sync()?;
+        Ok(calc)
     }
 
     /// A file in the temp directory that says a restore on this port still

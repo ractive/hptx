@@ -127,31 +127,42 @@ impl Entry {
 
 /// Parse a `G D` directory listing.
 ///
-/// An optional first line starting with `{` holds the path and the free
-/// memory. Every other non-blank line is `NAME SIZE TYPE... CHECKSUM`.
-/// Returns [`Error::Reply`] for a line that does not fit.
+/// An optional header starting with `{` holds the path and the free
+/// memory; the 49G wraps a long header over several lines (seen in
+/// `HOME/HPTXAAAA/HPTXBBBB`, 2026-10-05), so it runs to the line with the
+/// closing brace. Every other non-blank line is `NAME SIZE TYPE...
+/// CHECKSUM`. Returns [`Error::Reply`] for a line that does not fit.
 pub fn parse_listing(text: &str) -> Result<Listing> {
     let mut listing = Listing {
         path: None,
         free: None,
         entries: Vec::new(),
     };
-    let mut first = true;
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if std::mem::take(&mut first) && line.starts_with('{') {
-            let bad = || Error::Reply(format!("bad directory header: {line:?}"));
-            let end = line.find('}').ok_or_else(bad)?;
-            let (list, rest) = line.split_at(end + 1);
-            listing.path = Some(parse_list(list).ok_or_else(bad)?);
-            if !rest.trim().is_empty() {
-                listing.free = Some(parse_real(rest).ok_or_else(bad)?);
+    let mut lines = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .peekable();
+    if lines.peek().is_some_and(|l| l.starts_with('{')) {
+        let mut header = String::new();
+        for line in lines.by_ref() {
+            if !header.is_empty() {
+                header.push(' ');
             }
-            continue;
+            header.push_str(line);
+            if line.contains('}') {
+                break;
+            }
         }
+        let bad = || Error::Reply(format!("bad directory header: {header:?}"));
+        let end = header.find('}').ok_or_else(bad)?;
+        let (list, rest) = header.split_at(end + 1);
+        listing.path = Some(parse_list(list).ok_or_else(bad)?);
+        if !rest.trim().is_empty() {
+            listing.free = Some(parse_real(rest).ok_or_else(bad)?);
+        }
+    }
+    for line in lines {
         listing.entries.push(parse_entry(line)?);
     }
     Ok(listing)
@@ -684,7 +695,23 @@ mod tests {
             parse_listing("X 16 Real Number 12.5"),
             Err(Error::Reply(_))
         ));
+        // A header the 49G wrapped over two lines (seen in HOME/HPTXAAAA/
+        // HPTXBBBB, 2026-10-05).
+        let l =
+            parse_listing("{ HOME HPTXAAAA\r\nHPTXBBBB } 244872.\r\nX 10.5 Real Number 1234\r\n")
+                .unwrap();
+        assert_eq!(
+            l.path.as_deref(),
+            Some(&["HOME".to_string(), "HPTXAAAA".into(), "HPTXBBBB".into()][..])
+        );
+        assert_eq!((l.free, l.entries.len()), (Some(244872.0), 1));
+        // A header that never closes is an error.
         assert!(matches!(parse_listing("{ HOME 12"), Err(Error::Reply(_))));
+        // A complete header with garbage after it is still an error.
+        assert!(matches!(
+            parse_listing("{ HOME } lots"),
+            Err(Error::Reply(_))
+        ));
         let l = parse_listing("{ HOME }\r\n").unwrap();
         assert_eq!((l.path.unwrap().len(), l.free), (1, None));
     }

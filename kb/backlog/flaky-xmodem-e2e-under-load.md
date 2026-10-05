@@ -25,3 +25,15 @@ sender's start window.
   character arrives within a few seconds.
 - Run the two CI emulators one after the other instead of side by side.
 - Mark the scenario as retried once in CI only.
+
+## 2026-10-05, later
+
+In CI the emulated 49G was dead after the hptx-core suite in three runs in
+a row (PRs #14 and #16): the CLI script's first `info` got no answer, and
+retyping SERVER via `calc-keys` did not revive it. That is the emulator
+wedge, not a missed SERVER. CI now gives the CLI script a fresh 49G
+container after the core suite; the local scripts keep the SERVER
+restart-and-retry on the first command. Root cause still unknown; the
+core suite's last scenario is the XModem round trip with its keyboard
+SERVER restart, so the ON press during a settling exchange ("Port Not
+Available" state, see the quirks checklist) is the leading suspect.

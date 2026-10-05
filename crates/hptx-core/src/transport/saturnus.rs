@@ -1,4 +1,5 @@
-//! In-process link to the `saturnus` HP 48SX emulator (feature `saturnus`).
+//! In-process link to the `saturnus` emulator (feature `saturnus`): an HP
+//! 48SX, 48GX or 49G.
 //!
 //! The transport owns a [`saturnus::Machine`] and runs it in emulated time,
 //! single-threaded, with no sockets:
@@ -16,20 +17,24 @@
 //!   right after the final ACK is lost). Then it queues the packet, which
 //!   the emulated UART receives at line rate.
 //!
-//! Opening boots the ROM, answers "Try To Recover Memory?" with NO and types
-//! `SERVER`, like the saturnng container's `AUTOSTART`, then waits for the
-//! idle server's first NAK as proof that the server runs. A ROM that never
-//! reaches the prompt or never starts the server is [`Error::Emulator`].
+//! Opening boots the ROM and types `SERVER` with the model's key script
+//! from [`saturnus_drive::autostart`] (the same choreography as the
+//! saturnng container's `AUTOSTART`), then waits for the idle server's
+//! first NAK as proof that the server runs. A model without a serial port
+//! or a Kermit server, a ROM that never reaches its boot prompt or never
+//! starts the server is [`Error::Emulator`].
 
 use std::collections::VecDeque;
 use std::io;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use saturnus::io::Key;
 use saturnus::{Machine, Model};
+use saturnus_drive::autostart::autostart_script;
+use saturnus_drive::script::Action;
+use saturnus_drive::session::Session;
 
-use super::Transport;
+use super::{EmulatorModel, Transport};
 use crate::{Error, Result};
 
 /// Longest wall-clock gap between transport calls that is replayed as
@@ -40,21 +45,11 @@ const STEP: Duration = Duration::from_millis(1);
 /// Emulated quiet time after the last transmitted byte that ends a read: a
 /// byte takes 1.2 ms at 9600 baud and the HP sends a packet back to back.
 const QUIET: Duration = Duration::from_millis(4);
-/// How long a key is held.
-const KEY_HOLD: Duration = Duration::from_millis(60);
-/// LCD stable, CPU in SHUTDN, this long: the ROM waits for a key.
-const IDLE_STABLE: Duration = Duration::from_millis(300);
-/// Longest wait for the boot prompt.
-const BOOT_CAP: Duration = Duration::from_secs(60);
-/// Longest wait for the ROM to settle after a key.
-const KEY_CAP: Duration = Duration::from_secs(10);
-/// Time the ROM gets after ENTER to start the server and draw its banner.
-const SERVER_SETTLE: Duration = Duration::from_secs(1);
 /// Longest emulated wait for the idle server's first NAK (it times out
 /// after about 5 s).
 const SERVER_CAP: Duration = Duration::from_secs(15);
 
-/// The HP 48SX emulated in-process.
+/// A saturnus calculator emulated in-process.
 pub struct SaturnusTransport {
     machine: Machine,
     cycles_per_sec: u64,
@@ -67,6 +62,7 @@ pub struct SaturnusTransport {
 impl std::fmt::Debug for SaturnusTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SaturnusTransport")
+            .field("model", &self.machine.model())
             .field("cycles", &self.machine.cycles())
             .field("pending", &self.pending.len())
             .finish()
@@ -81,19 +77,52 @@ fn halt(e: impl std::fmt::Display) -> io::Error {
     io::Error::other(format!("emulated CPU halted: {e}"))
 }
 
-impl SaturnusTransport {
-    /// Build an HP 48SX from the packed ROM image at `rom`, boot it and start
-    /// the Kermit server.
-    pub fn open(rom: &Path) -> Result<Self> {
-        let image = std::fs::read(rom)
-            .map_err(|e| Error::Emulator(format!("cannot read ROM {}: {e}", rom.display())))?;
-        let mut t = Self::new(Machine::new(Model::Hp48sx, &image).map_err(emulator)?);
-        t.autostart().map_err(|e| {
+/// The saturnus model for `model`, or [`Error::Emulator`] when hptx cannot
+/// talk to it: the 42S has no serial port, the 38G, 39G and 40G have no
+/// Kermit server command (their PC link is started on the calculator).
+pub fn boot_model(model: EmulatorModel) -> Result<Model> {
+    let found = Model::ALL
+        .into_iter()
+        .find(|m| m.name() == model.name())
+        .ok_or_else(|| {
             Error::Emulator(format!(
-                "{} did not start the Kermit server: {e}",
-                rom.display()
+                "saturnus does not emulate the {}",
+                model.name().to_uppercase()
             ))
         })?;
+    let upper = found.name().to_uppercase();
+    if !found.has_serial() {
+        return Err(Error::Emulator(format!(
+            "the {upper} has no serial port; saturnus:// boots the 48SX, 48GX or 49G"
+        )));
+    }
+    match found {
+        Model::Hp48sx | Model::Hp48gx | Model::Hp49g => Ok(found),
+        _ => Err(Error::Emulator(format!(
+            "the {upper} has no Kermit server command; saturnus:// boots the 48SX, 48GX or 49G"
+        ))),
+    }
+}
+
+impl SaturnusTransport {
+    /// Build `model` from the ROM image at `rom`, boot it and start the
+    /// Kermit server.
+    pub fn open(model: EmulatorModel, rom: &Path) -> Result<Self> {
+        let model = boot_model(model)?;
+        let image =
+            saturnus_drive::rom::load(model, rom).map_err(|e| Error::Emulator(format!("{e:#}")))?;
+        let machine = Machine::new(model, &image).map_err(emulator)?;
+        let start_failed = |e: String| {
+            Error::Emulator(format!(
+                "{} as the {} did not start the Kermit server: {e}",
+                rom.display(),
+                model.name().to_uppercase()
+            ))
+        };
+        let machine = autostart(machine).map_err(start_failed)?;
+        let mut t = Self::new(machine);
+        t.wait_for_server()
+            .map_err(|e| start_failed(e.to_string()))?;
         t.last_call = Instant::now();
         Ok(t)
     }
@@ -135,94 +164,31 @@ impl SaturnusTransport {
         self.run(n).map(|_| ())
     }
 
-    /// Run until the LCD has not changed for [`IDLE_STABLE`] with the CPU
-    /// in SHUTDN (`true`), or for `cap` (`false`).
-    fn wait_idle(&mut self, cap: Duration) -> io::Result<bool> {
-        let step = self.cycles(Duration::from_millis(2));
-        let stable = self.cycles(IDLE_STABLE);
-        let end = self.machine.cycles().saturating_add(self.cycles(cap));
-        let mut last = self.machine.lcd();
-        let mut since = self.machine.cycles();
-        while self.machine.cycles() < end {
-            self.run(step)?;
-            let lcd = self.machine.lcd();
-            let now = self.machine.cycles();
-            if lcd != last {
-                last = lcd;
-                since = now;
-            } else if now - since >= stable && self.machine.is_shutdown() {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
-    /// Press and release `key`, then wait for the ROM to settle.
-    fn press(&mut self, key: Key, name: &str) -> io::Result<()> {
-        self.machine.key_down(key);
-        self.run_for(KEY_HOLD)?;
-        self.machine.key_up(key);
-        if self.wait_idle(KEY_CAP)? {
-            Ok(())
-        } else {
-            Err(io::Error::other(format!(
-                "not idle {} s after pressing {name}",
-                KEY_CAP.as_secs()
-            )))
-        }
-    }
-
-    /// Run until the calculator has sent a Kermit NAK, at most `cap`.
-    fn wait_for_nak(&mut self, cap: Duration) -> io::Result<bool> {
+    /// Run until the calculator has sent a Kermit NAK (at most
+    /// [`SERVER_CAP`]), then drop what it sent.
+    fn wait_for_server(&mut self) -> io::Result<()> {
         let step = self.cycles(Duration::from_millis(10));
-        let end = self.machine.cycles().saturating_add(self.cycles(cap));
+        let end = self
+            .machine
+            .cycles()
+            .saturating_add(self.cycles(SERVER_CAP));
         while self.machine.cycles() < end {
             self.run(step)?;
-            let bytes: Vec<u8> = self.pending.iter().copied().collect();
             // SOH, LEN, SEQ, TYPE: a NAK has type `N`.
-            if bytes.windows(4).any(|w| w[0] == 0x01 && w[3] == b'N') {
-                return Ok(true);
+            let nak = self
+                .pending
+                .iter()
+                .zip(self.pending.iter().skip(3))
+                .any(|(&soh, &ty)| soh == 0x01 && ty == b'N');
+            if nak {
+                self.pending.clear();
+                return Ok(());
             }
         }
-        Ok(false)
-    }
-
-    /// Answer the boot prompt with NO, then ALPHA ALPHA S E R V E R ENTER.
-    /// Then wait for the idle server's first NAK.
-    fn autostart(&mut self) -> io::Result<()> {
-        if !self.wait_idle(BOOT_CAP)? {
-            return Err(io::Error::other(format!(
-                "no boot prompt within {} s",
-                BOOT_CAP.as_secs()
-            )));
-        }
-        self.press(Key::F, "NO (softkey F)")?;
-        // 48SX alpha letters: S = SIN, E = softkey E, R = right arrow,
-        // V = square root.
-        for (key, name) in [
-            (Key::Alpha, "ALPHA"),
-            (Key::Alpha, "ALPHA"),
-            (Key::Sin, "S"),
-            (Key::E, "E"),
-            (Key::Right, "R"),
-            (Key::Sqrt, "V"),
-            (Key::E, "E"),
-            (Key::Right, "R"),
-        ] {
-            self.press(key, name)?;
-        }
-        self.machine.key_down(Key::Enter);
-        self.run_for(KEY_HOLD)?;
-        self.machine.key_up(Key::Enter);
-        self.run_for(SERVER_SETTLE)?;
-        if !self.wait_for_nak(SERVER_CAP)? {
-            return Err(io::Error::other(format!(
-                "no Kermit NAK within {} s of SERVER",
-                SERVER_CAP.as_secs()
-            )));
-        }
-        self.pending.clear();
-        Ok(())
+        Err(io::Error::other(format!(
+            "no Kermit NAK within {} s of SERVER",
+            SERVER_CAP.as_secs()
+        )))
     }
 
     /// Replay the wall time the host spent outside the transport.
@@ -238,6 +204,26 @@ impl SaturnusTransport {
         }
         n
     }
+}
+
+/// Cold-boot `machine` and type `SERVER` with the model's autostart script.
+/// The boot prompt not showing up within the script's cap is an error;
+/// a key after it that leaves the screen busy is only noted (the NAK wait
+/// decides), as the saturnus CLI does.
+fn autostart(machine: Machine) -> std::result::Result<Machine, String> {
+    let script = autostart_script(machine.model(), true).map_err(|e| format!("{e:#}"))?;
+    let mut session = Session::new(machine, 0, false);
+    session.set_echo_warnings(false);
+    session.check_keys(&script).map_err(|e| format!("{e:#}"))?;
+    for line in &script {
+        session.apply(line).map_err(|e| format!("{e:#}"))?;
+        if let Action::WaitIdle { cap_ms } = line.action
+            && !session.take_warnings().is_empty()
+        {
+            return Err(format!("no boot prompt within {} s", cap_ms / 1000));
+        }
+    }
+    Ok(session.machine)
 }
 
 impl Transport for SaturnusTransport {
@@ -284,13 +270,18 @@ impl Transport for SaturnusTransport {
 mod tests {
     use super::*;
 
+    fn temp_rom(tag: &str, bytes: &[u8]) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("hptx-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rom = dir.join("rom");
+        std::fs::write(&rom, bytes).unwrap();
+        (dir, rom)
+    }
+
     #[test]
     fn zero_rom_is_an_emulator_error() {
-        let dir = std::env::temp_dir().join(format!("hptx-zero-rom-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let rom = dir.join("zero-rom");
-        std::fs::write(&rom, vec![0u8; Model::Hp48sx.rom_bytes()]).unwrap();
-        let result = SaturnusTransport::open(&rom);
+        let (dir, rom) = temp_rom("zero-rom", &vec![0u8; Model::Hp48sx.rom_bytes()]);
+        let result = SaturnusTransport::open(EmulatorModel::Hp48sx, &rom);
         std::fs::remove_dir_all(&dir).unwrap();
         match result {
             Err(Error::Emulator(msg)) => {
@@ -302,12 +293,42 @@ mod tests {
 
     #[test]
     fn short_rom_is_an_emulator_error() {
-        let dir = std::env::temp_dir().join(format!("hptx-short-rom-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let rom = dir.join("short-rom");
-        std::fs::write(&rom, [0u8; 100]).unwrap();
-        let result = SaturnusTransport::open(&rom);
+        let (dir, rom) = temp_rom("short-rom", &[0u8; 100]);
+        for model in [
+            EmulatorModel::Hp48sx,
+            EmulatorModel::Hp48gx,
+            EmulatorModel::Hp49g,
+        ] {
+            let result = SaturnusTransport::open(model, &rom);
+            match result {
+                Err(Error::Emulator(msg)) => assert!(msg.contains("100 bytes"), "{msg}"),
+                other => panic!("expected Error::Emulator, got {other:?}"),
+            }
+        }
         std::fs::remove_dir_all(&dir).unwrap();
-        assert!(matches!(result, Err(Error::Emulator(_))), "{result:?}");
+    }
+
+    #[test]
+    fn models_without_a_kermit_server_are_refused() {
+        // Refused before the ROM is read: no ROM file needed.
+        let rom = Path::new("/nonexistent/rom");
+        for (model, why) in [
+            (EmulatorModel::Hp42s, "the 42S has no serial port"),
+            (EmulatorModel::Hp38g, "the 38G has no Kermit server"),
+            (EmulatorModel::Hp39g, "the 39G has no Kermit server"),
+            (EmulatorModel::Hp40g, "the 40G has no Kermit server"),
+        ] {
+            match SaturnusTransport::open(model, rom) {
+                Err(Error::Emulator(msg)) => assert!(msg.starts_with(why), "{msg}"),
+                other => panic!("expected Error::Emulator for {model:?}, got {other:?}"),
+            }
+        }
+        for model in [
+            EmulatorModel::Hp48sx,
+            EmulatorModel::Hp48gx,
+            EmulatorModel::Hp49g,
+        ] {
+            assert_eq!(boot_model(model).unwrap().name(), model.name());
+        }
     }
 }

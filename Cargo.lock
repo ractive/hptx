@@ -374,6 +374,7 @@ dependencies = [
  "kermit-proto",
  "png",
  "saturnus",
+ "saturnus-drive",
  "serialport",
  "thiserror",
  "xmodem-proto",
@@ -764,7 +765,17 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "saturnus"
 version = "0.1.0"
-source = "git+https://github.com/ractive/saturnus?rev=4fc75738d8410d3693e64e37592bcc5e0454add2#4fc75738d8410d3693e64e37592bcc5e0454add2"
+source = "git+https://github.com/ractive/saturnus?rev=a6e7e9514821dede1ce8114c6562366c97d8e8ce#a6e7e9514821dede1ce8114c6562366c97d8e8ce"
+
+[[package]]
+name = "saturnus-drive"
+version = "0.1.0"
+source = "git+https://github.com/ractive/saturnus?rev=a6e7e9514821dede1ce8114c6562366c97d8e8ce#a6e7e9514821dede1ce8114c6562366c97d8e8ce"
+dependencies = [
+ "anyhow",
+ "png",
+ "saturnus",
+]
 
 [[package]]
 name = "scopeguard"

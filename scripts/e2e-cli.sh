@@ -4,7 +4,8 @@
 #
 # Re-expresses the hptx-core e2e scenarios through the CLI: info, ls, a
 # byte-exact binary put/get round trip of all 256 byte values, run, error
-# paths, pict, backup, rm, `ls --json | jq`, `repl` from a pipe, and
+# paths, pict, backup, rm, `ls --json | jq`, `repl` from a pipe (text and
+# JSON lines), the late reply of a killed REPL's command, and
 # the offline commands on what the calculator sent: `object inspect` (walked size = file size),
 # `grob to-png`, `object convert` both ways checked through the calculator.
 # On a 49G also a list holding a symbolic matrix (iteration 3 regression).
@@ -132,6 +133,8 @@ xmodem_run() {
 
 cleanup() {
     local status=$?
+    # Background processes of the abort scenario, if it stopped midway.
+    for pid in ${feeder_pid:-} ${repl_pid:-}; do kill "$pid" 2>/dev/null || true; done
     if ((!verified)); then
         rm -rf "$work"
         exit "$status"
@@ -145,7 +148,7 @@ cleanup() {
     # Best effort: remove what this script may have created.
     local names
     names=$(hptx --dir HOME ls --jq '.results[].name' 2>/dev/null || true)
-    for n in HPTXCLI HPTXPT HPTXSM HPTXCD HPTXCE HPTXGR HPTXG2 HPTXCV HPTXCW HPTXCX HPTXXM HPTXR; do
+    for n in HPTXCLI HPTXPT HPTXSM HPTXCD HPTXCE HPTXGR HPTXG2 HPTXCV HPTXCW HPTXCX HPTXXM HPTXR HPTXAAAA; do
         if grep -qx "$n" <<<"$names"; then
             echo "cleanup: removing $n" >&2
             hptx rm "$n" >/dev/null 2>&1 || true
@@ -160,7 +163,20 @@ trap cleanup EXIT
 echo "hptx e2e against $addr, expecting the $expected_model"
 
 step "info: the expected model"
-info=$(hptx info --json)
+# The first command after another suite can find the calculator out of
+# server mode (the XModem scenario ends with a keyboard SERVER restart that
+# occasionally does not take). With a container at hand, restart the
+# server once and retry with a short timeout before giving up.
+if ! info=$(hptx --timeout 5 --retries 1 info --json 2>/dev/null); then
+    if [[ -n $container ]]; then
+        echo "no answer; restarting SERVER on the calculator" >&2
+        keys "\\"
+        sleep 1
+        type_word server
+        sleep 3
+    fi
+    info=$(hptx info --json)
+fi
 model=$(jq -r '.results.model' <<<"$info")
 [[ $model == "$expected_model" ]] \
     || fail "$addr answers as the $model, expected the $expected_model (HPTX_E2E_MODEL=${HPTX_E2E_MODEL:-unset}); is another emulator on this port? Nothing was changed."
@@ -464,10 +480,79 @@ out=$(printf "'HPTXNOSUCH' RCL\nDROP\n:nosuch\n6 7 *\nDROP\n" | hptx repl 2>"$wo
 grep -q 'Undefined Name' "$work/repl.err" || fail "no calculator error: $(cat "$work/repl.err")"
 grep -q 'unknown command :nosuch' "$work/repl.err" || fail "no hint: $(cat "$work/repl.err")"
 grep -qx '1: 42' <<<"$out" || fail "no result after the errors: $out"
-if hptx repl --json </dev/null 2>/dev/null; then fail "repl --json accepted"; fi
+if hptx repl --jq . </dev/null 2>/dev/null; then fail "repl --jq accepted"; fi
 if hptx --port tcp://127.0.0.1:1 repl </dev/null 2>/dev/null; then
     fail "repl on a dead link exited 0"
 fi
+ok
+
+step "repl --json: one object per line"
+# CLEAR, RPL, blank, calculator error (1 0 / is an error on the 48s and
+# gives ∞ on the 49G), CLEAR, colon command, colon error, :quit; the line
+# after :quit is never read.
+printf "CLEAR\n6 7 *\n\n'HPTXNOSUCH' RCL\nCLEAR\n:ls\n:nosuch\n:quit\n99\n" \
+    | hptx repl --json >"$work/repl.jsonl" 2>"$work/repl.err" \
+    || fail "repl --json exit $?: $(cat "$work/repl.err")"
+[[ ! -s $work/repl.err ]] || fail "repl --json stderr: $(cat "$work/repl.err")"
+[[ $(wc -l <"$work/repl.jsonl" | tr -d ' ') == 8 ]] || fail "not 8 lines: $(cat "$work/repl.jsonl")"
+jq -e -s '
+    .[0] == {stack: []}
+    and (.[1].stack | length) == 1 and (.[1].stack[0] | test("^42\\.?$"))
+    and .[2] == {}
+    and (.[3].error | test("Undefined Name")) and (.[3].hint | length > 0)
+        and (.[3].stack | length) == 2
+    and .[4] == {stack: []}
+    and (.[5].results | map(.name) | index("IOPAR")) != null
+    and (.[6].error | test("unknown command :nosuch")) and (.[6] | has("stack") | not)
+    and .[7] == {quit: true}' "$work/repl.jsonl" >/dev/null \
+    || fail "repl --json: $(cat "$work/repl.jsonl")"
+ok
+
+step "late reply of an aborted command is skipped"
+# A REPL killed (as by Ctrl-C) while the calculator runs a long loop: the
+# calculator finishes it and offers the reply for about a minute. The next
+# hptx must not take that reply for its own (`bad directory line: "Empty
+# Stack"` before iteration 11b). SIGTERM, since a background job in a
+# script ignores SIGINT. The REPL reads a FIFO whose writer (`exec sleep`,
+# so its pid is the sleeper's) keeps stdin open; both are killed here and,
+# should the script stop midway, by the exit trap.
+hptx run CLEAR >/dev/null   # start from a known stack: DEPTH is checked below
+mkfifo "$work/repl.fifo"
+hptx repl <"$work/repl.fifo" >/dev/null 2>&1 &
+repl_pid=$!
+{
+    echo '1 1000000 START NEXT 4711'
+    exec sleep 60
+} >"$work/repl.fifo" &
+feeder_pid=$!
+sleep 3
+kill -TERM "$repl_pid" 2>/dev/null || true
+wait "$repl_pid" 2>/dev/null || true
+kill "$feeder_pid" 2>/dev/null || true
+wait "$feeder_pid" 2>/dev/null || true
+repl_pid='' feeder_pid=''
+late=$(hptx ls --json) || fail "ls after an aborted command: $late"
+jq -e '.results | map(.name) | index("IOPAR")' <<<"$late" >/dev/null || fail "ls: $late"
+# The loop's result is on the stack, nothing of hptx's own.
+stack=$(hptx run DEPTH --json)
+jq -e '.results.stack | length == 2 and (.[0] | test("^1\\.?$")) and (.[1] | test("^4711\\.?$"))' \
+    <<<"$stack" >/dev/null || fail "stack after the late reply: $stack"
+hptx run CLEAR >/dev/null
+ok
+
+step "connect in a deep directory keeps the stack"
+# The 49G cuts a long path at the display width; the connect's sync must
+# leave the user's stack exactly as it was there too.
+hptx --dir HOME mkdir HPTXAAAA >/dev/null
+hptx --dir HOME/HPTXAAAA mkdir HPTXBBBB >/dev/null
+hptx run CLEAR >/dev/null
+hptx run 4711 >/dev/null
+hptx --dir HOME/HPTXAAAA/HPTXBBBB ls --json >/dev/null || fail "ls in HOME/HPTXAAAA/HPTXBBBB"
+stack=$(hptx run DEPTH --json)
+jq -e '.results.stack | length == 2 and (.[0] | test("^1\\.?$")) and (.[1] | test("^4711\\.?$"))' \
+    <<<"$stack" >/dev/null || fail "stack after connecting in a deep directory: $stack"
+hptx run CLEAR >/dev/null
+hptx --dir HOME rm HPTXAAAA >/dev/null
 ok
 
 step "settings --mode ascii"
