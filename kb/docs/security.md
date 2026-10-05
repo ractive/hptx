@@ -72,7 +72,9 @@ binary; the calculator's own memory (hptx runs what the user tells it to).
    calculator stored the temporary under `HPTXPT` (test
    `commands::put_overwrite_checks_the_stored_name_first`), and `xserv
    --dir` components pass `validate_name` before the calculator evaluates
-   them (test `xserv::dir_components_are_names`).
+   them, and each must be listed as a directory first, as in
+   `Calculator::cd` (tests `xserv::dir_components_are_names`,
+   `xserv::cd_checks_each_component_is_a_directory`).
 3. **hptx spawns no process.** No `std::process::Command` outside the e2e
    test (which drives `docker exec`); rustyline is built without default
    features. The REPL sends RPL to the calculator, never to a shell.
@@ -124,7 +126,8 @@ binary; the calculator's own memory (hptx runs what the user tells it to).
    `calc::restore_refuses_a_truncated_backup`,
    `calc::check_backup_accepts_an_attached_library`,
    `commands::restore_checks_the_whole_backup`) and counts the silent
-   `RESTORE` as done only when a probe after it gets no reply either (test
+   `RESTORE` as done only when a probe after it gets no reply either; an
+   answered probe is reported as an unknown result, never as success (test
    `calc::restore_probe_after_the_silent_restore`).
 7. **Text from the calculator or a file cannot drive the terminal.** Text
    mode (`output::render`, `Failure::render`, the REPL's output and `--jq`

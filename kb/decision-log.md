@@ -428,11 +428,14 @@ Decisions already made. Do not re-litigate; add a dated entry to change one.
   it as `NoReply`. kermit-proto is unpublished, so the field is additive.
 - **Restore probe.** A `RESTORE` that gets no reply is done only if a probe
   after it (a fresh sync marker, sent once, normal timeout) gets no reply
-  either: the warm start ended server mode. A reply to the probe means the
-  `RESTORE` command was lost: error, `:0:HPTXRS` stays, the hint says
-  `restore --cleanup` and run again. Costs one `--timeout` (20 s) on every
+  either: the warm start ended server mode. A reply to the probe leaves the
+  result unknown: the `RESTORE` command may have been lost, or it ran and
+  `SERVER` was restarted on the calculator within the probe's timeout
+  (PR #20 review; the first wording called it "did not run"). Error,
+  `:0:HPTXRS` stays, the hint says to check HOME with `hptx ls` before
+  running the restore again. Costs one `--timeout` (20 s) on every
   successful restore. `restore` also requires a complete directory walk
-  before the upload and in `--dry-run`.
+  (any attached library id) before the upload and in `--dry-run`.
 - **Converter output rule.** `object convert` and `grob to-png` without
   `-o` write the input's file name with the new extension in the current
   directory (`./x.txt` for `dl/x.hp`), like every other default output,

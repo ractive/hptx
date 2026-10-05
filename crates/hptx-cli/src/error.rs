@@ -223,9 +223,10 @@ fn reply_hint(text: &str) -> Option<String> {
                 .into(),
         );
     }
-    if text.starts_with("RESTORE did not run") {
+    if text.starts_with("RESTORE's result is unknown") {
         return Some(
-            "`hptx restore --cleanup` deletes the copy in port 0; then run the restore again"
+            "check HOME (`hptx ls`) before running the restore again; `hptx restore \
+             --cleanup` deletes the copy in port 0"
                 .into(),
         );
     }

@@ -578,8 +578,10 @@ impl Calculator {
 
     /// `RESTORE` from `:0:HPTXRS`. The warm start ends server mode, so no
     /// reply ever comes; but no reply is also what a lost `C` gives. A
-    /// probe tells the two apart: the calculator still answering means
-    /// `RESTORE` did not run ([`Error::Reply`], `:0:HPTXRS` stays).
+    /// probe follows: no answer means the warm start ended server mode
+    /// (success). An answer leaves the result unknown ([`Error::Reply`],
+    /// `:0:HPTXRS` stays): the `RESTORE` may have been lost, or it ran and
+    /// someone restarted `SERVER` within the probe's timeout.
     fn restore_from_port(&mut self) -> Result<()> {
         self.mode = None;
         let timeout = self.session.config().timeout;
@@ -596,8 +598,9 @@ impl Calculator {
         let probe = self.host_once(&format!("\"{marker}\""), timeout);
         let still_running = || {
             Error::Reply(format!(
-                "RESTORE did not run: the calculator still answers in server mode; HOME is \
-                 unchanged and the backup stays in :0:{RESTORE_VAR}"
+                "RESTORE's result is unknown: the calculator answers again, so it may not \
+                 have run, or it ran before the server was restarted; the backup stays in \
+                 :0:{RESTORE_VAR}"
             ))
         };
         match probe {
@@ -1312,7 +1315,9 @@ mod tests {
     }
 
     /// Audit PR #18, #9: no reply to RESTORE is success only when the probe
-    /// after it gets no reply either (the warm start ended server mode).
+    /// after it gets no reply either (the warm start ended server mode); an
+    /// answered probe leaves the result unknown (PR #20 review: SERVER may
+    /// have been restarted after a RESTORE that ran).
     #[test]
     fn restore_probe_after_the_silent_restore() {
         const RESTORE: &str = ":0:HPTXRS RESTORE";
@@ -1324,7 +1329,7 @@ mod tests {
         assert_eq!(log[0], RESTORE);
         assert!(log[1].starts_with("\"HPTX-"), "{log:?}");
 
-        // The RESTORE command was lost: the server still answers the probe.
+        // The server answers the probe: RESTORE lost, or SERVER restarted.
         let (mut c, log) = calc(|cmd| match cmd {
             RESTORE => "SILENT".into(),
             "DROP" => EMPTY.into(),
@@ -1332,7 +1337,7 @@ mod tests {
         });
         let err = c.restore_from_port().unwrap_err();
         assert!(
-            matches!(&err, Error::Reply(m) if m.starts_with("RESTORE did not run")),
+            matches!(&err, Error::Reply(m) if m.starts_with("RESTORE's result is unknown")),
             "{err:?}"
         );
         let log = sent(&log);
