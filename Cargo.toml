@@ -15,3 +15,11 @@ clap = { version = "4", features = ["derive"] }
 [workspace.lints.clippy]
 unwrap_used = "warn"
 expect_used = "warn"
+
+# The in-process emulator (feature `saturnus`) runs far below real time
+# unoptimised; the e2e suite drives it in the test profile.
+[profile.dev.package.saturnus]
+opt-level = 3
+
+[profile.dev.package.saturnus-drive]
+opt-level = 3

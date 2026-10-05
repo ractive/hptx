@@ -146,6 +146,28 @@ typing `SERVER` again with `calc-keys`. On the 48SX, keys typed straight after
 the FINISH ACK were lost except ENTER, which gave "DUP Error: Too Few
 Arguments". Press ON (`calc-keys '\'`) to clear such an error.
 
+### Recording traces with kermit-proto (verified)
+
+`crates/kermit-proto/examples/record.rs` drives the real `kermit-proto`
+client (block check 3, all control characters prefixed) and writes a text
+trace: `>` lines are what we sent, `<` lines what the calculator sent.
+
+```sh
+just record-trace info
+just record-trace host "6 7 *"
+just record-trace send NAME FILE
+just record-trace get NAME
+just record-trace host "LCD\\x8d 'X' STO"   # \xNN escapes for HP bytes (0x8D = →)
+```
+
+The traces in `crates/kermit-proto/traces/` were recorded this way on a
+freshly reset 48SX, 48GX and 49G and are replayed by the unit tests. The
+replies and objects in `crates/hptx-core/fixtures/` were recorded the same
+way. A host command's results stay on the calculator's stack; send `CLEAR`
+before recording a reply. If the
+calculator stops answering after an aborted client (the LCD shows garbage),
+restart the container.
+
 ### C-Kermit via a host pty (unverified)
 
 C-Kermit and socat are not installed on the test Mac, so this path was not run.

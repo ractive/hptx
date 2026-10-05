@@ -1,0 +1,28 @@
+# record-xmodem --host 'HPTXX' XSEND --check sum --linger 3 receive
+# started over Kermit: one C packet to the running server
+> \x010 C'HPTXX' XSEND?\r
+# xmodem start
+> \x15
+< \x01+ S~* @-#Y3$\r
+< \x01+ S~* @-#Y3$\r
+> \x15
+< \x01+ S~* @-#Y3$\r
+> \x15
+< \x01+ S~* @-#Y3$\r
+> \x15
+< \x01+ S~* @-#Y3$\r
+> \x15
+< \x01+ S~* @-#Y3$\r
+> \x15
+< \x01+ S~* @-#Y3$\r
+> \x15
+< \x01+ S~* @-#Y3$\r
+> \x15
+< \x01+ S~* @-#Y3$\r
+> \x15
+< \x01+ S~* @-#Y3$\r
+> \x15
+< \x01* ETimeoutW\r
+< \x01# N3\r
+> \x18\x18\x18
+# xmodem end
