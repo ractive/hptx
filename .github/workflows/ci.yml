@@ -91,6 +91,16 @@ jobs:
           # The 48SX has no XModem: the script checks that it is refused.
           HPTX_E2E_CONTAINER: calc
         run: scripts/e2e-cli.sh
+      # After the hptx-core suite the emulated 49G is regularly wedged (no
+      # answer even after SERVER is retyped; see
+      # kb/backlog/flaky-xmodem-e2e-under-load.md). Give the CLI script a
+      # fresh calculator instead of inheriting that state.
+      - name: Restart HP 49G
+        run: |
+          docker rm -f calc49
+          docker run -d -p 4850:4848 -e MODEL=49g --name calc49 hp49g-emu
+          timeout 90 sh -c 'until docker logs calc49 2>&1 | grep -q bridged; do sleep 1; done'
+          sleep 15
       - name: CLI end-to-end script, 49G
         env:
           HPTX_E2E_ADDR: tcp://localhost:4850
