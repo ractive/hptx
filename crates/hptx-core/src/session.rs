@@ -79,6 +79,8 @@ pub struct Session {
     turnaround: Duration,
     /// When the last transaction ended.
     last_end: Option<Instant>,
+    /// See [`Session::answered`].
+    answered: bool,
 }
 
 impl Session {
@@ -91,6 +93,7 @@ impl Session {
             config: options.kermit,
             turnaround: options.turnaround,
             last_end: None,
+            answered: false,
         })
     }
 
@@ -117,6 +120,13 @@ impl Session {
         self.config = config;
     }
 
+    /// Whether the server sent its parameters (its `S`, or the ACK to an
+    /// `I` or `S`) in the last transaction, also when it failed later: for
+    /// a host command, whether the `C` was received and answered.
+    pub fn answered(&self) -> bool {
+        self.answered
+    }
+
     /// Run one transaction to completion.
     pub fn transact(&mut self, command: Command) -> Result<Transcript> {
         self.transact_with(command, &mut |_| {})
@@ -132,6 +142,7 @@ impl Session {
             std::thread::sleep((end + self.turnaround).saturating_duration_since(Instant::now()));
         }
         let result = self.run(command, progress);
+        self.answered = self.client.peer_params().is_some();
         if result.is_err() {
             self.client = Client::new(self.config.clone());
             self.last_end = Some(Instant::now());
@@ -536,6 +547,7 @@ mod tests {
             config: options.kermit,
             turnaround: options.turnaround,
             last_end: None,
+            answered: false,
         };
         let start = Instant::now();
         let err = s.transact(Command::Host(b"6 7 *".to_vec())).unwrap_err();

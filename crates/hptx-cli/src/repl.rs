@@ -326,23 +326,25 @@ pub fn calculator_failure(message: String, stack: Vec<String>) -> Failure {
     failure
 }
 
-/// True if `err` means the link is gone or out of step: the session cannot
-/// go on. A dead link (I/O, serial, a Kermit timeout) or a host command
-/// without a reply, whose late reply would land on the next line; a
-/// refused or broken-off transfer (`TooLarge`, `Protocol`, `Cancelled`)
-/// ends with an E packet and leaves the server ready for the next line.
+/// True if `err` means the link is gone: the session cannot go on. A dead
+/// link (I/O, serial, a Kermit timeout); a refused or broken-off transfer
+/// (`TooLarge`, `Protocol`, `Cancelled`) ends with an E packet and leaves
+/// the server ready for the next line, and a host command without a reply
+/// is followed by a resync ([`is_no_reply`]).
 pub fn is_link_failure(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         matches!(
             cause.downcast_ref::<Error>(),
-            Some(
-                Error::Io(_)
-                    | Error::Serial(_)
-                    | Error::Kermit(kermit_proto::Error::Timeout)
-                    | Error::NoReply { .. }
-            )
+            Some(Error::Io(_) | Error::Serial(_) | Error::Kermit(kermit_proto::Error::Timeout))
         )
     })
+}
+
+/// True if `err` is a host command without a reply: it may still run, and
+/// its late reply would land on the next line unless the session resyncs.
+pub fn is_no_reply(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| matches!(cause.downcast_ref::<Error>(), Some(Error::NoReply { .. })))
 }
 
 /// Which operating system's data directory to use.
@@ -582,9 +584,24 @@ impl Ctx {
 
     /// Run one line and show the result. `Err` only for a link failure; in
     /// JSON-lines mode it is written as the line's object first.
+    /// After a line without a reply the session resyncs
+    /// ([`Calculator::sync`]: the late reply, or a calculator still busy)
+    /// and goes on; a failed resync ends it.
     fn repl_line(&mut self, calc: &mut Calculator, line: &str, output: Output) -> Result<Flow> {
         let shown = self.repl_eval(calc, line);
-        self.show(shown, output)
+        let no_reply = matches!(&shown, Err(e) if is_no_reply(e));
+        let flow = self.show(shown, output)?;
+        if no_reply && let Err(e) = calc.sync() {
+            let err = anyhow::Error::new(e).context("resyncing after a line without a reply");
+            return match output {
+                Output::Text => Err(err),
+                Output::JsonLines => {
+                    print_json(&failure_json(&repl_failure(&err, &self.link)))?;
+                    Err(err.context(Reported))
+                }
+            };
+        }
+        Ok(flow)
     }
 
     /// Show what a line produced, see [`Ctx::repl_line`].
@@ -736,7 +753,7 @@ fn print_json(value: &serde_json::Value) -> Result<Flow> {
 /// `:quit`.
 fn write_json_line(out: &mut impl std::io::Write, value: &serde_json::Value) -> Result<Flow> {
     let result = out
-        .write_all(value.to_string().as_bytes())
+        .write_all(output::escape_json(&value.to_string()).as_bytes())
         .and_then(|()| out.write_all(b"\n"))
         .and_then(|()| out.flush());
     match result {
@@ -1348,6 +1365,36 @@ mod tests {
         assert_eq!(buf, b"abc");
     }
 
+    /// PR #20 review: a line without a reply is a per-line error; the
+    /// session resyncs and the next line works.
+    #[test]
+    fn line_without_reply_resyncs_and_goes_on() {
+        let (mut calc, log) = crate::testkit::calc(|cmd| match cmd {
+            "SLOW" => "SILENT".into(),
+            "6 7 *" => "1:                 42\r\n".into(),
+            "DROP" => "Empty Stack\r\n".into(),
+            marker => format!("1: {marker}\r\n"),
+        });
+        let mut ctx = crate::testkit::ctx();
+        assert_eq!(
+            ctx.repl_line(&mut calc, "SLOW", Output::Text).unwrap(),
+            Flow::Continue
+        );
+        assert_eq!(
+            ctx.repl_line(&mut calc, "6 7 *", Output::Text).unwrap(),
+            Flow::Continue
+        );
+        let log = crate::testkit::sent(&log);
+        assert_eq!(log.len(), 4, "{log:?}");
+        assert_eq!(log[0], "SLOW");
+        assert!(log[1].starts_with("\"HPTX-"), "{log:?}");
+        assert_eq!(log[2..], ["DROP", "6 7 *"]);
+
+        // A resync that fails (the calculator stays silent) ends the session.
+        let (mut calc, _) = crate::testkit::calc(|_| "SILENT".into());
+        assert!(ctx.repl_line(&mut calc, "SLOW", Output::Text).is_err());
+    }
+
     #[test]
     fn mode_choice() {
         assert_eq!(input_mode(true), InputMode::Editor);
@@ -1384,7 +1431,7 @@ mod tests {
         let no_reply = anyhow::Error::new(Error::NoReply {
             command: "1 2 +".into(),
         });
-        assert!(is_link_failure(&no_reply));
+        assert!(!is_link_failure(&no_reply) && is_no_reply(&no_reply));
         // A local file error is not the link.
         let file = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound))
             .context("cannot read x.hp");

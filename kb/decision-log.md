@@ -399,8 +399,8 @@ Decisions already made. Do not re-litigate; add a dated entry to change one.
 ## 2026-10-06 (iteration 12)
 
 - **Host commands are single-shot.** `Calculator::host` sends every `C`
-  packet with `retries = 0` and `nak_grace = timeout`; no reply in time is
-  `Error::NoReply` ("may still be running or may have run; the next
+  packet once (`first_packet_retries = Some(0)`, `nak_grace = timeout`); no
+  answer in time is `Error::NoReply` ("may still be running or may have run; the next
   connection resyncs"). Why: the calculator executes a `C` packet when it
   receives it, and a retransmission after a lost or late ACK (or 1 s after
   a NAK, which may be a stale one from the idle server) is indistinguishable
@@ -409,14 +409,23 @@ Decisions already made. Do not re-litigate; add a dated entry to change one.
   PR #18, #1; seen once as `4711` twice on the 49G). Kermit sequence numbers
   restart at zero for every command, so nothing on the wire tells the two
   apart; never resending is the only fix without a protocol change. Cost: a
-  lossy link surfaces a timeout (or a Kermit error for a damaged reply
-  packet, since the reply has no retries either) that the user checks and
-  retries by hand; the REPL ends on `NoReply`, whose late reply would land
-  on the next line. `G D`, GET and SEND keep their retries, and so does the
+  lost `C` or a lost first answer surfaces as `NoReply`, which the user
+  checks and retries by hand; the REPL prints it, resyncs
+  (`Calculator::sync` absorbs the late reply) and goes on, ending only if
+  the resync fails. `G D`, GET and SEND keep their retries, and so does the
   second sync marker attempt, the only command that may run twice.
   Supersedes the 11b sentence "an odd reply is never an error": two odd
   replies in a row now fail the connect (`Error::Reply`, "not in step"),
   since nothing is run on a stack hptx cannot vouch for.
+- **First-packet retry budget.** kermit-proto `Config` gained
+  `first_packet_retries: Option<u32>` (`None` = `retries`), counted only
+  while the client awaits the answer to the packet that starts the
+  transaction. Once the server's `S` is in, the normal `retries` cover the
+  reply, so a damaged or lost X/D/Z/B is still NAKed and re-requested; a
+  timeout after the `S` is the ordinary Kermit timeout (the command ran),
+  not `NoReply` (`Session::answered`). First design (PR #20 review): plain
+  `retries = 0` aborted the whole reply on one bad packet and misreported
+  it as `NoReply`. kermit-proto is unpublished, so the field is additive.
 - **Restore probe.** A `RESTORE` that gets no reply is done only if a probe
   after it (a fresh sync marker, sent once, normal timeout) gets no reply
   either: the warm start ended server mode. A reply to the probe means the

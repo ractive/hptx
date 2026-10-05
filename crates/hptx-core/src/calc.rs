@@ -165,7 +165,11 @@ impl Calculator {
                 // stalled (seen on the emulated 49G under load: the marker
                 // ran, its reply never came). Once more: the second reply
                 // shows both markers and both are dropped.
-                Err(Error::NoReply { .. }) if attempt == 0 => continue,
+                Err(Error::NoReply { .. } | Error::Kermit(kermit_proto::Error::Timeout))
+                    if attempt == 0 =>
+                {
+                    continue;
+                }
                 reply => reply?,
             };
             let ours = reply
@@ -208,9 +212,11 @@ impl Calculator {
     /// Send `command` as a `C` packet exactly once and parse the stack
     /// reply. A `C` resent after a lost or late ACK runs again on the
     /// calculator, which cannot tell it from a new command, so the packet
-    /// is never retransmitted: no retries, and a NAK (usually a stale one
-    /// from the idle server) does not shorten the wait. No reply within the
-    /// timeout is [`Error::NoReply`].
+    /// is never retransmitted (`first_packet_retries = Some(0)`), and a NAK
+    /// (usually a stale one from the idle server) does not shorten the wait.
+    /// No answer to the `C` within the timeout is [`Error::NoReply`]. Once
+    /// the calculator's `S` is in, the reply packets keep the session's
+    /// retries; a failure after that is the Kermit error (the command ran).
     fn host(&mut self, command: &str) -> Result<StackReply> {
         let timeout = self.session.config().timeout;
         self.host_once(command, timeout)
@@ -221,15 +227,17 @@ impl Calculator {
         let normal = self.session.config().clone();
         let mut once = normal.clone();
         once.timeout = timeout;
-        once.retries = 0;
+        once.first_packet_retries = Some(0);
         once.nak_grace = timeout;
         self.session.set_config(once);
         let result = self.host_retrying(command);
         self.session.set_config(normal);
         match result {
-            Err(Error::Kermit(kermit_proto::Error::Timeout)) => Err(Error::NoReply {
-                command: command.to_string(),
-            }),
+            Err(Error::Kermit(kermit_proto::Error::Timeout)) if !self.session.answered() => {
+                Err(Error::NoReply {
+                    command: command.to_string(),
+                })
+            }
             other => other,
         }
     }
@@ -923,6 +931,12 @@ mod tests {
                             out.push(wire(next));
                         }
                     }
+                    // A reply packet NAKed: send it again.
+                    b'N' => {
+                        if let Some(again) = queue.iter().find(|q| q.seq == p.seq) {
+                            out.push(wire(again));
+                        }
+                    }
                     // The client gave up (timeout).
                     b'E' => queue.clear(),
                     kind => panic!("unexpected packet {}", char::from(kind)),
@@ -1198,6 +1212,64 @@ mod tests {
             c.session().config().retries,
             Options::default().kermit.retries
         );
+        assert_eq!(c.session().config().first_packet_retries, None);
+    }
+
+    /// A calculator over `fake_server` whose D packets are lost `drop`
+    /// times (`usize::MAX`: always).
+    fn calc_dropping_data(
+        drop: usize,
+        reply: impl FnMut(&str) -> String + Send + 'static,
+    ) -> (Calculator, Log) {
+        let log: Log = Arc::default();
+        let mut server = fake_server(Arc::clone(&log), reply);
+        let mut left = drop;
+        let mut deframer = Deframer::new();
+        let transport = MemoryTransport::new(move |bytes: &[u8]| {
+            let mut out = server(bytes);
+            out.retain(|chunk| {
+                deframer.push(chunk);
+                let data = deframer
+                    .next_frame()
+                    .is_some_and(|f| parse_frame(&f, BlockCheck::Type1).unwrap().kind == b'D');
+                if data && left > 0 {
+                    left -= 1;
+                    return false;
+                }
+                true
+            });
+            out
+        });
+        let mut kermit = Options::default().kermit;
+        kermit.timeout = Duration::from_millis(100);
+        kermit.linger = Duration::ZERO;
+        let options = Options {
+            kermit,
+            drain: Duration::ZERO,
+            turnaround: Duration::ZERO,
+        };
+        let session = Session::new(Box::new(transport), options).unwrap();
+        (Calculator::new(session), log)
+    }
+
+    /// PR #20 review: the single-shot rule covers the `C` only. A reply
+    /// packet lost after the calculator's `S` is re-requested, and a reply
+    /// that never completes is a Kermit timeout (the command ran), not
+    /// `NoReply`.
+    #[test]
+    fn host_reply_packets_keep_their_retries() {
+        let reply = |_: &str| "1:                 42\r\n".to_string();
+        let (mut c, log) = calc_dropping_data(1, reply);
+        assert_eq!(c.run("6 7 *").unwrap().levels, ["42"]);
+        assert_eq!(sent(&log), ["6 7 *"]);
+
+        let (mut c, log) = calc_dropping_data(usize::MAX, reply);
+        let err = c.run("6 7 *").unwrap_err();
+        assert!(
+            matches!(err, Error::Kermit(kermit_proto::Error::Timeout)),
+            "{err:?}"
+        );
+        assert_eq!(sent(&log), ["6 7 *"]);
     }
 
     /// Audit PR #18, #3: a backup whose directory walk fails (here cut in
@@ -1219,6 +1291,24 @@ mod tests {
             "{err:?}"
         );
         assert!(sent(&log).is_empty());
+    }
+
+    /// PR #20 review: a backup holding a directory with an attached
+    /// library (field #123, not #7FF) is a backup like any other.
+    #[test]
+    fn check_backup_accepts_an_attached_library() {
+        let nibbles = |lib: u32| -> Vec<u8> {
+            let mut n = Vec::new();
+            for (value, width) in [(0x02A96u32, 5), (lib, 3), (0, 5)] {
+                n.extend((0..width).map(|i| ((value >> (4 * i)) & 0xF) as u8));
+            }
+            n
+        };
+        for lib in [0x7FF, 0x123] {
+            let mut data = b"HPHP48-R".to_vec();
+            data.extend(crate::object::pack(&nibbles(lib)));
+            check_backup(&data).unwrap();
+        }
     }
 
     /// Audit PR #18, #9: no reply to RESTORE is success only when the probe

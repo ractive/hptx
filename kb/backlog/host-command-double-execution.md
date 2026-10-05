@@ -39,7 +39,8 @@ Input for the whole-hptx audit.
 ## Resolution (iteration 12, 2026-10-06)
 
 The first option, without a protocol change: `Calculator::host` sends
-every `C` packet once (`retries = 0`, `nak_grace = timeout`), and a missing
-reply is `Error::NoReply`, telling the user the command may still be
+every `C` packet once (kermit-proto `first_packet_retries = Some(0)`,
+`nak_grace = timeout`; the reply packets keep their retries), and no answer
+is `Error::NoReply`, telling the user the command may still be
 running or may have run and that the next connection resyncs. Decision log
 2026-10-06; security.md invariant 6; test `calc::host_command_is_never_resent`.

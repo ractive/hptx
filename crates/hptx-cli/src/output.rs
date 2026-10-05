@@ -97,7 +97,9 @@ pub fn render(outcome: &Outcome, format: Format, jq: Option<&str>) -> Result<Str
         return run_jq(filter, &value);
     }
     match format {
-        Format::Json => serde_json::to_string_pretty(&envelope).map_err(|e| e.to_string()),
+        Format::Json => serde_json::to_string_pretty(&envelope)
+            .map(|json| escape_json(&json))
+            .map_err(|e| e.to_string()),
         Format::Text => {
             let mut text = outcome.text.trim_end_matches('\n').to_string();
             append_hints(&mut text, &outcome.hints);
@@ -110,7 +112,7 @@ pub fn render(outcome: &Outcome, format: Format, jq: Option<&str>) -> Result<Str
 /// (C0, DEL, C1, a CR not before a LF) becomes `\xHH`, so text from the
 /// calculator or a crafted file (stack levels, names, error texts) cannot
 /// send escape sequences. `\r\n` becomes `\n`. Applied to everything text
-/// mode prints; JSON escapes control characters itself.
+/// mode prints; JSON output goes through [`escape_json`] instead.
 pub fn escape_control(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
@@ -122,6 +124,22 @@ pub fn escape_control(text: &str) -> String {
                 let _ = write!(out, "\\x{:02X}", u32::from(c));
             }
             c => out.push(c),
+        }
+    }
+    out
+}
+
+/// JSON text with DEL and the C1 controls (U+007F-U+009F) written as
+/// `\u00XX`: serde_json escapes only U+0000-U+001F, and a terminal reading
+/// raw C1 (CSI is U+009B) acts on it. Such characters occur only inside
+/// strings, so the text stays valid JSON for the same value.
+pub fn escape_json(json: &str) -> String {
+    let mut out = String::with_capacity(json.len());
+    for c in json.chars() {
+        if ('\u{7f}'..='\u{9f}').contains(&c) {
+            let _ = write!(out, "\\u{:04x}", u32::from(c));
+        } else {
+            out.push(c);
         }
     }
     out
@@ -178,6 +196,7 @@ impl Failure {
     pub fn render(&self, format: Format) -> String {
         match format {
             Format::Json => serde_json::to_string_pretty(self)
+                .map(|json| escape_json(&json))
                 .unwrap_or_else(|_| format!("{{\"error\": {:?}}}", self.error)),
             Format::Text => escape_control(&self.text()),
         }
@@ -262,7 +281,7 @@ pub fn run_jq(code: &str, value: &serde_json::Value) -> Result<String, String> {
         let val = result.map_err(|e| format!("jq filter {code:?}: {e}"))?;
         let text = match val {
             Val::TStr(ref s) | Val::BStr(ref s) => escape_control(&String::from_utf8_lossy(s)),
-            other => other.to_string(),
+            other => escape_json(&other.to_string()),
         };
         bytes = bytes.saturating_add(text.len() + 1);
         if out.len() == MAX_JQ_OUTPUTS || bytes > MAX_JQ_BYTES {
@@ -393,10 +412,12 @@ mod tests {
         );
     }
 
-    /// Audit PR #18, #11: control characters from the calculator are
-    /// escaped in text mode; JSON escapes them itself.
+    /// Audit PR #18, #11 and the PR #20 review: control characters from
+    /// the calculator are escaped in text mode as `\xHH`, and in JSON (also
+    /// `--jq` objects) as `\u00XX`, DEL and C1 included, which serde_json
+    /// leaves raw.
     #[test]
-    fn text_mode_escapes_control_characters() {
+    fn control_characters_are_escaped_in_text_and_json() {
         assert_eq!(
             escape_control("A\u{1b}[2J\r\nB\tC\rD\u{7f}\u{9b}31m\u{0}Σ"),
             "A\\x1B[2J\nB\tC\\x0DD\\x7F\\x9B31m\\x00Σ"
@@ -413,10 +434,33 @@ mod tests {
             "{text:?}"
         );
         assert!(text.contains("X\\x1B]0;pwned\\x07"), "{text}");
-        // JSON keeps the name as it is (escaped by serde).
-        let json = render(&o, Format::Json, None).unwrap();
+        // JSON keeps the value; every control character is a \u escape.
+        let c1 = Outcome {
+            results: json!([{"name": "X\u{1b}]0;\u{7f}\u{9b}31m\u{85}pwned\u{7}"}]),
+            ..Outcome::default()
+        };
+        let json = render(&c1, Format::Json, None).unwrap();
+        assert!(
+            !json.chars().any(|c| c.is_control() && c != '\n'),
+            "{json:?}"
+        );
+        assert!(json.contains(r"\u007f\u009b31m\u0085"), "{json}");
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["results"][0]["name"], "X\u{1b}]0;pwned\u{7}");
+        assert_eq!(
+            v["results"][0]["name"],
+            "X\u{1b}]0;\u{7f}\u{9b}31m\u{85}pwned\u{7}"
+        );
+        let obj = render(&c1, Format::Json, Some(".results[0]")).unwrap();
+        assert!(
+            obj.contains(r"\u009b") && !obj.contains('\u{9b}'),
+            "{obj:?}"
+        );
+        let f = Failure {
+            error: "\u{9b}2J".into(),
+            hint: None,
+            stack: None,
+        };
+        assert!(f.render(Format::Json).contains(r"\u009b2J"));
         // --jq raw strings and failures too.
         let raw = render(&o, Format::Json, Some(".results[0].name")).unwrap();
         assert_eq!(raw, "X\\x1B]0;pwned\\x07");

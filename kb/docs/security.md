@@ -102,11 +102,16 @@ binary; the calculator's own memory (hptx runs what the user tells it to).
    features are too coarse to drop them, see the decision log 2026-10-06).
 6. **A host command is sent once, and a late reply cannot be mistaken for
    the answer to the user's command.** `Calculator::host` sends every `C`
-   packet with no retries and a NAK grace as long as the timeout: a
-   calculator cannot tell a resent `C` from a new one and would run it
-   again. No reply in time is `Error::NoReply` ("may still be running or may
-   have run; the next connection resyncs"), never a retry (test
-   `calc::host_command_is_never_resent`); the REPL ends on it. Every
+   packet with `first_packet_retries = Some(0)` and a NAK grace as long as
+   the timeout: a calculator cannot tell a resent `C` from a new one and
+   would run it again. No answer in time is `Error::NoReply` ("may still be
+   running or may have run; the next connection resyncs"), never a retry
+   (tests `calc::host_command_is_never_resent`, kermit-proto
+   `first_packet_retries_only_cover_the_command`). Once the calculator's
+   `S` is in, the reply packets keep the normal retries (test
+   `calc::host_reply_packets_keep_their_retries`). The REPL prints a
+   `NoReply`, resyncs and goes on (test
+   `repl::line_without_reply_resyncs_and_goes_on`). Every
    connection starts with `Calculator::sync`: a sacrificial command that
    pushes a marker string unique to the session (`HPTX-` and six random hex
    digits), sent once more if the first reply does not show the marker at
@@ -114,8 +119,10 @@ binary; the calculator's own memory (hptx runs what the user tells it to).
    two odd replies in a row fail the connect (test
    `calc::sync_never_drops_what_it_did_not_push`). The marker is the only
    command ever resent: its second attempt has the normal retries.
-   `restore` uploads only a backup whose directory walk succeeds (tests
+   `restore` uploads only a backup whose directory walk succeeds, an
+   attached library id in any directory included (tests
    `calc::restore_refuses_a_truncated_backup`,
+   `calc::check_backup_accepts_an_attached_library`,
    `commands::restore_checks_the_whole_backup`) and counts the silent
    `RESTORE` as done only when a probe after it gets no reply either (test
    `calc::restore_probe_after_the_silent_restore`).
@@ -123,8 +130,11 @@ binary; the calculator's own memory (hptx runs what the user tells it to).
    mode (`output::render`, `Failure::render`, the REPL's output and `--jq`
    raw strings) passes through `output::escape_control`: every control
    character but newline and tab (C0, DEL, C1, a CR not before LF) is shown
-   as `\xHH` (test `output::text_mode_escapes_control_characters`). JSON
-   output is unchanged; serde escapes control characters.
+   as `\xHH`. JSON output (`--json`, `--jq` objects and arrays, failures,
+   REPL JSON lines) keeps the values: serde_json escapes C0 itself, and
+   `output::escape_json` writes DEL and C1 (U+007F-U+009F), which serde_json
+   leaves raw, as `\u00XX` (test
+   `output::control_characters_are_escaped_in_text_and_json`).
 
 ## Supply chain
 
@@ -153,10 +163,10 @@ binary; the calculator's own memory (hptx runs what the user tells it to).
   A marker command that ran without its reply arriving leaves its string
   on the stack when neither reply shows it (the connect then fails). Left
   deliberately (iteration 12).
-- **A lossy link fails host commands**: with no retries, a damaged or lost
-  packet anywhere in a host command's exchange (its reply included) ends
-  the command with `NoReply` or a Kermit error, and the user runs it again
-  after checking. The price of invariant 6 without a protocol change.
+- **A lost command is not resent**: a `C` (or the calculator's first
+  answer to it) lost on the line ends the command with `NoReply`, and the
+  user runs it again after checking. The price of invariant 6 without a
+  protocol change.
 - **`--jq` can still build a large value**: the output caps count results
   and bytes as they come; a filter that builds one huge value
   (`[range(1e9)]`) allocates inside jaq before anything is output. jaq has

@@ -1,5 +1,6 @@
 //! An in-memory Kermit server for command tests: answers `C` and `G D`
-//! with text and takes SENDs, block check type 1, like the 48SX traces.
+//! with text (or not at all for `SILENT`) and takes SENDs, block check type
+//! 1, like the 48SX traces; and a text-mode `Ctx`.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -60,7 +61,13 @@ fn server(
                         decode(&data)
                     };
                     log.lock().unwrap().push(command.clone());
-                    let text = encode(&reply(&command)).unwrap();
+                    // `SILENT` never answers (the client times out).
+                    let reply = reply(&command);
+                    if reply == "SILENT" {
+                        queue.clear();
+                        continue;
+                    }
+                    let text = encode(&reply).unwrap();
                     queue = vec![Packet::new(1, b'X', Vec::new())];
                     let mut rest = text.as_slice();
                     while !rest.is_empty() {
@@ -93,5 +100,23 @@ fn server(
             }
         }
         out
+    }
+}
+
+/// A `Ctx` for text output with default link settings.
+pub fn ctx() -> crate::commands::Ctx {
+    crate::commands::Ctx {
+        global: crate::Global {
+            port: None,
+            dir: None,
+            timeout: 20,
+            retries: 5,
+            format: None,
+            json: false,
+            jq: None,
+        },
+        format: crate::output::Format::Text,
+        link: crate::error::LinkInfo::default(),
+        port_on_command_line: false,
     }
 }

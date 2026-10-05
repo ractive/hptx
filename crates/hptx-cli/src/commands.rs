@@ -1601,23 +1601,6 @@ mod tests {
         assert_eq!(ctx(global, true).cmd("ls"), "hptx ls");
     }
 
-    fn text_ctx() -> Ctx {
-        Ctx {
-            global: Global {
-                port: None,
-                dir: None,
-                timeout: 20,
-                retries: 5,
-                format: None,
-                json: false,
-                jq: None,
-            },
-            format: Format::Text,
-            link: LinkInfo::default(),
-            port_on_command_line: false,
-        }
-    }
-
     fn put_args(name: &str) -> PutArgs {
         PutArgs {
             file: PathBuf::from("x.hp"),
@@ -1667,7 +1650,7 @@ mod tests {
             env!("CARGO_MANIFEST_DIR")
         );
         let full = std::fs::read(path).unwrap();
-        let ctx = text_ctx();
+        let ctx = crate::testkit::ctx();
         ctx.check_backup("d1.hp", &full).unwrap();
         let err = ctx
             .check_backup("d1.hp", &full[..full.len() - 10])
@@ -1690,7 +1673,7 @@ mod tests {
             "-35 SF" => "Empty Stack\r\n".into(),
             _ => panic!("unexpected {cmd}"),
         });
-        let ctx = text_ctx();
+        let ctx = crate::testkit::ctx();
         let args = put_args("X");
         let err = ctx
             .put_on(&mut calc, &args, "X", b"data", "x.hp", TransferMode::Binary)
@@ -1715,7 +1698,7 @@ mod tests {
             "SEND HPTXPT" => "HPTXPT".into(),
             _ => "Empty Stack\r\n".into(),
         });
-        let ctx = text_ctx();
+        let ctx = crate::testkit::ctx();
         let err = ctx
             .put_replacing(&mut calc, name, b"data", TransferMode::Binary)
             .unwrap_err();
