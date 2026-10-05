@@ -1,0 +1,3 @@
+Error: Invalid Syntax
+2:                NOSUCH
+1:       "CLEAR \->LIST"

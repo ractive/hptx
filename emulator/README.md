@@ -157,10 +157,14 @@ just record-trace info
 just record-trace host "6 7 *"
 just record-trace send NAME FILE
 just record-trace get NAME
+just record-trace host "LCD\\x8d 'X' STO"   # \xNN escapes for HP bytes (0x8D = →)
 ```
 
 The traces in `crates/kermit-proto/traces/` were recorded this way on a
-freshly reset 48SX and 49G and are replayed by the unit tests. If the
+freshly reset 48SX, 48GX and 49G and are replayed by the unit tests. The
+replies and objects in `crates/hptx-core/fixtures/` were recorded the same
+way. A host command's results stay on the calculator's stack; send `CLEAR`
+before recording a reply. If the
 calculator stops answering after an aborted client (the LCD shows garbage),
 restart the container.
 

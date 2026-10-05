@@ -1,0 +1,842 @@
+//! What a user does with a calculator in Kermit server mode: list, change
+//! directory, get, put, run host commands, screenshot, backup and restore.
+//!
+//! Everything is built from `C` host commands, `G D` listings, GET and SEND
+//! (wiki: protocols/server-commands). A host command returns the whole stack
+//! as display text and leaves its results on the user's stack, so every
+//! internal query drops what it pushed. A failed command replies `Error: X`
+//! (no E packet) and leaves its arguments on the stack. Evaluating an
+//! undefined name pushes the name and evaluating a variable runs it, so names
+//! are checked against the listing before they are evaluated.
+
+use std::time::Duration;
+
+use kermit_proto::{Command, OutgoingFile};
+
+use crate::charset::{decode, encode, encode_command};
+use crate::grob::Grob;
+use crate::object::{KERMIT_PADDING_ALLOWANCE, ObjectType, inspect, strip_padding};
+use crate::reply::{Iopar, Listing, StackReply, parse_list, parse_listing, parse_real};
+use crate::reply::{parse_name, parse_stack, parse_string};
+use crate::session::Session;
+use crate::{Error, Result};
+
+/// Temporary variable for [`Calculator::screenshot`].
+const SCREENSHOT_VAR: &str = "HPTXTMP";
+/// Temporary variable and port-0 object for [`Calculator::backup`].
+const BACKUP_VAR: &str = "HPTXBK";
+/// Temporary variable and port-0 object for [`Calculator::restore`].
+const RESTORE_VAR: &str = "HPTXRS";
+/// Reply timeout for the final `RESTORE`, which never gets a reply.
+const RESTORE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Kermit transfer format, flag -35 on the calculator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransferMode {
+    /// Flag -35 set: GET returns `HPHP48-x` / `HPHP49-x` + object; PUT of a
+    /// file that is not an HP binary object stores it as a String.
+    Binary,
+    /// Flag -35 clear (a fresh calculator): objects travel as `%%HP:` text.
+    Ascii,
+}
+
+/// A calculator in Kermit server mode.
+pub struct Calculator {
+    session: Session,
+    /// Last transfer mode set or read by us; `None` = unknown.
+    mode: Option<TransferMode>,
+}
+
+impl Calculator {
+    /// Wrap an open session. The transfer mode is unknown until read or set.
+    pub fn new(session: Session) -> Self {
+        Calculator {
+            session,
+            mode: None,
+        }
+    }
+
+    /// Open `addr` (see [`crate::transport::open`]) with default options.
+    pub fn open(addr: &str) -> Result<Self> {
+        Ok(Calculator::new(Session::open(addr)?))
+    }
+
+    /// The underlying session. Forgets the cached transfer mode, since the
+    /// caller may change flag -35 through it.
+    pub fn session(&mut self) -> &mut Session {
+        self.mode = None;
+        &mut self.session
+    }
+
+    /// Run a host command (Unicode or ASCII trigraphs such as `\->`) and
+    /// return the stack. An `Error:` reply is `Ok` with `error` set. Forgets
+    /// the cached transfer mode, since the command may change flag -35.
+    pub fn run(&mut self, command: &str) -> Result<StackReply> {
+        self.mode = None;
+        self.host(command)
+    }
+
+    /// Send `command` as a `C` packet and parse the stack reply.
+    fn host(&mut self, command: &str) -> Result<StackReply> {
+        let bytes = encode_command(command)?;
+        let transcript = self.session.transact(Command::Host(bytes))?;
+        Ok(parse_stack(&decode(&transcript.text)))
+    }
+
+    /// Run `parts` joined by spaces as one command; if that is too long for
+    /// a packet, run each part on its own in order. The first reply with an
+    /// error becomes [`Error::Calculator`].
+    fn exec(&mut self, parts: &[String]) -> Result<StackReply> {
+        match self.host(&parts.join(" ")) {
+            Err(Error::CommandTooLong { .. }) if parts.len() > 1 => {
+                let mut last = StackReply::default();
+                for part in parts {
+                    last = checked(self.host(part)?)?;
+                }
+                Ok(last)
+            }
+            reply => checked(reply?),
+        }
+    }
+
+    /// Run `command`, read `levels` stack levels (level 1 first) and drop
+    /// them again.
+    fn query(&mut self, command: &str, levels: usize) -> Result<Vec<String>> {
+        let reply = checked(self.host(command)?)?;
+        if reply.levels.len() < levels {
+            return Err(Error::Reply(format!(
+                "{command}: expected {levels} stack level(s), got {:?}",
+                reply.levels
+            )));
+        }
+        let values = reply.levels[..levels].to_vec();
+        self.drop_levels(levels)?;
+        Ok(values)
+    }
+
+    /// Drop `n` levels (1 or 2) pushed by an internal query.
+    fn drop_levels(&mut self, n: usize) -> Result<()> {
+        let command = if n >= 2 { "DROP2" } else { "DROP" };
+        checked(self.host(command)?).map(|_| ())
+    }
+
+    /// The current directory listing (`G D`).
+    pub fn list(&mut self) -> Result<Listing> {
+        let transcript = self.session.transact(Command::Directory)?;
+        parse_listing(&decode(&transcript.text))
+    }
+
+    /// The current directory path, e.g. `["HOME", "D1"]`: from the listing
+    /// header (48GX, 49G) or a `PATH` query (48SX, whose listing has none).
+    pub fn path(&mut self) -> Result<Vec<String>> {
+        if let Some(path) = self.list()?.path {
+            return Ok(path);
+        }
+        let [value]: [String; 1] = self
+            .query("PATH", 1)?
+            .try_into()
+            .map_err(|_| Error::Reply("PATH: no value".into()))?;
+        parse_list(&value).ok_or_else(|| Error::Reply(format!("PATH: not a list: {value:?}")))
+    }
+
+    /// Change to the absolute directory `path`, e.g. `["HOME", "D1"]` (the
+    /// leading `HOME` is optional). Each component is checked against the
+    /// listing before it is evaluated.
+    pub fn cd(&mut self, path: &[&str]) -> Result<()> {
+        let components = match path.split_first() {
+            Some((&"HOME", rest)) => rest,
+            _ => path,
+        };
+        for name in components {
+            validate_name(name)?;
+        }
+        self.exec(&["HOME".to_string()])?;
+        for name in components {
+            let listing = self.list()?;
+            let is_dir = listing
+                .entries
+                .iter()
+                .any(|e| e.name == *name && e.is_directory());
+            if !is_dir {
+                return Err(Error::Reply(format!("{name}: no such directory")));
+            }
+            self.exec(&[(*name).to_string()])?;
+        }
+        Ok(())
+    }
+
+    /// Go to the parent directory (`UPDIR`).
+    pub fn updir(&mut self) -> Result<()> {
+        self.exec(&["UPDIR".to_string()]).map(|_| ())
+    }
+
+    /// Create directory `name` in the current directory (`CRDIR`).
+    pub fn mkdir(&mut self, name: &str) -> Result<()> {
+        self.exec(&[format!("{} CRDIR", quote(name)?)]).map(|_| ())
+    }
+
+    /// Delete variable `name` from the current directory; a directory is
+    /// deleted with its contents (`PGDIR`).
+    pub fn remove(&mut self, name: &str) -> Result<()> {
+        let quoted = quote(name)?;
+        let is_dir = self
+            .list()?
+            .entries
+            .iter()
+            .find(|e| e.name == name)
+            .map(|e| e.is_directory())
+            .ok_or_else(|| Error::Reply(format!("{name}: no such variable")))?;
+        let purge = if is_dir { "PGDIR" } else { "PURGE" };
+        self.exec(&[format!("{quoted} {purge}")]).map(|_| ())
+    }
+
+    /// Rename variable `from` to `to` in the current directory (`RCL`, `STO`,
+    /// then `PURGE` or `PGDIR`). `to` must not exist yet.
+    pub fn rename(&mut self, from: &str, to: &str) -> Result<()> {
+        let quoted_from = quote(from)?;
+        let quoted_to = quote(to)?;
+        let listing = self.list()?;
+        let is_dir = listing
+            .entries
+            .iter()
+            .find(|e| e.name == from)
+            .map(|e| e.is_directory())
+            .ok_or_else(|| Error::Reply(format!("{from}: no such variable")))?;
+        if listing.entries.iter().any(|e| e.name == to) {
+            return Err(Error::Reply(format!("{to}: already exists")));
+        }
+        let purge = if is_dir { "PGDIR" } else { "PURGE" };
+        self.exec(&[
+            format!("{quoted_from} RCL"),
+            format!("{quoted_to} STO"),
+            format!("{quoted_from} {purge}"),
+        ])
+        .map(|_| ())
+    }
+
+    /// Free memory in bytes (`MEM`).
+    pub fn mem(&mut self) -> Result<f64> {
+        let values = self.query("MEM", 1)?;
+        let value = values.first().map(String::as_str).unwrap_or_default();
+        parse_real(value).ok_or_else(|| Error::Reply(format!("MEM: not a number: {value:?}")))
+    }
+
+    /// The ROM version text, e.g. `Version HP48-R, Copyright HP 1993`;
+    /// `None` on the 48SX, which has no `VERSION` command.
+    pub fn version(&mut self) -> Result<Option<String>> {
+        let reply = checked(self.host("VERSION")?)?;
+        // 48SX: the undefined name evaluates to itself.
+        let level1 = reply.level(1).unwrap_or_default().trim();
+        if level1 == "VERSION" || parse_name(level1).as_deref() == Some("VERSION") {
+            self.drop_levels(1)?;
+            return Ok(None);
+        }
+        let (Some(l2), Some(l1)) = (reply.level(2), reply.level(1)) else {
+            return Err(Error::Reply(format!(
+                "VERSION: expected two strings, got {:?}",
+                reply.levels
+            )));
+        };
+        let bad = |s: &str| Error::Reply(format!("VERSION: not a string: {s:?}"));
+        let version = parse_string(l2).ok_or_else(|| bad(l2))?;
+        let copyright = parse_string(l1).ok_or_else(|| bad(l1))?;
+        let version = version.split_whitespace().collect::<Vec<_>>().join(" ");
+        self.drop_levels(2)?;
+        Ok(Some(format!("{version}, {copyright}")))
+    }
+
+    /// The serial settings (`IOPAR`).
+    pub fn iopar(&mut self) -> Result<Iopar> {
+        let values = self.query("IOPAR", 1)?;
+        let value = values.first().map(String::as_str).unwrap_or_default();
+        Iopar::parse(value).ok_or_else(|| Error::Reply(format!("IOPAR: bad list: {value:?}")))
+    }
+
+    /// Store `iopar` as `IOPAR` in HOME and return to the current directory.
+    /// Takes effect when the calculator reopens the port (e.g. the next
+    /// `SERVER`), not in the running session.
+    pub fn set_iopar(&mut self, iopar: &Iopar) -> Result<()> {
+        self.exec(&[
+            "PATH HOME".to_string(),
+            format!("{} 'IOPAR' STO", iopar.to_rpl()),
+            "EVAL".to_string(),
+        ])
+        .map(|_| ())
+    }
+
+    /// Read the transfer mode (flag -35) and cache it.
+    pub fn transfer_mode(&mut self) -> Result<TransferMode> {
+        let values = self.query("-35 FS?", 1)?;
+        let value = values.first().map(String::as_str).unwrap_or_default();
+        let mode = match parse_real(value) {
+            Some(1.0) => TransferMode::Binary,
+            Some(0.0) => TransferMode::Ascii,
+            _ => return Err(Error::Reply(format!("-35 FS?: not a flag: {value:?}"))),
+        };
+        self.mode = Some(mode);
+        Ok(mode)
+    }
+
+    /// Set the transfer mode (flag -35) unless the cached mode already is
+    /// `mode`.
+    pub fn set_transfer_mode(&mut self, mode: TransferMode) -> Result<()> {
+        if self.mode == Some(mode) {
+            return Ok(());
+        }
+        let command = match mode {
+            TransferMode::Binary => "-35 SF",
+            TransferMode::Ascii => "-35 CF",
+        };
+        self.exec(&[command.to_string()])?;
+        self.mode = Some(mode);
+        Ok(())
+    }
+
+    /// GET variable `name` from the current directory in `mode`. Binary
+    /// data is cut after the object (the calculator pads the last packet).
+    pub fn get(&mut self, name: &str, mode: TransferMode) -> Result<Vec<u8>> {
+        validate_name(name)?;
+        self.set_transfer_mode(mode)?;
+        let transcript = self.session.transact(Command::Get(encode(name)?))?;
+        let [file]: [_; 1] = transcript.files.try_into().map_err(|files: Vec<_>| {
+            Error::Reply(format!(
+                "GET {name}: expected one file, got {}",
+                files.len()
+            ))
+        })?;
+        Ok(match mode {
+            TransferMode::Binary => strip_padding(&file.data, KERMIT_PADDING_ALLOWANCE).to_vec(),
+            TransferMode::Ascii => file.data,
+        })
+    }
+
+    /// SEND `data` as variable `name` in `mode` and return the name the
+    /// calculator stored it under (it can differ, e.g. a `.1` suffix when
+    /// the name exists).
+    pub fn put(&mut self, name: &str, data: &[u8], mode: TransferMode) -> Result<String> {
+        validate_name(name)?;
+        self.set_transfer_mode(mode)?;
+        let file = OutgoingFile {
+            name: encode(name)?,
+            data: data.to_vec(),
+        };
+        let transcript = self.session.transact(Command::Send(vec![file]))?;
+        transcript
+            .stored_names
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::Reply(format!("SEND {name}: no file stored")))
+    }
+
+    /// Grab the display as a 131x64 GROB via `LCD→` and a binary GET of a
+    /// temporary variable `HPTXTMP`, which is purged afterwards. Leaves the
+    /// calculator in binary transfer mode.
+    pub fn screenshot(&mut self) -> Result<Grob> {
+        self.refuse_existing(SCREENSHOT_VAR)?;
+        self.exec(&[format!("LCD\u{2192} '{SCREENSHOT_VAR}' STO")])?;
+        let data = self.get(SCREENSHOT_VAR, TransferMode::Binary);
+        let purge = self.exec(&[format!("'{SCREENSHOT_VAR}' PURGE")]);
+        let data = data?;
+        purge?;
+        Grob::from_file(&data)
+    }
+
+    /// Back up HOME: `ARCHIVE` into port 0, recall it into a temporary
+    /// variable `HPTXBK`, GET that in binary mode, then remove both. Returns
+    /// the binary transfer file of the Directory object. `ARCHIVE :IO:name`
+    /// fails in server mode ("Port Not Available"), hence the detour.
+    /// Leaves the calculator in binary transfer mode.
+    pub fn backup(&mut self) -> Result<Vec<u8>> {
+        self.refuse_existing(BACKUP_VAR)?;
+        self.exec(&[format!(":0:{BACKUP_VAR} ARCHIVE")])?;
+        let result = self.backup_steps();
+        if result.is_err() {
+            // Best effort: the error being reported matters more.
+            let _ = self.exec(&[format!(":0:{BACKUP_VAR} PURGE")]);
+            let _ = self.exec(&[format!("'{BACKUP_VAR}' PGDIR")]);
+        }
+        let data = result?;
+        let info = inspect(&data)?;
+        if info.object_type != Some(ObjectType::Directory) {
+            return Err(Error::Object(format!(
+                "backup is not a directory (prolog {:05X})",
+                info.prolog
+            )));
+        }
+        Ok(data)
+    }
+
+    fn backup_steps(&mut self) -> Result<Vec<u8>> {
+        // STO before PURGE, else "Object In Use".
+        self.exec(&[
+            format!(":0:{BACKUP_VAR} RCL"),
+            format!("'{BACKUP_VAR}' STO"),
+            format!(":0:{BACKUP_VAR} PURGE"),
+        ])?;
+        let data = self.get(BACKUP_VAR, TransferMode::Binary)?;
+        self.exec(&[format!("'{BACKUP_VAR}' PGDIR")])?;
+        Ok(data)
+    }
+
+    /// Replace HOME with the backup `data` (from [`Calculator::backup`]):
+    /// binary PUT as `HPTXRS`, copy to port 0, `RESTORE` from there. The
+    /// calculator warm-starts and leaves server mode; restart `SERVER` on
+    /// it, then call [`Calculator::purge_restore_leftover`] to delete
+    /// `:0:HPTXRS`.
+    pub fn restore(&mut self, data: &[u8]) -> Result<()> {
+        let info = inspect(data).map_err(|e| Error::Object(format!("not a backup: {e}")))?;
+        if info.object_type != Some(ObjectType::Directory) {
+            return Err(Error::Object(format!(
+                "not a backup: prolog {:05X} is not a directory",
+                info.prolog
+            )));
+        }
+        self.refuse_existing(RESTORE_VAR)?;
+        let stored = self.put(RESTORE_VAR, data, TransferMode::Binary)?;
+        if stored != RESTORE_VAR {
+            return Err(Error::Reply(format!(
+                "backup stored as {stored}, expected {RESTORE_VAR}"
+            )));
+        }
+        let copied = self.exec(&[
+            format!("'{RESTORE_VAR}' RCL"),
+            format!(":0:{RESTORE_VAR} STO"),
+            format!("'{RESTORE_VAR}' PGDIR"),
+        ]);
+        if let Err(e) = copied {
+            let _ = self.exec(&[format!("'{RESTORE_VAR}' PGDIR")]);
+            return Err(e);
+        }
+        // The warm start ends server mode: no reply ever comes.
+        let previous = self.session.config().clone();
+        self.session.set_config(kermit_proto::Config {
+            timeout: RESTORE_TIMEOUT,
+            retries: 0,
+            ..previous.clone()
+        });
+        let result = self.host(&format!(":0:{RESTORE_VAR} RESTORE"));
+        self.session.set_config(previous);
+        self.mode = None;
+        match result {
+            Err(Error::Kermit(kermit_proto::Error::Timeout)) => Ok(()),
+            Err(e) => Err(e),
+            Ok(reply) => match checked(reply) {
+                Err(e) => Err(e),
+                Ok(_) => Err(Error::Reply("calculator did not restart".into())),
+            },
+        }
+    }
+
+    /// Delete the backup object `:0:HPTXRS` that [`Calculator::restore`]
+    /// leaves in port 0, once `SERVER` runs again.
+    pub fn purge_restore_leftover(&mut self) -> Result<()> {
+        self.exec(&[format!(":0:{RESTORE_VAR} PURGE")]).map(|_| ())
+    }
+
+    /// End server mode (`G F`).
+    pub fn finish(&mut self) -> Result<()> {
+        self.session.transact(Command::Finish).map(|_| ())
+    }
+
+    /// Fail if `name` exists in the current directory.
+    fn refuse_existing(&mut self, name: &str) -> Result<()> {
+        if self.list()?.entries.iter().any(|e| e.name == name) {
+            return Err(Error::Reply(format!(
+                "{name} exists in the current directory; remove it first"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Turn a reply with an error into [`Error::Calculator`].
+fn checked(reply: StackReply) -> Result<StackReply> {
+    match reply.error {
+        Some(message) => Err(Error::Calculator {
+            message,
+            stack: reply.levels,
+        }),
+        None => Ok(reply),
+    }
+}
+
+/// `'NAME'` after [`validate_name`].
+fn quote(name: &str) -> Result<String> {
+    validate_name(name)?;
+    Ok(format!("'{name}'"))
+}
+
+/// Check that `name` is a plain global variable name: 1 to 127 characters,
+/// not starting with a digit or `.`, no whitespace, control characters or
+/// RPL delimiters and operators, encodable in the HP character set.
+pub fn validate_name(name: &str) -> Result<()> {
+    let bad = || Error::Name(name.to_string());
+    let count = name.chars().count();
+    let first = name.chars().next().ok_or_else(bad)?;
+    if count > 127 || first.is_ascii_digit() || first == '.' {
+        return Err(bad());
+    }
+    let forbidden = |c: char| {
+        c.is_whitespace()
+            || c.is_control()
+            || matches!(
+                c,
+                '\'' | '"'
+                    | '«'
+                    | '»'
+                    | '{'
+                    | '}'
+                    | '['
+                    | ']'
+                    | '('
+                    | ')'
+                    | '#'
+                    | ':'
+                    | ','
+                    | ';'
+                    | '+'
+                    | '-'
+                    | '*'
+                    | '/'
+                    | '^'
+                    | '='
+                    | '<'
+                    | '>'
+            )
+    };
+    if name.chars().any(forbidden) {
+        return Err(bad());
+    }
+    encode(name).map_err(|_| bad())?;
+    Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::session::Options;
+    use crate::transport::MemoryTransport;
+    use kermit_proto::Config;
+    use kermit_proto::codec::{BlockCheck, Deframer, Framing, Packet, parse_frame};
+    use kermit_proto::prefix::{self, Quoting};
+    use std::sync::{Arc, Mutex};
+
+    type Log = Arc<Mutex<Vec<String>>>;
+
+    /// A Kermit server answering `C` and `G D` like the 48SX trace
+    /// `48sx-host.trace`, with block check type 1: S, then X, D.., Z, B,
+    /// each after the ACK of the previous one. `reply` maps the decoded
+    /// command (`G D` for the listing) to the reply text.
+    fn fake_server(
+        log: Log,
+        mut reply: impl FnMut(&str) -> String + Send + 'static,
+    ) -> impl FnMut(&[u8]) -> Vec<Vec<u8>> + Send {
+        let check = BlockCheck::Type1;
+        let mut deframer = Deframer::new();
+        let mut queue: Vec<Packet> = Vec::new();
+        move |bytes| {
+            let wire = |p: &Packet| p.encode(check, &Framing::default());
+            deframer.push(bytes);
+            let mut out = Vec::new();
+            while let Some(frame) = deframer.next_frame() {
+                let p = parse_frame(&frame, check).unwrap();
+                let data = prefix::decode(&p.data, &Quoting::default()).unwrap();
+                match p.kind {
+                    b'C' | b'G' => {
+                        let command = if p.kind == b'G' {
+                            format!("G {}", decode(&data))
+                        } else {
+                            decode(&data)
+                        };
+                        log.lock().unwrap().push(command.clone());
+                        let text = encode(&reply(&command)).unwrap();
+                        queue = vec![Packet::new(1, b'X', Vec::new())];
+                        let mut rest = text.as_slice();
+                        while !rest.is_empty() {
+                            let (enc, used) = prefix::encode(rest, &Quoting::default(), 90);
+                            let seq = u8::try_from(queue.len() + 1).unwrap();
+                            queue.push(Packet::new(seq, b'D', enc));
+                            rest = &rest[used..];
+                        }
+                        let seq = u8::try_from(queue.len() + 1).unwrap();
+                        queue.push(Packet::new(seq, b'Z', Vec::new()));
+                        queue.push(Packet::new(seq + 1, b'B', Vec::new()));
+                        out.push(wire(&Packet::new(0, b'S', b"~* @-#Y1 ".to_vec())));
+                    }
+                    b'Y' => {
+                        if let Some(next) = queue.iter().find(|q| q.seq == p.seq + 1) {
+                            out.push(wire(next));
+                        }
+                    }
+                    kind => panic!("unexpected packet {}", char::from(kind)),
+                }
+            }
+            out
+        }
+    }
+
+    fn calc(reply: impl FnMut(&str) -> String + Send + 'static) -> (Calculator, Log) {
+        let log: Log = Arc::default();
+        let transport = MemoryTransport::new(fake_server(Arc::clone(&log), reply));
+        let options = Options {
+            kermit: Config {
+                timeout: Duration::from_millis(200),
+                ..Config::default()
+            },
+            drain: Duration::ZERO,
+            turnaround: Duration::ZERO,
+        };
+        let session = Session::new(Box::new(transport), options).unwrap();
+        (Calculator::new(session), log)
+    }
+
+    fn sent(log: &Log) -> Vec<String> {
+        log.lock().unwrap().clone()
+    }
+
+    const EMPTY: &str = "Empty Stack\r\n";
+    const GX_DIR: &str =
+        "{ HOME D1 } 127847\r\nX 10.5 Real Number 1234\r\nSUB 5.5 Directory 4321\r\n";
+    const SX_DIR: &str = "X 10.5 Real Number 1234\r\nSUB 5.5 Directory 4321\r\n";
+
+    #[test]
+    fn mem_drops_its_value() {
+        let (mut c, log) = calc(|cmd| match cmd {
+            "MEM" => "1:              12345\r\n".into(),
+            _ => EMPTY.into(),
+        });
+        assert_eq!(c.mem().unwrap(), 12345.0);
+        assert_eq!(sent(&log), ["MEM", "DROP"]);
+    }
+
+    #[test]
+    fn path_from_listing_header() {
+        let (mut c, log) = calc(|cmd| match cmd {
+            "G D" => GX_DIR.into(),
+            _ => panic!("unexpected {cmd}"),
+        });
+        assert_eq!(c.path().unwrap(), ["HOME", "D1"]);
+        assert_eq!(sent(&log), ["G D"]);
+    }
+
+    #[test]
+    fn path_query_without_header() {
+        let (mut c, log) = calc(|cmd| match cmd {
+            "G D" => SX_DIR.into(),
+            "PATH" => "1:          { HOME D1 }\r\n".into(),
+            _ => EMPTY.into(),
+        });
+        assert_eq!(c.path().unwrap(), ["HOME", "D1"]);
+        assert_eq!(sent(&log), ["G D", "PATH", "DROP"]);
+    }
+
+    #[test]
+    fn version_48sx() {
+        let (mut c, log) = calc(|cmd| match cmd {
+            "VERSION" => "1:  'VERSION'\r\n".into(),
+            _ => EMPTY.into(),
+        });
+        assert_eq!(c.version().unwrap(), None);
+        assert_eq!(sent(&log), ["VERSION", "DROP"]);
+    }
+
+    #[test]
+    fn version_48gx() {
+        let (mut c, log) = calc(|cmd| match cmd {
+            "VERSION" => "2:     \"Version HP48-R\"\r\n1:  \"Copyright HP 1993\"\r\n".into(),
+            _ => EMPTY.into(),
+        });
+        assert_eq!(
+            c.version().unwrap().as_deref(),
+            Some("Version HP48-R, Copyright HP 1993")
+        );
+        assert_eq!(sent(&log), ["VERSION", "DROP2"]);
+    }
+
+    #[test]
+    fn version_49g_two_line_string() {
+        let (mut c, _) = calc(|cmd| match cmd {
+            "VERSION" => {
+                "2: \"Version HP49-C\r\nRevision #1.19-6\r\n1:  \"Copyright HP 2009\"\r\n".into()
+            }
+            _ => EMPTY.into(),
+        });
+        assert_eq!(
+            c.version().unwrap().as_deref(),
+            Some("Version HP49-C Revision #1.19-6, Copyright HP 2009")
+        );
+    }
+
+    #[test]
+    fn cd_checks_each_component() {
+        let (mut c, log) = calc(|cmd| match cmd {
+            "G D" => "D1 5.5 Directory 4321\r\nX 10.5 Real Number 1234\r\n".into(),
+            _ => EMPTY.into(),
+        });
+        c.cd(&["HOME", "D1"]).unwrap();
+        assert_eq!(sent(&log), ["HOME", "G D", "D1"]);
+
+        log.lock().unwrap().clear();
+        let err = c.cd(&["NOSUCH"]).unwrap_err();
+        assert!(matches!(&err, Error::Reply(m) if m.contains("no such directory")));
+        assert_eq!(sent(&log), ["HOME", "G D"]);
+
+        log.lock().unwrap().clear();
+        let err = c.cd(&["HOME", "X"]).unwrap_err();
+        assert!(matches!(&err, Error::Reply(m) if m.contains("no such directory")));
+        assert_eq!(sent(&log), ["HOME", "G D"]);
+
+        log.lock().unwrap().clear();
+        assert!(matches!(c.cd(&["A B"]), Err(Error::Name(_))));
+        assert!(sent(&log).is_empty());
+    }
+
+    #[test]
+    fn rename_joined_split_and_directory() {
+        let (mut c, log) = calc(|cmd| match cmd {
+            "G D" => format!(
+                "X 10.5 Real Number 1234\r\nSUB 5.5 Directory 4321\r\n{} 10.5 Real Number 1\r\n",
+                "L".repeat(40)
+            ),
+            _ => EMPTY.into(),
+        });
+        c.rename("X", "Y").unwrap();
+        assert_eq!(sent(&log), ["G D", "'X' RCL 'Y' STO 'X' PURGE"]);
+
+        log.lock().unwrap().clear();
+        let long = "L".repeat(40);
+        let to = "M".repeat(40);
+        c.rename(&long, &to).unwrap();
+        assert_eq!(
+            sent(&log),
+            [
+                "G D".to_string(),
+                format!("'{long}' RCL"),
+                format!("'{to}' STO"),
+                format!("'{long}' PURGE"),
+            ]
+        );
+
+        log.lock().unwrap().clear();
+        c.rename("SUB", "SUB2").unwrap();
+        assert_eq!(sent(&log), ["G D", "'SUB' RCL 'SUB2' STO 'SUB' PGDIR"]);
+
+        log.lock().unwrap().clear();
+        assert!(matches!(c.rename("NOSUCH", "Z"), Err(Error::Reply(_))));
+        assert!(matches!(c.rename("X", "SUB"), Err(Error::Reply(_))));
+        assert_eq!(sent(&log), ["G D", "G D"]);
+    }
+
+    #[test]
+    fn remove_checks_listing() {
+        let (mut c, log) = calc(|cmd| match cmd {
+            "G D" => SX_DIR.into(),
+            _ => EMPTY.into(),
+        });
+        let err = c.remove("NOSUCH").unwrap_err();
+        assert!(matches!(&err, Error::Reply(m) if m.contains("no such variable")));
+        assert_eq!(sent(&log), ["G D"]);
+        c.remove("SUB").unwrap();
+        c.remove("X").unwrap();
+        assert_eq!(
+            sent(&log),
+            ["G D", "G D", "'SUB' PGDIR", "G D", "'X' PURGE"]
+        );
+    }
+
+    #[test]
+    fn calculator_error() {
+        let (mut c, _) = calc(|_| "Error: Undefined Name\r\n1:          'NOSUCH'\r\n".into());
+        let reply = c.run("'NOSUCH' RCL").unwrap();
+        assert_eq!(reply.error.as_deref(), Some("Undefined Name"));
+        let err = c.mkdir("NOSUCH").unwrap_err();
+        assert!(
+            matches!(&err, Error::Calculator { message, stack }
+                if message == "Undefined Name" && stack == &["'NOSUCH'"]),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn transfer_mode_is_cached() {
+        let (mut c, log) = calc(|_| EMPTY.into());
+        c.set_transfer_mode(TransferMode::Binary).unwrap();
+        c.set_transfer_mode(TransferMode::Binary).unwrap();
+        assert_eq!(sent(&log), ["-35 SF"]);
+        c.set_transfer_mode(TransferMode::Ascii).unwrap();
+        assert_eq!(sent(&log), ["-35 SF", "-35 CF"]);
+        // An arbitrary command may change the flag.
+        c.run("1").unwrap();
+        c.set_transfer_mode(TransferMode::Ascii).unwrap();
+        assert_eq!(sent(&log), ["-35 SF", "-35 CF", "1", "-35 CF"]);
+    }
+
+    #[test]
+    fn transfer_mode_query() {
+        let (mut c, log) = calc(|cmd| match cmd {
+            "-35 FS?" => "1: 1.\r\n".into(),
+            _ => EMPTY.into(),
+        });
+        assert_eq!(c.transfer_mode().unwrap(), TransferMode::Binary);
+        c.set_transfer_mode(TransferMode::Binary).unwrap();
+        assert_eq!(sent(&log), ["-35 FS?", "DROP"]);
+    }
+
+    #[test]
+    fn command_too_long() {
+        let (mut c, log) = calc(|_| EMPTY.into());
+        let err = c.run(&"1".repeat(200)).unwrap_err();
+        assert!(
+            matches!(err, Error::CommandTooLong { len: 200, .. }),
+            "{err:?}"
+        );
+        assert!(sent(&log).is_empty());
+        c.run("1").unwrap();
+    }
+
+    #[test]
+    fn names() {
+        for ok in [
+            "A",
+            "HPTXE2E",
+            "IOPAR",
+            "x\u{0304}",
+            "Σ1",
+            "a.b",
+            &"N".repeat(127),
+        ] {
+            assert!(validate_name(ok).is_ok(), "{ok:?}");
+        }
+        for bad in [
+            "",
+            "1A",
+            ".A",
+            "A B",
+            "A\tB",
+            "A'",
+            "A\"",
+            "«A",
+            "{A}",
+            "A[1]",
+            "F(X)",
+            "#A",
+            ":0:A",
+            "A,B",
+            "A;B",
+            "A+B",
+            "A-B",
+            "A*B",
+            "A/B",
+            "A^B",
+            "A=B",
+            "A<B",
+            "A>B",
+            "A\u{1}",
+            "A\u{263A}",
+            &"N".repeat(128),
+        ] {
+            assert!(matches!(validate_name(bad), Err(Error::Name(_))), "{bad:?}");
+        }
+    }
+}

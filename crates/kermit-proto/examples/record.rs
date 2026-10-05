@@ -2,13 +2,14 @@
 //!
 //! Usage: `record ADDR COMMAND [ARGS]`, e.g. `record localhost:4848 host "6 7 *"`.
 //! Commands: `info`, `host TEXT`, `dir`, `get NAME`, `send NAME FILE`, `finish`,
-//! `logout`. The trace goes to stdout, events to stderr.
+//! `logout`. `host` TEXT takes the trace escapes (`\x8d` for a byte outside
+//! ASCII). The trace goes to stdout, events to stderr.
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
-use kermit_proto::trace::escape;
+use kermit_proto::trace::{escape, unescape};
 use kermit_proto::{Client, Command, Config, Event, OutgoingFile};
 
 const USAGE: &str = "usage: record ADDR info|host TEXT|dir|get NAME|send NAME FILE|finish|logout";
@@ -17,7 +18,7 @@ fn parse_command(args: &[String]) -> Result<Command, Box<dyn std::error::Error>>
     let rest = args.get(1..).unwrap_or_default();
     let cmd = match (args.first().map(String::as_str), rest) {
         (Some("info"), []) => Command::Info,
-        (Some("host"), [_, ..]) => Command::Host(rest.join(" ").into_bytes()),
+        (Some("host"), [_, ..]) => Command::Host(unescape(&rest.join(" "))?),
         (Some("dir"), []) => Command::Directory,
         (Some("get"), [name]) => Command::Get(name.as_bytes().to_vec()),
         (Some("send"), [name, file]) => Command::Send(vec![OutgoingFile {

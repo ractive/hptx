@@ -5,8 +5,11 @@ later HP38G/39G/40G) and a modern computer over a serial cable, from macOS,
 Windows and Linux. Kermit and XModem, a sans-IO Rust core, a CLI that works
 for people and for AI agents, and a GUI later.
 
-Status: early. The sans-IO Kermit client (`crates/kermit-proto`) is done
-and tested against recorded emulator traces; the CLI is not usable yet. Project knowledge (architecture, decisions, iteration
+Status: early. The sans-IO Kermit client (`crates/kermit-proto`) and the
+HP layer (`crates/hptx-core`: serial/TCP transports, directory listing,
+get/put in binary or ASCII, host commands, screenshots, backup and restore)
+are done and tested against recorded replies and the emulated 48SX, 48GX
+and 49G; the CLI is not usable yet. Project knowledge (architecture, decisions, iteration
 plans) lives in `kb/`, a markdown knowledge base read with `hyalo`. The
 `emulator/` directory holds a Docker container running the real calculator
 ROMs in the saturnng emulator with the serial port on TCP, which is what the

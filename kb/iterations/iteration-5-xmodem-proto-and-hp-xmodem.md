@@ -24,8 +24,15 @@ Read first: wiki `protocols/xmodem`, `xmodem-hp`, `xserv`,
 - [ ] 128-byte and 1k blocks, checksum and CRC-16 (MSB-first #1021), receiver
   start characters NAK / `C`, fallback to checksum after failed CRC attempts
   (the 48G has no CRC at all).
-- [ ] HP padding: strip trailing bytes using the object-length walk; the 49G
-  rejects objects with more than ~255 bytes of padding.
+- [ ] HP padding: strip trailing bytes with `hptx_core::object::strip_padding`
+  (the object-length walk, iteration 3); the 49G rejects objects with more
+  than ~255 bytes of padding.
+- [ ] Driver: an XModem session in `hptx-core` next to `session::Session`,
+  reusing `transport::Transport` (one packet per write, read with timeout,
+  `drain`) and `MemoryTransport` for tests. Starting XRECV/XSEND on the
+  calculator goes through a Kermit `C` host command if the calculator is
+  in Kermit server mode; results stay on its stack (decision log,
+  iteration 3).
 - [ ] XSERV (49g+/50g) framing: 2-byte big-endian length, data, 1-byte sum;
   commands P, G, E, M, L. Facts came from HP-written Conn4x code under a
   non-commercial license: implement from the wiki description only.

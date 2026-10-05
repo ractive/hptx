@@ -29,6 +29,23 @@ tags:
   a clear message, never a truncated command. Names and server text arrive
   as HP-charset bytes and are shown translated (hptx-core, iteration 3).
 
+### From iteration 3
+
+- [ ] `restore` ends server mode (the calculator warm-starts and needs
+  SERVER typed again), and leaves the backup object `:0:HPTXRS` in port 0;
+  after the user restarts SERVER, `hptx restore --cleanup` (or the next
+  connect) calls `Calculator::purge_restore_leftover`. Say both in the
+  output and in `--help`; ask for confirmation (it replaces HOME).
+- [ ] `run` prints the calculator's stack display as returned: the 49G
+  truncates long values and shows lists with commas. Document it; for
+  exact values `get` the object instead.
+- [ ] `ports` / auto-pick: `hptx-core` builds `serialport` without default
+  features (no libudev), so USB vendor/product info is not available on
+  Linux. Either enable the `libudev` feature in `hptx-cli` (CI then needs
+  `libudev-dev`) or auto-pick by name pattern; decide and log it.
+- [ ] Temporary variables `HPTXTMP`, `HPTXBK`, `HPTXRS`: surface the
+  "already exists" error from hptx-core with a hint to rename or remove it.
+
 ## Acceptance criteria
 
 the M3 e2e scenarios re-expressed as a shell script driving the
