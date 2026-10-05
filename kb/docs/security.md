@@ -14,8 +14,9 @@ emulator over TCP or in-process), reads files the user names and writes the
 files the user asks for. It listens on no port and has no network service.
 This page names what hptx must not trust, the invariants that follow, and
 where the code does not meet them yet. Each invariant was checked against the
-code on 2026-10-05 (iteration 11b); the gaps are the work list for the next
-whole-crate audit (decision log, 2026-10-05, "Whole-crate audits").
+code on 2026-10-05 (iteration 11b) and again after the first whole-hptx
+audit (PR #18, fixed in iteration 12, 2026-10-06); the gaps are the work list
+for the next audit (decision log, 2026-10-05, "Whole-crate audits").
 
 ## Untrusted inputs
 
@@ -44,19 +45,34 @@ binary; the calculator's own memory (hptx runs what the user tells it to).
    in the current directory.** Downloads (`get`, `xmodem get`, `xserv get`,
    `:get`) write to `-o FILE` or to the variable name the user typed;
    `backup` and `pict` default to `hptx-backup-<time>.hp` and
-   `hptx-pict-<time>.png`. All go through `write_file`, which uses
-   `create_new` unless `--force` (no silent overwrite, no race between the
-   existence check and the write). Known exceptions by design: the REPL
-   history under the platform data directory and the restore marker in the
-   temp directory (see "Not yet true" for both), and the offline converters
-   (below).
+   `hptx-pict-<time>.png`; `object convert` and `grob to-png` default to the
+   input's file name with a new extension in the current directory, not
+   beside the input, and write stdout for stdin (iteration 12; tests
+   `offline::default_outputs_go_to_the_current_directory`,
+   `grob_from_stdin_goes_to_stdout`). All go through `write_file`, which
+   uses `create_new` unless `--force` (no silent overwrite, no race between
+   the existence check and the write). Known exceptions by design, both in
+   hptx's per-user data directory (`$XDG_DATA_HOME/hptx/` and the
+   macOS/Windows equivalents, `repl::data_dir`): the REPL history, never
+   read or written through a symbolic link (test
+   `repl::history_refuses_a_symlink`), and the restore marker
+   `restore-pending-<port>`, created with `create_new` and counted only as
+   a regular file (test `commands::restore_marker_never_follows_a_symlink`).
 2. **Calculator-provided names are never used as paths.** The name in a
    received F packet is decoded into `ReceivedFile::name` and only shown;
    `Calculator::get` returns the data and the CLI picks the path from the
    user's arguments. Listing names appear only in output and in hints, where
-   they are shell-quoted (`output::shell_quote`). User-typed variable names
-   pass `validate_name` (no `/`, no leading `.` or digit, no whitespace or
-   control characters) before they become a default file name.
+   they are shell-quoted (`output::shell_quote`; every name in every hint
+   command, test `commands::hint_names_are_shell_quoted`). User-typed
+   variable names pass `validate_name` (no `/`, `\`, leading `.` or digit,
+   whitespace or control characters, and none of the Windows device names
+   `CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9` in any case,
+   alone or before a `.`, on every platform; test `calc::names`) before they
+   become a default file name. `put --overwrite` deletes nothing unless the
+   calculator stored the temporary under `HPTXPT` (test
+   `commands::put_overwrite_checks_the_stored_name_first`), and `xserv
+   --dir` components pass `validate_name` before the calculator evaluates
+   them (test `xserv::dir_components_are_names`).
 3. **hptx spawns no process.** No `std::process::Command` outside the e2e
    test (which drives `docker exec`); rustyline is built without default
    features. The REPL sends RPL to the calculator, never to a shell.
@@ -66,19 +82,49 @@ binary; the calculator's own memory (hptx runs what the user tells it to).
    decoding checks the length field against height and width with checked
    arithmetic before allocating (at most about 4 M pixels); object parsing
    reads nibbles through `get`-style accessors and returns
-   `Error::Object`/`None` on truncation; `.unwrap()`/`.expect()` are linted
-   (`clippy::unwrap_used`, `expect_used`) outside tests. The saturnus ROM is
-   size-checked per model by `saturnus_drive::rom::load`.
-5. **`--jq` has no file or network I/O.** jaq gets the envelope as its only
-   input; no `input`/`inputs` source is wired and jaq has no file or network
-   functions.
-6. **A late reply cannot be mistaken for the answer to the user's command.**
-   Every connection starts with `Calculator::sync`: a sacrificial command
-   that pushes a marker string unique to the session (`HPTX-` and six
-   random hex digits), sent once more if the first reply does not show the
-   marker at level 1. Only copies of the marker on top of the stack are
-   dropped. hptx never resends a `run` or any other mutating command
-   (decision log, iteration 11b).
+   `Error::Object`/`None` on truncation; the `%%HP:` parser checks a `C$`
+   count against the remaining input before allocating (test
+   `convert::counted_string_count_beyond_the_input`);
+   `.unwrap()`/`.expect()` are linted (`clippy::unwrap_used`,
+   `expect_used`) outside tests. Local input (`put`, `xserv put`, `object`,
+   `grob`, `restore`, stdin for each) is read through `util::read_input`:
+   the size is checked before reading and the read stops past 4 MiB (test
+   `util::oversized_input_is_refused`); a piped REPL line longer than
+   8 KiB is skipped without being buffered (test
+   `repl::overlong_piped_line_is_skipped`). `--jq` stops after 10 000
+   results or 64 MiB of output (test `output::jq_output_is_capped`). The
+   saturnus ROM is size-checked per model by `saturnus_drive::rom::load`.
+5. **`--jq` has no I/O.** jaq gets the envelope as its only input; no
+   `input`/`inputs` source is wired and jaq has no file or network
+   functions. `env`, `debug`, `stderr` and `halt` (`halt_error`,
+   `debug_empty`, `stderr_empty`) are filtered out of jaq-std by name, so
+   they are undefined (test `output::jq_has_no_env_stderr_or_halt`; jaq-std's
+   features are too coarse to drop them, see the decision log 2026-10-06).
+6. **A host command is sent once, and a late reply cannot be mistaken for
+   the answer to the user's command.** `Calculator::host` sends every `C`
+   packet with no retries and a NAK grace as long as the timeout: a
+   calculator cannot tell a resent `C` from a new one and would run it
+   again. No reply in time is `Error::NoReply` ("may still be running or may
+   have run; the next connection resyncs"), never a retry (test
+   `calc::host_command_is_never_resent`); the REPL ends on it. Every
+   connection starts with `Calculator::sync`: a sacrificial command that
+   pushes a marker string unique to the session (`HPTX-` and six random hex
+   digits), sent once more if the first reply does not show the marker at
+   level 1. Only copies of the marker on top of the stack are dropped, and
+   two odd replies in a row fail the connect (test
+   `calc::sync_never_drops_what_it_did_not_push`). The marker is the only
+   command ever resent: its second attempt has the normal retries.
+   `restore` uploads only a backup whose directory walk succeeds (tests
+   `calc::restore_refuses_a_truncated_backup`,
+   `commands::restore_checks_the_whole_backup`) and counts the silent
+   `RESTORE` as done only when a probe after it gets no reply either (test
+   `calc::restore_probe_after_the_silent_restore`).
+7. **Text from the calculator or a file cannot drive the terminal.** Text
+   mode (`output::render`, `Failure::render`, the REPL's output and `--jq`
+   raw strings) passes through `output::escape_control`: every control
+   character but newline and tab (C0, DEL, C1, a CR not before LF) is shown
+   as `\xHH` (test `output::text_mode_escapes_control_characters`). JSON
+   output is unchanged; serde escapes control characters.
 
 ## Supply chain
 
@@ -96,47 +142,27 @@ binary; the calculator's own memory (hptx runs what the user tells it to).
 
 ## Not yet true
 
-- **Restore marker symlink**: `restore` writes
-  `$TMPDIR/hptx-restore-pending-<port>` with `std::fs::write`, which follows
-  a symlink. On Linux, where `/tmp` is shared, another local user can plant
-  that name as a symlink and have hptx truncate a file the victim owns (the
-  content is a fixed line). Use `create_new` or a per-user directory.
-- **Offline converters write next to the input file**: `object convert` and
-  `grob to-png` without `-o` derive the output from the input path
-  (`with_extension`), so the output lands in the input's directory, not the
-  current directory. Either document this as the rule or change it.
-- **Windows file names**: `validate_name` allows `\` and device names
-  (`CON`, `NUL`, `COM1`); `hptx get 'A\B'` without `-o` writes into a
-  subdirectory `A` on Windows, and `get CON` writes to the console device.
-  User-typed, so not an escalation, but the "current directory" invariant
-  does not hold there. Hints are POSIX-quoted, wrong for `cmd.exe`/PowerShell.
-- **Terminal escapes**: text output prints stack displays, listing names and
-  object text as decoded, control characters (ESC included) unchanged. A
-  calculator or a crafted file can send ANSI escape sequences to the user's
-  terminal. Sanitize control characters in text mode (JSON escapes them).
-- **`--jq` reads the environment**: jaq-std is built with default features,
-  so `env` returns every environment variable (tokens included) and
-  `debug`/`stderr` write to stderr, `halt` exits. No file or network I/O, but
-  the "no I/O" invariant is stronger than what is built. Build jaq-std
-  without default features (`std`, `log`) or document it.
-- **Local input files are read whole**: `put`, `xserv put`, `object`,
-  `grob` and `restore` use `std::fs::read` without a size limit, and the
-  REPL reads a piped line of any length before it is refused as too long.
-  User-chosen input, but invariant 4 does not hold for it.
 - **No fuzzing of the parsers**: invariant 4 rests on review and fixture
   tests (`object`, `reply`, `grob`, `convert` with BCD reals and `%%HP:`
   headers); the decision log rules out fuzz suites, so the audit must read
-  every index and slice in these modules.
-- **REPL history symlink**: the history file
-  (`$XDG_DATA_HOME/hptx/history` and the macOS/Windows equivalents) is
-  created and appended with rustyline's `append_history`, which follows a
-  symlink planted at that path. The data directory is the user's own, so
-  this needs write access to it already; still, refuse a symlink or open
-  with `O_NOFOLLOW` where the platform has it.
+  every index and slice in these modules. Left deliberately.
 - **Sync limits**: the first marker attempt has one timeout period and no
   retries, so a crossed exchange costs one `--timeout` (20 s by default)
-  before the second attempt, which has the normal budget (20 s × 6
-  tries); a calculator busy for longer than that fails the connect with a
-  timeout. If neither reply shows the marker
-  (two odd replies in a row) nothing is dropped, so a marker command that
-  ran without its reply arriving leaves its string on the stack.
+  before the second attempt, which has the normal budget (20 s × 6 tries);
+  a calculator busy for longer than that fails the connect with a timeout.
+  A marker command that ran without its reply arriving leaves its string
+  on the stack when neither reply shows it (the connect then fails). Left
+  deliberately (iteration 12).
+- **A lossy link fails host commands**: with no retries, a damaged or lost
+  packet anywhere in a host command's exchange (its reply included) ends
+  the command with `NoReply` or a Kermit error, and the user runs it again
+  after checking. The price of invariant 6 without a protocol change.
+- **`--jq` can still build a large value**: the output caps count results
+  and bytes as they come; a filter that builds one huge value
+  (`[range(1e9)]`) allocates inside jaq before anything is output. jaq has
+  no evaluation limit to set.
+- **REPL history check-then-open**: the history path is checked with
+  `symlink_metadata` and then opened by rustyline, which follows a link
+  planted in between. It needs write access to the user's own data
+  directory, which already means control of the user's account.
+- **Hints are POSIX-quoted**: wrong for `cmd.exe`/PowerShell on Windows.
