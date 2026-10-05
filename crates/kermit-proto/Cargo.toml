@@ -10,5 +10,10 @@ readme = "README.md"
 keywords = ["kermit", "sans-io", "serial", "file-transfer", "hp48"]
 categories = ["network-programming", "hardware-support"]
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# The caller's clock on wasm32 (`std::time::Instant::now()` panics on
+# wasm32-unknown-unknown); see "Time and WebAssembly" in the crate docs.
+web-time = "1.1.0"
+
 [lints]
 workspace = true

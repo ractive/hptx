@@ -1,9 +1,9 @@
 //! The XModem state machine, both roles. wiki: protocols/xmodem,
 //! protocols/xmodem-hp.
 
+use crate::time::{Duration, Instant};
 use std::collections::VecDeque;
 use std::fmt;
-use std::time::{Duration, Instant};
 
 use crate::codec::{
     ACK, BlockSize, CAN, CR_KERMIT, Check, EOT, NAK, SOH, STX, SUB, decode_block, frame_block,

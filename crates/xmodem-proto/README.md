@@ -6,7 +6,7 @@ checksum, CRC-16 and HP's own CRC mode.
 
 The crate never touches a port, a clock or a file. The caller owns all three:
 it reads and writes the link (a serial port, a TCP bridge to an emulator),
-supplies the current `std::time::Instant` and loads or stores file contents.
+supplies the current `Instant` (see below) and loads or stores file contents.
 `Transfer` is a pure state machine in between, so it runs unchanged on any
 transport and is tested by replaying byte traces recorded against real
 calculator ROMs.
@@ -38,6 +38,17 @@ After `Done` or `Error` keep calling `poll_output` until it returns `None`: the
 final ACK or the CANs may still be queued. A receiver lingers briefly after
 the final ACK (`Config::linger`) to re-ACK a retransmitted EOT; keep driving
 it until `next_timeout()` is `None`, or start the next transfer.
+
+## Time and WebAssembly
+
+The state machine never reads a clock; every call that needs the time takes
+`now` from the caller. The type is `xmodem_proto::time::Instant`: `std::time::Instant`
+on every target except `wasm32`, where it is `web_time::Instant` from the
+[`web-time`](https://crates.io/crates/web-time) crate, because
+`std::time::Instant::now()` panics on `wasm32-unknown-unknown`. A wasm caller
+creates it with `Instant::now()` from `web-time` (or `xmodem_proto::time::Instant::now()`),
+which reads `performance.now()` in the browser. `xmodem_proto::time::Duration` is
+`core::time::Duration` everywhere. Native callers use `std::time` as before.
 
 ## Driver loop
 

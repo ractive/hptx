@@ -3,7 +3,7 @@
 //!
 //! The crate never touches a port, a clock or a file. The caller owns all
 //! three: it reads and writes the link, supplies the current [`Instant`]
-//! (`std::time::Instant`) and loads or stores file contents. [`Transfer`] is a
+//! ([`time::Instant`]) and loads or stores file contents. [`Transfer`] is a
 //! pure state machine in between, with the same seam as `kermit-proto`.
 //!
 //! - Sender ([`Command::Send`]): the calculator runs `XRECV`. We wait for its
@@ -63,6 +63,17 @@
 //! [`Transfer::next_timeout`] is `None`, or [`Transfer::start`] the next
 //! transfer, which ends the linger.
 //!
+//! # Time and WebAssembly
+//!
+//! The state machine never reads a clock: every call that needs the time
+//! takes `now` from the caller. The type is [`time::Instant`], which is
+//! `std::time::Instant` on every target except `wasm32`, where it is
+//! `web_time::Instant` from the [`web-time`](https://docs.rs/web-time) crate
+//! (`std::time::Instant::now()` panics on `wasm32-unknown-unknown`). A wasm
+//! caller names it as `xmodem_proto::time::Instant` and creates it with
+//! `Instant::now()`, which `web-time` backs with `performance.now()` in the
+//! browser. [`time::Duration`] is `core::time::Duration` everywhere.
+//!
 //! # Driver loop
 //!
 //! ```no_run
@@ -113,12 +124,22 @@
 //! The block layer is public for tools and tests: [`codec`] (control bytes,
 //! framing, checksum and CRC-16).
 //!
-//! [`Instant`]: std::time::Instant
+//! [`Instant`]: time::Instant
 
 pub mod codec;
 #[cfg(test)]
 mod trace_tests;
 mod transfer;
+
+/// The clock types of the seam: `std::time` everywhere except `wasm32`,
+/// where they come from `web-time` (see the crate docs, "Time and
+/// WebAssembly").
+pub mod time {
+    #[cfg(not(target_arch = "wasm32"))]
+    pub use std::time::{Duration, Instant};
+    #[cfg(target_arch = "wasm32")]
+    pub use web_time::{Duration, Instant};
+}
 
 pub use codec::{BlockSize, Check};
 pub use transfer::{Command, Config, Error, Event, StartError, Transfer};

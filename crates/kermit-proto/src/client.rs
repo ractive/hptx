@@ -1,9 +1,9 @@
 //! The Kermit client (user Kermit) state machine: we are the host, the
 //! calculator is the server.
 
+use crate::time::{Duration, Instant};
 use std::collections::VecDeque;
 use std::fmt;
-use std::time::{Duration, Instant};
 
 use crate::codec::{BlockCheck, CR, Deframer, FrameError, Framing, Packet, parse_frame, unchar};
 use crate::params::{InitParams, Negotiated, negotiate};

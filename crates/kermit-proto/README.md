@@ -6,7 +6,7 @@ the directory, end server mode.
 
 The crate never touches a port, a clock or a file. The caller owns all three:
 it reads and writes the link (a serial port, a TCP bridge to an emulator),
-supplies the current `std::time::Instant` and loads or stores file contents.
+supplies the current `Instant` (see below) and loads or stores file contents.
 `Client` is a pure state machine in between, so it runs unchanged on any
 transport and is tested by replaying byte traces recorded against real
 calculator ROMs.
@@ -40,6 +40,17 @@ final ACK or an E packet may still be queued. After a receive the client
 lingers briefly (`Config::linger`) to re-ACK a retransmitted `B` packet, in
 case its final ACK was lost; keep driving it until `next_timeout()` is `None`,
 or start the next command.
+
+## Time and WebAssembly
+
+The state machine never reads a clock; every call that needs the time takes
+`now` from the caller. The type is `kermit_proto::time::Instant`: `std::time::Instant`
+on every target except `wasm32`, where it is `web_time::Instant` from the
+[`web-time`](https://crates.io/crates/web-time) crate, because
+`std::time::Instant::now()` panics on `wasm32-unknown-unknown`. A wasm caller
+creates it with `Instant::now()` from `web-time` (or `kermit_proto::time::Instant::now()`),
+which reads `performance.now()` in the browser. `kermit_proto::time::Duration` is
+`core::time::Duration` everywhere. Native callers use `std::time` as before.
 
 ## Driver loop
 
