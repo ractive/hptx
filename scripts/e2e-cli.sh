@@ -436,8 +436,9 @@ step "grob to-png of a stored LCD\\-> GROB"
 hptx run "LCD\\-> 'HPTXGR' STO" --json >/dev/null
 hptx get HPTXGR -o "$work/gr.hp" --json >/dev/null
 [[ $(walks_whole_file "$work/gr.hp") == Graphic ]] || fail "inspect type"
-png=$(hptx grob to-png "$work/gr.hp" --json)
-jq -e '.results.width == 131 and .results.height == 64' <<<"$png" >/dev/null || fail "$png"
+# Without -o the PNG goes to the current directory under the input's name.
+png=$(cd "$work" && hptx grob to-png gr.hp --json)
+jq -e '.results.width == 131 and .results.height == 64 and .results.output == "gr.png"' <<<"$png" >/dev/null || fail "$png"
 [[ $(head -c 8 "$work/gr.png" | od -An -tx1 | tr -d ' \n') == 89504e470d0a1a0a ]] || fail "not a PNG"
 ok "131x64"
 
