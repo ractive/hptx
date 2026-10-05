@@ -17,7 +17,7 @@ SERVER) and the security discussion of the same day.
 
 ## Tasks
 
-- [ ] Stale reply after an aborted command: when a client dies mid host
+- [x] Stale reply after an aborted command: when a client dies mid host
   command, the calculator finishes it and its reply arrives seconds later
   as the answer to the next client's first command (`bad directory line:
   "Empty Stack"`). Packet sequences restart at zero for every command and
@@ -31,7 +31,7 @@ SERVER) and the security discussion of the same day.
   mutating command. Cover with an in-memory transport test that injects a
   stale stack reply before the first answer, and with an e2e scenario on
   the 48SX (Ctrl-C a piped REPL mid `1 1000000 START NEXT`, then `hptx ls`).
-- [ ] REPL JSON-lines mode for agents: `hptx repl --json` with piped stdin
+- [x] REPL JSON-lines mode for agents: `hptx repl --json` with piped stdin
   emits exactly one JSON object per input line on stdout, in input order:
   an RPL line gives `{"stack": [...]}` (empty list for an empty stack), a
   calculator error gives `{"error", "hint", "stack"}` on stdout as well
@@ -44,7 +44,7 @@ SERVER) and the security discussion of the same day.
   refused in the REPL". Document it in `repl --help` and README as the agent
   pattern on real hardware (one process, no per-call reconnect, no
   stale-reply race). Unit tests and an e2e-cli scenario.
-- [ ] In-process saturnus transport on `saturnus-drive`: the address
+- [x] In-process saturnus transport on `saturnus-drive`: the address
   carries the model, `saturnus://<model>@<abs-rom-path>` with hptx's model
   names (`48sx`, `48gx`, `49g`; a bare path means `48sx` for compatibility),
   because a ROM path alone is ambiguous (the 38G and 48GX are both 512 KB)
@@ -60,7 +60,7 @@ SERVER) and the security discussion of the same day.
   `rom.49g` under `~/devel/saturnus/roms/`); it passes for all three. The
   decision-log entry replaces the iteration 8 entry "Address
   `saturnus://ROM-PATH` boots an HP 48SX".
-- [ ] `kb/docs/security.md`: the threat model. Untrusted inputs (bytes from
+- [x] `kb/docs/security.md`: the threat model. Untrusted inputs (bytes from
   the calculator over Kermit/XModem, files given to `put`, `object`, `grob`,
   `restore`, REPL and piped lines, `HPTX_PORT`, the ROM file for saturnus);
   invariants (no file written outside the explicit `-o` path or a
