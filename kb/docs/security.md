@@ -73,14 +73,19 @@ binary; the calculator's own memory (hptx runs what the user tells it to).
    input; no `input`/`inputs` source is wired and jaq has no file or network
    functions.
 6. **A late reply cannot be mistaken for the answer to the user's command.**
-   Every connection starts with a sacrificial, idempotent `PATH` query
-   (`Calculator::sync`), asked a second time if the first reply is not a
-   path; only a path answer is dropped again. hptx never resends a `run` or
-   any other mutating command (decision log, iteration 11b).
+   Every connection starts with `Calculator::sync`: a sacrificial command
+   that pushes a marker string unique to the session (`HPTX-` and six
+   random hex digits), sent once more if the first reply does not show the
+   marker at level 1. Only copies of the marker on top of the stack are
+   dropped. hptx never resends a `run` or any other mutating command
+   (decision log, iteration 11b).
 
 ## Supply chain
 
 - `Cargo.lock` is committed; release binaries and CI build from it.
+- `cargo-deny` (`deny.toml`: advisories, licenses, bans, sources) runs in
+  CI on every PR and push to main (iteration 11a) and locally with
+  `cargo deny --locked check`.
 - Git dependencies (`saturnus`, `saturnus-drive`, feature `saturnus` only)
   are pinned by commit rev.
 - Default features are trimmed where they pull system libraries or I/O:
@@ -122,10 +127,14 @@ binary; the calculator's own memory (hptx runs what the user tells it to).
   tests (`object`, `reply`, `grob`, `convert` with BCD reals and `%%HP:`
   headers); the decision log rules out fuzz suites, so the audit must read
   every index and slice in these modules.
-- **Sync heuristics**: `Calculator::sync` drops level 1 when the reply looks
-  like a path. If the aborted command itself left a path on level 1 (it ran
-  `PATH`) and our query was eaten, that value is dropped. A calculator still
-  busy longer than the Kermit retry budget (20 s × 5) fails the connect
-  with a timeout instead of syncing.
-- **Supply-chain checks**: no `cargo-deny` (licenses, advisories, sources)
-  or `cargo audit` on `main` yet; iteration 11a adds them to CI.
+- **REPL history symlink**: the history file
+  (`$XDG_DATA_HOME/hptx/history` and the macOS/Windows equivalents) is
+  created and appended with rustyline's `append_history`, which follows a
+  symlink planted at that path. The data directory is the user's own, so
+  this needs write access to it already; still, refuse a symlink or open
+  with `O_NOFOLLOW` where the platform has it.
+- **Sync limits**: a calculator still busy longer than the Kermit retry
+  budget (20 s × 5) fails the connect with a timeout instead of syncing;
+  if neither reply shows the marker (two late replies in a row) nothing is
+  dropped, so a marker command that ran without its reply arriving leaves
+  its string on the stack.

@@ -67,7 +67,9 @@ input line on stdout, in input order:
   blank line         {}
   :help / :quit      {\"help\": ...} / {\"quit\": true}, then the stream ends
 Errors are on stdout too, unlike the other commands, so a reader sees results
-and errors in order; a link failure is the last object and hptx exits 1. An
+and errors in order; a link failure is the last object and hptx exits 1.
+When the reader closes stdout, hptx stops before the next line (nothing more
+reaches the calculator) and exits 0. An
 error before the first line (no link) goes to stderr as {\"error\", \"hint\"}.
 This is the way for an agent to drive real hardware: one process and one
 link for many commands, no reconnect per call and no late reply from an
@@ -380,6 +382,7 @@ pub fn history_path(platform: Platform, var: impl Fn(&str) -> Option<OsString>) 
 }
 
 /// After a line: go on or leave.
+#[derive(Debug, PartialEq, Eq)]
 enum Flow {
     Continue,
     Quit,
@@ -569,11 +572,12 @@ impl Ctx {
                 Ok(flow(&shown))
             }
             (Ok(shown), Output::JsonLines) => {
-                print_json(&shown_json(&shown))?;
-                Ok(flow(&shown))
+                let written = print_json(&shown_json(&shown))?;
+                Ok(either(written, flow(&shown)))
             }
             (Err(e), Output::Text) if is_link_failure(&e) => Err(e),
             (Err(e), Output::JsonLines) if is_link_failure(&e) => {
+                // Written if anyone still reads; the session ends anyway.
                 print_json(&failure_json(&repl_failure(&e, &self.link)))?;
                 Err(e.context(Reported))
             }
@@ -581,10 +585,7 @@ impl Ctx {
                 eprintln!("{}", repl_failure(&e, &self.link).render(Format::Text));
                 Ok(Flow::Continue)
             }
-            (Err(e), Output::JsonLines) => {
-                print_json(&failure_json(&repl_failure(&e, &self.link)))?;
-                Ok(Flow::Continue)
-            }
+            (Err(e), Output::JsonLines) => print_json(&failure_json(&repl_failure(&e, &self.link))),
         }
     }
 
@@ -700,9 +701,34 @@ fn show_text(shown: &Shown) -> Result<()> {
     }
 }
 
-/// One compact JSON object and a newline on stdout.
-fn print_json(value: &serde_json::Value) -> Result<()> {
-    output::print_stdout(&value.to_string()).context("writing to stdout")
+/// One compact JSON object and a newline on stdout; `Flow::Quit` once the
+/// reader has closed the pipe (see [`write_json_line`]).
+fn print_json(value: &serde_json::Value) -> Result<Flow> {
+    write_json_line(&mut std::io::stdout().lock(), value)
+}
+
+/// Write `value` as one line to `out` and flush. A closed pipe
+/// (`BrokenPipe`) ends the session: nobody reads the results, so no
+/// further line may reach the calculator. `Flow::Quit` then, exit 0 like
+/// `:quit`.
+fn write_json_line(out: &mut impl std::io::Write, value: &serde_json::Value) -> Result<Flow> {
+    let result = out
+        .write_all(value.to_string().as_bytes())
+        .and_then(|()| out.write_all(b"\n"))
+        .and_then(|()| out.flush());
+    match result {
+        Ok(()) => Ok(Flow::Continue),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(Flow::Quit),
+        Err(e) => Err(anyhow::Error::new(e).context("writing to stdout")),
+    }
+}
+
+/// `Quit` if either says so.
+fn either(a: Flow, b: Flow) -> Flow {
+    match (a, b) {
+        (Flow::Continue, Flow::Continue) => Flow::Continue,
+        _ => Flow::Quit,
+    }
 }
 
 fn kermit() -> XmodemArgs {
@@ -1146,6 +1172,54 @@ mod tests {
         let reported =
             anyhow::Error::new(Error::Kermit(kermit_proto::Error::Timeout)).context(Reported);
         assert!(reported.downcast_ref::<Reported>().is_some());
+    }
+
+    /// Accepts `ok` writes, then fails every write with `kind`.
+    struct ClosingPipe {
+        ok: usize,
+        kind: std::io::ErrorKind,
+        written: Vec<u8>,
+    }
+
+    impl std::io::Write for ClosingPipe {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.ok == 0 {
+                return Err(self.kind.into());
+            }
+            self.ok -= 1;
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn closed_pipe_ends_the_json_session() {
+        // Object and newline go through, then the reader is gone.
+        let mut out = ClosingPipe {
+            ok: 2,
+            kind: std::io::ErrorKind::BrokenPipe,
+            written: Vec::new(),
+        };
+        let first = serde_json::json!({"stack": ["42"]});
+        assert_eq!(write_json_line(&mut out, &first).unwrap(), Flow::Continue);
+        assert_eq!(out.written, b"{\"stack\":[\"42\"]}\n");
+        let second = serde_json::json!({"stack": []});
+        assert_eq!(write_json_line(&mut out, &second).unwrap(), Flow::Quit);
+        // Any other write error is an error.
+        let mut full = ClosingPipe {
+            ok: 0,
+            kind: std::io::ErrorKind::StorageFull,
+            written: Vec::new(),
+        };
+        assert!(write_json_line(&mut full, &second).is_err());
+        // A closed pipe wins over a line that would go on.
+        assert_eq!(either(Flow::Quit, Flow::Continue), Flow::Quit);
+        assert_eq!(either(Flow::Continue, Flow::Quit), Flow::Quit);
+        assert_eq!(either(Flow::Continue, Flow::Continue), Flow::Continue);
     }
 
     #[test]

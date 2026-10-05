@@ -133,6 +133,8 @@ xmodem_run() {
 
 cleanup() {
     local status=$?
+    # Background processes of the abort scenario, if it stopped midway.
+    for pid in ${feeder_pid:-} ${repl_pid:-}; do kill "$pid" 2>/dev/null || true; done
     if ((!verified)); then
         rm -rf "$work"
         exit "$status"
@@ -146,7 +148,7 @@ cleanup() {
     # Best effort: remove what this script may have created.
     local names
     names=$(hptx --dir HOME ls --jq '.results[].name' 2>/dev/null || true)
-    for n in HPTXCLI HPTXPT HPTXSM HPTXCD HPTXCE HPTXGR HPTXG2 HPTXCV HPTXCW HPTXCX HPTXXM HPTXR; do
+    for n in HPTXCLI HPTXPT HPTXSM HPTXCD HPTXCE HPTXGR HPTXG2 HPTXCV HPTXCW HPTXCX HPTXXM HPTXR HPTXAAAA; do
         if grep -qx "$n" <<<"$names"; then
             echo "cleanup: removing $n" >&2
             hptx rm "$n" >/dev/null 2>&1 || true
@@ -498,12 +500,23 @@ step "late reply of an aborted command is skipped"
 # calculator finishes it and offers the reply for about a minute. The next
 # hptx must not take that reply for its own (`bad directory line: "Empty
 # Stack"` before iteration 11b). SIGTERM, since a background job in a
-# script ignores SIGINT.
-{ echo '1 1000000 START NEXT 4711'; sleep 60; } | hptx repl >/dev/null 2>&1 &
+# script ignores SIGINT. The REPL reads a FIFO whose writer (`exec sleep`,
+# so its pid is the sleeper's) keeps stdin open; both are killed here and,
+# should the script stop midway, by the exit trap.
+mkfifo "$work/repl.fifo"
+hptx repl <"$work/repl.fifo" >/dev/null 2>&1 &
 repl_pid=$!
+{
+    echo '1 1000000 START NEXT 4711'
+    exec sleep 60
+} >"$work/repl.fifo" &
+feeder_pid=$!
 sleep 3
 kill -TERM "$repl_pid" 2>/dev/null || true
 wait "$repl_pid" 2>/dev/null || true
+kill "$feeder_pid" 2>/dev/null || true
+wait "$feeder_pid" 2>/dev/null || true
+repl_pid='' feeder_pid=''
 late=$(hptx ls --json) || fail "ls after an aborted command: $late"
 jq -e '.results | map(.name) | index("IOPAR")' <<<"$late" >/dev/null || fail "ls: $late"
 # The loop's result is on the stack, nothing of hptx's own.
@@ -511,6 +524,21 @@ stack=$(hptx run DEPTH --json)
 jq -e '.results.stack | length == 2 and (.[0] | test("^1\\.?$")) and (.[1] | test("^4711\\.?$"))' \
     <<<"$stack" >/dev/null || fail "stack after the late reply: $stack"
 hptx run CLEAR >/dev/null
+ok
+
+step "connect in a deep directory keeps the stack"
+# The 49G cuts a long path at the display width; the connect's sync must
+# leave the user's stack exactly as it was there too.
+hptx --dir HOME mkdir HPTXAAAA >/dev/null
+hptx --dir HOME/HPTXAAAA mkdir HPTXBBBB >/dev/null
+hptx run CLEAR >/dev/null
+hptx run 4711 >/dev/null
+hptx --dir HOME/HPTXAAAA/HPTXBBBB ls --json >/dev/null || fail "ls in HOME/HPTXAAAA/HPTXBBBB"
+stack=$(hptx run DEPTH --json)
+jq -e '.results.stack | length == 2 and (.[0] | test("^1\\.?$")) and (.[1] | test("^4711\\.?$"))' \
+    <<<"$stack" >/dev/null || fail "stack after connecting in a deep directory: $stack"
+hptx run CLEAR >/dev/null
+hptx --dir HOME rm HPTXAAAA >/dev/null
 ok
 
 step "settings --mode ascii"

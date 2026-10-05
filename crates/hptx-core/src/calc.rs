@@ -128,22 +128,36 @@ impl Calculator {
     /// numbers restart at zero for every command and host commands and
     /// `G D` both answer with text, so the late reply cannot be told apart
     /// on the wire, and repeating an arbitrary command would repeat its
-    /// effect. Instead the session starts with a sacrificial, idempotent
-    /// `PATH` query: its first reply is accepted whatever it is, and if it
-    /// is not a path (a list starting with `HOME`) the query runs once
-    /// more. Only a path answer is dropped again, so a late reply leaves
-    /// the user's stack as it was. Never fails on an unexpected reply;
+    /// effect. Instead the session starts with a sacrificial command that
+    /// pushes a marker string unique to this session ([`sync_marker`],
+    /// short enough that no model truncates it). A reply whose level 1 is
+    /// the marker is ours: the marker is dropped (every copy of it on top
+    /// of the stack, in case an earlier attempt was not eaten after all).
+    /// Any other reply was a late one and our command was eaten: the marker
+    /// command is sent once more. Nothing but the marker is ever dropped,
+    /// nothing else is ever resent, and an odd reply is never an error;
     /// link errors are returned.
     pub fn sync(&mut self) -> Result<()> {
+        self.sync_with(&sync_marker())
+    }
+
+    fn sync_with(&mut self, marker: &str) -> Result<()> {
+        let command = format!("\"{marker}\"");
         for _ in 0..2 {
-            let reply = self.host("PATH")?;
-            let is_path = reply.error.is_none()
-                && reply
-                    .level(1)
-                    .and_then(parse_list)
-                    .is_some_and(|path| path.first().is_some_and(|p| p == "HOME"));
-            if is_path {
-                return self.drop_levels(1);
+            let reply = self.host(&command)?;
+            let ours = reply
+                .levels
+                .iter()
+                .take_while(|level| parse_string(level).as_deref() == Some(marker))
+                .count();
+            if reply.error.is_none() && ours > 0 {
+                let mut left = ours;
+                while left > 0 {
+                    let n = left.min(2);
+                    self.drop_levels(n)?;
+                    left -= n;
+                }
+                return Ok(());
             }
         }
         Ok(())
@@ -646,6 +660,20 @@ impl Calculator {
     }
 }
 
+/// The string [`Calculator::sync`] pushes: `HPTX-` and six random hex
+/// digits (13 characters with the quotes, far below every model's display
+/// width), plain ASCII without RPL delimiters.
+pub fn sync_marker() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    // RandomState is seeded per process from the OS; mix in the time so two
+    // states in one process differ too.
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    if let Ok(since) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        hasher.write_u128(since.as_nanos());
+    }
+    format!("HPTX-{:06x}", hasher.finish() & 0xFF_FFFF)
+}
+
 /// Turn a reply with an error into [`Error::Calculator`].
 fn checked(reply: StackReply) -> Result<StackReply> {
     match reply.error {
@@ -822,50 +850,106 @@ mod tests {
         assert_eq!(sent(&log), ["G D"]);
     }
 
-    /// The first command after an aborted client is eaten by the server and
-    /// answered with the late reply of the aborted command (here a stack
-    /// display): sync accepts it, asks again and drops only its own path.
-    #[test]
-    fn sync_skips_a_stale_reply() {
-        let mut first = true;
+    const MARKER: &str = "HPTX-0a1b2c";
+    const MARKER_CMD: &str = "\"HPTX-0a1b2c\"";
+
+    /// Sync with [`MARKER`] against a server whose replies to the marker
+    /// command are `replies` in order (then an empty stack); the log of
+    /// what was sent.
+    fn sync_against(replies: Vec<&'static str>) -> Vec<String> {
+        let mut replies = replies.into_iter();
         let (mut c, log) = calc(move |cmd| match cmd {
-            "PATH" if std::mem::take(&mut first) => {
-                "2:                  1\r\n1:                  2\r\n".into()
-            }
-            "PATH" => "1:          { HOME }\r\n".into(),
-            "DROP" => "2:                  1\r\n1:                  2\r\n".into(),
+            MARKER_CMD => replies.next().unwrap_or(EMPTY).into(),
+            "DROP" | "DROP2" => EMPTY.into(),
             _ => panic!("unexpected {cmd}"),
         });
-        c.sync().unwrap();
-        assert_eq!(sent(&log), ["PATH", "PATH", "DROP"]);
+        c.sync_with(MARKER).unwrap();
+        sent(&log)
     }
 
     #[test]
-    fn sync_in_step_costs_one_query() {
-        let (mut c, log) = calc(|cmd| match cmd {
-            "PATH" => "1:          { HOME D1 }\r\n".into(),
-            "DROP" => EMPTY.into(),
-            _ => panic!("unexpected {cmd}"),
-        });
-        c.sync().unwrap();
-        assert_eq!(sent(&log), ["PATH", "DROP"]);
+    fn sync_marker_is_short_and_plain() {
+        let m = sync_marker();
+        assert_eq!(m.len(), 11, "{m}");
+        assert!(m.starts_with("HPTX-"));
+        assert!(m[5..].chars().all(|c| c.is_ascii_hexdigit()), "{m}");
+        assert_ne!(sync_marker(), sync_marker());
+    }
+
+    #[test]
+    fn sync_in_step_costs_two_transactions() {
+        let one = "1:      \"HPTX-0a1b2c\"\r\n";
+        assert_eq!(sync_against(vec![one]), [MARKER_CMD, "DROP"]);
+    }
+
+    /// The first command after an aborted client is eaten by the server and
+    /// answered with the late reply of the aborted command (here a stack
+    /// display): sync sends the marker again and drops only the marker.
+    #[test]
+    fn sync_skips_a_stale_reply() {
+        let stale = "2:                  1\r\n1:                  2\r\n";
+        let ours = "3:                  1\r\n2:                  2\r\n1:      \"HPTX-0a1b2c\"\r\n";
+        assert_eq!(
+            sync_against(vec![stale, ours]),
+            [MARKER_CMD, MARKER_CMD, "DROP"]
+        );
+    }
+
+    /// A late reply that is a 49G path cut at the display width (no closing
+    /// brace, fixture `49g-vars.txt` style) is not taken for ours.
+    #[test]
+    fn sync_skips_a_truncated_path_reply() {
+        let stale = "1: {HOME,HPTXAAAA,HPTXBB\r\n";
+        let ours = "2: {HOME,HPTXAAAA,HPTXBB\r\n1:      \"HPTX-0a1b2c\"\r\n";
+        assert_eq!(
+            sync_against(vec![stale, ours]),
+            [MARKER_CMD, MARKER_CMD, "DROP"]
+        );
+    }
+
+    /// The aborted command's own result was a path: it stays on the stack.
+    #[test]
+    fn sync_keeps_a_path_shaped_stale_result() {
+        let stale = "1:          { HOME }\r\n";
+        let ours = "2:          { HOME }\r\n1:      \"HPTX-0a1b2c\"\r\n";
+        // One DROP for the marker; the path at level 2 is the user's.
+        assert_eq!(
+            sync_against(vec![stale, ours]),
+            [MARKER_CMD, MARKER_CMD, "DROP"]
+        );
+    }
+
+    /// In a deep 49G directory the stack shows truncated values; the marker
+    /// at level 1 is recognised all the same and only it is dropped.
+    #[test]
+    fn sync_in_a_deep_49g_directory() {
+        let ours = "2: {D1,G,TG,B,C,A,P,L,S,R\r\n1: \"HPTX-0a1b2c\"\r\n";
+        assert_eq!(sync_against(vec![ours]), [MARKER_CMD, "DROP"]);
+    }
+
+    /// Our first marker command was not eaten after all: both copies are
+    /// ours and both go.
+    #[test]
+    fn sync_drops_every_copy_of_its_marker() {
+        let stale = "Error: Bad Argument Type\r\n";
+        let ours =
+            "3:                  7\r\n2:      \"HPTX-0a1b2c\"\r\n1:      \"HPTX-0a1b2c\"\r\n";
+        assert_eq!(
+            sync_against(vec![stale, ours]),
+            [MARKER_CMD, MARKER_CMD, "DROP2"]
+        );
     }
 
     #[test]
     fn sync_never_drops_what_it_did_not_push() {
-        // Two replies that are not paths (a late error reply, then an
-        // empty stack): accepted, nothing dropped, no error.
-        let mut n = 0;
-        let (mut c, log) = calc(move |cmd| {
-            n += 1;
-            match (cmd, n) {
-                ("PATH", 1) => "Error: Bad Argument Type\r\n1:                  1\r\n".into(),
-                ("PATH", _) => EMPTY.into(),
-                _ => panic!("unexpected {cmd}"),
-            }
-        });
-        c.sync().unwrap();
-        assert_eq!(sent(&log), ["PATH", "PATH"]);
+        // A late error reply, then an empty stack: accepted, nothing
+        // dropped, no error, no third attempt. A marker below level 1 or
+        // another marker is not ours to drop either.
+        let error = "Error: Bad Argument Type\r\n1:                  1\r\n";
+        assert_eq!(sync_against(vec![error, EMPTY]), [MARKER_CMD, MARKER_CMD]);
+        let below = "2:      \"HPTX-0a1b2c\"\r\n1:                  1\r\n";
+        let other = "1:      \"HPTX-ffffff\"\r\n";
+        assert_eq!(sync_against(vec![below, other]), [MARKER_CMD, MARKER_CMD]);
     }
 
     #[test]

@@ -346,11 +346,17 @@ Decisions already made. Do not re-litigate; add a dated entry to change one.
   command. Packet sequences restart at zero for every command and host
   commands and `G D` both answer with text, so a late reply cannot be told
   apart on the wire. Every connection (`Calculator::open`, every CLI
-  command, the REPL) starts with `Calculator::sync`: a sacrificial `PATH`
-  query whose first reply is accepted whatever it is, asked once more if
-  that reply is not a path; only a path answer is dropped. hptx never
-  resends `run` or any mutating command. Cost: two short transactions per
-  connection. Closes `backlog/stale-reply-after-abort`.
+  command, the REPL) starts with `Calculator::sync`: a sacrificial command
+  pushes a marker string unique to the session (`HPTX-` and six random hex
+  digits, short enough that no model truncates it). A reply whose level
+  1 is the marker is ours, and the marker copies on top of the stack are
+  dropped; any other reply was a late one and our command was eaten, so
+  the marker command is sent once more. Nothing but the marker is ever
+  dropped and an odd reply is never an error. (A `PATH` query was the
+  first design; the PR #16 review rejected it: the 49G cuts a long path at
+  the display width, and a path-shaped late reply would have been dropped.)
+  hptx never resends `run` or any mutating command. Cost: two short
+  transactions per connection. Closes `backlog/stale-reply-after-abort`.
 - **REPL JSON lines.** `hptx repl --json` with piped stdin writes exactly one
   compact JSON object per input line on stdout, in order: `{"stack": [...]}`
   (level 1 first, `[]` when empty); `{"error","hint","stack"}` for a
