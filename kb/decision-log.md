@@ -331,8 +331,8 @@ Decisions already made. Do not re-litigate; add a dated entry to change one.
   windows: clippy and the fast tests; fmt and cargo-deny on Linux only).
   The release workflow builds `hptx` for macOS arm64 and x86_64, Linux
   x86_64 and Windows x86_64, tests each and uploads artifacts; it triggers
-  on tags `v*`, `workflow_dispatch`, and a PR or `iter-*` push that changes
-  the workflow file (the dry run); publishing a GitHub Release or
+  on tags `v*`, `workflow_dispatch`, and a PR that changes the workflow
+  file (the dry run); publishing a GitHub Release or
   installers is a later iteration, after the hardware iteration.
 - **Measured** (2026-10-05): check job 55 s ubuntu, 45 s macos, 63 s
   windows on a warm cache (33-43 s on ubuntu before cargo-deny); release

@@ -49,6 +49,8 @@ allow = ["MPL-2.0"]
 # 0.8 (png) vs 0.9 (flate2). They clear when serialport and png move on.
 [bans]
 multiple-versions = "warn"
+# hptx-core's optional git dependency on saturnus has no `version`, which
+# cargo-deny counts as a wildcard requirement; nothing else is a wildcard.
 wildcards = "allow"
 
 [sources]

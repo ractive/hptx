@@ -43,8 +43,7 @@ wall time before and after in this file.
   Windows x86_64, runs the fast tests on each, and uploads the binaries as
   workflow artifacts; no GitHub Release is created and no tag is pushed in
   this iteration. `workflow_dispatch` only works once the workflow is on the
-  default branch, so it also triggers on a `pull_request` (and an `iter-*/**`
-  push) that changes `release.yml`: that is the dry run. Record the artifact
+  default branch, so it also triggers on a `pull_request` that changes `release.yml`: that is the dry run. Record the artifact
   sizes here.
 - [x] Decision-log entry: supply-chain policy and the release shape.
 
