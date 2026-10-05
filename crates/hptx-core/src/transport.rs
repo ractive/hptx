@@ -1,4 +1,5 @@
-//! Links to a calculator: serial port, TCP (emulator) and in-memory (tests).
+//! Links to a calculator: serial port, TCP (emulator), in-memory (tests) and,
+//! with the `saturnus` feature, the saturnus HP 48SX emulator in-process.
 //!
 //! A [`Transport`] writes whole packets and reads with a timeout. Each packet
 //! goes out in one write: the HP's receiver overruns on inter-byte gaps.
@@ -11,6 +12,11 @@ use std::time::{Duration, Instant};
 use kermit_proto::trace::{self, Direction};
 
 use crate::{Error, Result};
+
+#[cfg(feature = "saturnus")]
+mod saturnus;
+#[cfg(feature = "saturnus")]
+pub use saturnus::SaturnusTransport;
 
 /// A byte link to a calculator.
 pub trait Transport: Send {
@@ -27,9 +33,18 @@ pub const BAUD: u32 = 9600;
 /// Shortest timeout handed to the OS; zero would mean "block forever".
 const MIN_TIMEOUT: Duration = Duration::from_millis(1);
 
-/// Open a link: `tcp://host:port` for an emulator, anything else without a
-/// `scheme://` prefix is a serial device path (`/dev/ttyUSB0`, `COM3`).
+/// Open a link: `tcp://host:port` for an emulator, `saturnus://ROM` for the
+/// in-process saturnus emulator booted from the packed ROM image at the
+/// path `ROM` (`saturnus:///abs/sxrom-j`; needs the `saturnus` feature),
+/// anything else without a `scheme://` prefix is a serial device path
+/// (`/dev/ttyUSB0`, `COM3`).
 pub fn open(addr: &str) -> Result<Box<dyn Transport>> {
+    if let Some(rom) = addr.strip_prefix("saturnus://") {
+        if rom.is_empty() {
+            return Err(Error::Address(addr.to_string()));
+        }
+        return open_saturnus(std::path::Path::new(rom));
+    }
     if let Some(host_port) = addr.strip_prefix("tcp://") {
         if host_port.is_empty() {
             return Err(Error::Address(addr.to_string()));
@@ -40,6 +55,22 @@ pub fn open(addr: &str) -> Result<Box<dyn Transport>> {
         return Err(Error::Address(addr.to_string()));
     }
     Ok(Box::new(SerialTransport::open(addr)?))
+}
+
+/// Boot the saturnus HP 48SX emulator in-process from the packed ROM image
+/// at `rom` and start its Kermit server.
+#[cfg(feature = "saturnus")]
+pub fn open_saturnus(rom: &std::path::Path) -> Result<Box<dyn Transport>> {
+    Ok(Box::new(SaturnusTransport::open(rom)?))
+}
+
+/// Without the `saturnus` feature there is no in-process emulator.
+#[cfg(not(feature = "saturnus"))]
+pub fn open_saturnus(rom: &std::path::Path) -> Result<Box<dyn Transport>> {
+    Err(Error::Emulator(format!(
+        "cannot boot {}: hptx-core was built without the `saturnus` feature",
+        rom.display()
+    )))
 }
 
 /// Read and discard everything that arrives within `period` from now; returns
@@ -323,5 +354,10 @@ mod tests {
         assert!(matches!(open(""), Err(Error::Address(a)) if a.is_empty()));
         assert!(matches!(open("udp://x:1"), Err(Error::Address(a)) if a == "udp://x:1"));
         assert!(matches!(open("tcp://"), Err(Error::Address(_))));
+        assert!(matches!(open("saturnus://"), Err(Error::Address(_))));
+        assert!(matches!(
+            open("saturnus:///nonexistent/rom"),
+            Err(Error::Emulator(_))
+        ));
     }
 }

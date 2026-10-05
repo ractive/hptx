@@ -145,3 +145,30 @@ Decisions already made. Do not re-litigate; add a dated entry to change one.
   the server then stops with "Invalid IOPAR" and answers nothing. `Iopar::to_rpl`
   writes `{ 9600. 0. 0. 0. 3. 1. }` (the 48 reads that as reals too); the
   plain form stays for display.
+## 2026-10-05 (iteration 8)
+
+- **saturnus in-process, behind a feature.** `hptx-core` has an optional
+  dependency on the saturnus emulator core (feature `saturnus`) as a git
+  dependency pinned to a saturnus commit (`rev`). Not a sibling path: cargo
+  loads an optional path dependency's manifest even with the feature off,
+  so a lone hptx checkout would no longer build. Bump the `rev` to pick up
+  saturnus changes.
+- **Address `saturnus://ROM-PATH`.** `transport::open` boots an HP 48SX from
+  the packed ROM image at that path (`saturnus:///abs/sxrom-j`), answers the
+  boot prompt with NO and types `SERVER`, as the container's `AUTOSTART`
+  does, then waits (at most 15 s of emulated time) for the idle server's
+  first NAK as proof the server runs. A ROM that never shows the boot
+  prompt, never settles after a key or never NAKs is `Error::Emulator` from
+  `open`, not a link that only times out. Each open boots a fresh
+  calculator, so every e2e scenario starts clean. Without the feature the
+  address is `Error::Emulator`.
+- **Time model of the in-process transport.** No threads and no pacing:
+  `read` runs emulated time until the calculator's output has been quiet
+  for 4 ms (a packet is sent back to back) or `timeout` worth of emulated
+  time has passed; after a timeout it sleeps out the rest of `timeout` in
+  wall time, so the host's wall-clock Kermit deadlines see one timeout, not
+  many. `write_packet` first replays the wall time the host spent outside
+  the transport (at most 2 s) as emulated time: the `Session` turnaround
+  pause is time the calculator needs before the next command (a command
+  right after the final ACK is lost). The saturnus core is built with
+  `opt-level = 3` in the dev profile so the suite does not crawl.
