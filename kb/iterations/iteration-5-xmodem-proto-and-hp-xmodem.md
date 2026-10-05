@@ -32,8 +32,10 @@ Read first: wiki `protocols/xmodem`, `xmodem-hp`, `xserv`,
   with more than ~255 bytes of padding.
 - [ ] Walk rules for the 49G aplet (#026D5) and minifont (#026FE) prologs
   come from the Conn4x table only and are unverified (iteration 3 review).
-  Aplets are what 39G/40G XModem transfers carry: verify the walk on a real
-  aplet (Emu48 or hardware) and record the result in the wiki.
+  39G/40G transfers carry aplets, but their wire protocol is unverified
+  (Kermit or XModem; wiki `hardware/hp39g-40g`), and so is the prolog a
+  real aplet uses. Verify both on Emu48 or hardware, check the walk against
+  the object, and record the results in the wiki.
 - [ ] Driver: an XModem session in `hptx-core` next to `session::Session`,
   reusing `transport::Transport` (one packet per write, read with timeout,
   `drain`) and `MemoryTransport` for tests. Starting XRECV/XSEND on the

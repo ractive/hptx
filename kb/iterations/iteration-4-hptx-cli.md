@@ -49,8 +49,11 @@ tags:
   unknown prolog as an error, never as a ROM pointer (iteration 3 review:
   the walk used to truncate composites holding HP49 matrices). The 49G
   stores any matrix with exact integers as a symbolic matrix (#02686).
-  When the e2e script runs locally against the 49G it includes a
-  byte-exact `get` of a list holding a symbolic matrix.
+  The e2e script includes a byte-exact `get` of a list holding a symbolic
+  matrix (49G only: the 48 has no symbolic matrices). CI currently runs
+  the e2e job against the 48SX; start a second container from the same
+  image as the 49G (another port) in that job so this regression runs in
+  CI, not only locally.
 - [ ] Transport failures end in a message, never a hang: a Kermit timeout
   after the configured retries (noisy line, wrong speed, calculator not in
   SERVER) prints what was tried and a hint; `Session` fires the retransmit
