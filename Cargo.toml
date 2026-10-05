@@ -20,3 +20,6 @@ expect_used = "warn"
 # unoptimised; the e2e suite drives it in the test profile.
 [profile.dev.package.saturnus]
 opt-level = 3
+
+[profile.dev.package.saturnus-drive]
+opt-level = 3

@@ -38,9 +38,19 @@ e2e-cli addr=e2e_addr container="":
     fi
     HPTX_E2E_ADDR="{{addr}}" HPTX_E2E_CONTAINER="$c" scripts/e2e-cli.sh
 
-# e2e suite against the in-process saturnus emulator (HP 48SX ROM J path)
-e2e-saturnus rom="../saturnus/roms/sxrom-j":
-    HPTX_E2E_ADDR=saturnus://$(cd "$(dirname {{rom}})" && pwd)/$(basename {{rom}}) cargo test -p hptx-core --features saturnus --test e2e -- --nocapture
+# e2e suite against the in-process saturnus emulator, e.g. `just e2e-saturnus 49g`;
+# model 48sx (sxrom-j), 48gx (gxrom-r) or 49g (rom.49g), ROMs from `roms` (saturnus/roms)
+e2e-saturnus model="48sx" roms="../saturnus/roms":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "{{model}}" in
+        48sx) rom=sxrom-j ;;
+        48gx) rom=gxrom-r ;;
+        49g) rom=rom.49g ;;
+        *) echo "e2e-saturnus: model is 48sx, 48gx or 49g, not {{model}}" >&2; exit 2 ;;
+    esac
+    dir=$(cd "{{roms}}" && pwd)
+    HPTX_E2E_ADDR="saturnus://{{model}}@$dir/$rom" cargo test -p hptx-core --features saturnus --test e2e -- --nocapture
 
 # e.g. `just record-trace dir > crates/kermit-proto/traces/48sx-dir.trace`
 # Record a Kermit trace from the running emulator to stdout

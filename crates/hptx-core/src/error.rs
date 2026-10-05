@@ -9,10 +9,10 @@ pub enum Error {
     /// The serial port could not be opened or configured.
     #[error("serial port: {0}")]
     Serial(#[from] serialport::Error),
-    /// The link address is not `tcp://host:port`, `saturnus://ROM` or a
-    /// device path.
+    /// The link address is not `tcp://host:port`, `saturnus://[MODEL@]ROM`
+    /// or a device path.
     #[error(
-        "bad address {0:?}: expected a serial device path, tcp://host:port or saturnus://ROM-PATH"
+        "bad address {0:?}: expected a serial device path, tcp://host:port or saturnus://[MODEL@]ROM-PATH"
     )]
     Address(String),
     /// The in-process emulator could not be started (missing ROM, wrong
