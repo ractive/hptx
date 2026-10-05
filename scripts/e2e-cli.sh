@@ -12,6 +12,11 @@
 # Never runs restore (it ends server mode). Leaves the calculator in HOME and
 # ASCII mode.
 #
+# Data safety: the script refuses to run when any of its own variable names
+# (TEST_NAMES) already exists in HOME, so its cleanup only ever deletes what
+# it created. PICT is saved first when it holds a picture and put back
+# afterwards.
+#
 # The first check is `hptx info`: the model it reports must be the expected
 # one, or the script stops before touching the calculator, so a wrong
 # emulator on the port is not tested by mistake. HPTX_E2E_MODEL=48sx|48gx|49g
@@ -69,6 +74,12 @@ server_down=0
 xm_switched=0
 # Set while PICT holds the e2e drawing.
 pict_drawn=0
+# Set while the user's PICT is saved in HPTXPC.
+pict_saved=0
+# The variables this script creates in HOME (HPTXPT is put --overwrite's
+# temporary). None may exist before the run.
+TEST_NAMES=(HPTXCLI HPTXPT HPTXSM HPTXCD HPTXCE HPTXGR HPTXG2 HPTXCV HPTXCW HPTXCX HPTXXM HPTXR
+    HPTXAAAA HPTXPC)
 
 hptx() { "$HPTX_BIN" "$@"; }
 # Object bytes without the 8-byte HPHP4x-x header.
@@ -131,6 +142,18 @@ xmodem_run() {
     wait "$pid" || fail "hptx $*: $(cat "$work/xm.err")"
 }
 
+# Put the user's PICT back (or blank the e2e drawing when there was none).
+restore_pict() {
+    if ((pict_saved)); then
+        hptx --dir HOME run 'HPTXPC PICT STO' >/dev/null
+        hptx --dir HOME rm HPTXPC >/dev/null
+        pict_saved=0
+    else
+        hptx run ERASE >/dev/null
+    fi
+    pict_drawn=0
+}
+
 cleanup() {
     local status=$?
     # Background processes of the abort scenario, if it stopped midway.
@@ -144,11 +167,12 @@ cleanup() {
         restart_server || true
     fi
     if ((xm_switched)); then hptx run -95 SF >/dev/null 2>&1 || true; fi
-    if ((pict_drawn)); then hptx run ERASE >/dev/null 2>&1 || true; fi
-    # Best effort: remove what this script may have created.
+    if ((pict_saved || pict_drawn)); then restore_pict >/dev/null 2>&1 || true; fi
+    # Best effort: remove what this script created (none of these names
+    # existed when it started, see TEST_NAMES).
     local names
     names=$(hptx --dir HOME ls --jq '.results[].name' 2>/dev/null || true)
-    for n in HPTXCLI HPTXPT HPTXSM HPTXCD HPTXCE HPTXGR HPTXG2 HPTXCV HPTXCW HPTXCX HPTXXM HPTXR HPTXAAAA; do
+    for n in "${TEST_NAMES[@]}"; do
         if grep -qx "$n" <<<"$names"; then
             echo "cleanup: removing $n" >&2
             hptx rm "$n" >/dev/null 2>&1 || true
@@ -180,6 +204,12 @@ fi
 model=$(jq -r '.results.model' <<<"$info")
 [[ $model == "$expected_model" ]] \
     || fail "$addr answers as the $model, expected the $expected_model (HPTX_E2E_MODEL=${HPTX_E2E_MODEL:-unset}); is another emulator on this port? Nothing was changed."
+home=$(hptx --dir HOME ls --jq '.results[].name')
+for n in "${TEST_NAMES[@]}"; do
+    if grep -qx "$n" <<<"$home"; then
+        fail "$n exists in HOME; the script creates and deletes that name. Keep it elsewhere (hptx get $n, then hptx rm $n) and run again. Nothing was changed."
+    fi
+done
 verified=1
 info=$(hptx --dir HOME info --json)
 [[ $(jq -r '.results.path | join("/")' <<<"$info") == HOME ]] || fail "info: path is not HOME: $info"
@@ -285,7 +315,13 @@ hptx rm HPTXCE --json >/dev/null
 ok
 
 step "pict (PICT as PNG, 131x64)"
-# A fresh PICT is 0x0; ERASE makes it 131x64. Draw one pixel, fetch it.
+# A fresh PICT is 0x0; ERASE makes it 131x64. Draw one pixel, fetch it. A
+# PICT that is not empty may hold the user's drawing: saved in HPTXPC and
+# put back afterwards (checked against a PNG taken before).
+if hptx pict -o "$work/pict-before.png" --json >/dev/null 2>&1; then
+    hptx --dir HOME run "PICT RCL 'HPTXPC' STO" --json >/dev/null
+    pict_saved=1
+fi
 pict_drawn=1
 hptx run 'ERASE { # 10d # 10d } PIXON' --json >/dev/null
 pict=$(hptx pict -o "$work/pict.png" --json)
@@ -296,9 +332,13 @@ jq -e '.results.width == 131 and .results.height == 64' <<<"$pict" >/dev/null ||
 [[ $(head -c 24 "$work/pict.png" | tail -c 8 | od -An -tx1 | tr -d ' \n') == 0000008300000040 ]] \
     || fail "PNG is not 131x64"
 if hptx ls --jq '.results[].name' | grep -qx HPTXTMP; then fail "HPTXTMP left over"; fi
-hptx run ERASE --json >/dev/null
-pict_drawn=0
-ok "$(wc -c <"$work/pict.png" | tr -d ' ') bytes"
+saved=$pict_saved
+restore_pict
+if ((saved)); then
+    hptx pict -o "$work/pict-after.png" --json >/dev/null
+    cmp "$work/pict-before.png" "$work/pict-after.png" || fail "PICT not restored"
+fi
+ok "$(wc -c <"$work/pict.png" | tr -d ' ') bytes$( ((saved)) && echo ', PICT restored')"
 
 step "backup (HPHP4 header)"
 hptx backup -o "$work/home.hp" --json >/dev/null
