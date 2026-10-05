@@ -241,6 +241,26 @@ pub enum ObjectType {
     XlibName,
     /// #02614, 49G only.
     Integer,
+    /// #02686 (DOMATRIX), 49G symbolic matrix.
+    SymbolicMatrix,
+    /// #0263A (DOLNGREAL), 49G long real.
+    LongReal49,
+    /// #02660 (DOLNGCMP), 49G long complex.
+    LongComplex49,
+    /// #026AC (DOFLASHP), 49G flash pointer.
+    FlashPointer,
+    /// #026D5 (DOAPLET), 49G.
+    Aplet,
+    /// #026FE (DOMINIFONT), 49G.
+    MiniFont,
+    /// #02BAA (DOEXT1 / DOACPTR), extended (access) pointer.
+    ExtendedPointer,
+    /// #02BCC (DOEXT2).
+    Extended2,
+    /// #02BEE (DOEXT3).
+    Extended3,
+    /// #02C10 (DOEXT4).
+    Extended4,
 }
 
 /// How the walk finds an object's end.
@@ -250,6 +270,9 @@ enum Walk {
     Fixed(usize),
     /// 5-nibble length after the prolog counting itself and the body.
     Length,
+    /// `n` consecutive length-prefixed fields after the prolog, each length
+    /// counting itself and its body (49G long real: 2, long complex: 4).
+    Lengths(usize),
     /// Elements up to and including SEMI.
     Composite,
     /// 2-nibble char count, chars, one element.
@@ -260,8 +283,17 @@ enum Walk {
     Directory,
 }
 
-/// (type, prolog, name, walk rule).
-const TYPES: [(ObjectType, u32, &str, Walk); 25] = [
+/// Prologs live in this ROM range on the 48 and the 49G. An embedded value
+/// in it that is not in [`TYPES`] is an unknown object, not a ROM pointer.
+const PROLOG_RANGE: std::ops::RangeInclusive<u32> = 0x02600..=0x02FFF;
+
+/// (type, prolog, name, walk rule). Prologs and walk rules: wiki:
+/// protocols/hp-object-format (RPLMAN), wiki: sources/conn4x-ymodem-pas
+/// (raw/protocols/xserv-conn4x/conn4xsource/FixObj.pas, prolog list and
+/// per-type sizes, including the 49G types and DOEXT1-4) and the 48 entry
+/// list raw/saturn-hardware/hp48-hw-notes/mlstarterkit/hardware/internals/
+/// byaddress (DOEXT0-4 = #02B88, #02BAA, #02BCC, #02BEE, #02C10).
+const TYPES: [(ObjectType, u32, &str, Walk); 35] = [
     (
         ObjectType::SystemBinary,
         0x02911,
@@ -317,6 +349,47 @@ const TYPES: [(ObjectType, u32, &str, Walk); 25] = [
     (ObjectType::LocalName, 0x02E6D, "Local Name", Walk::Name),
     (ObjectType::XlibName, 0x02E92, "XLIB Name", Walk::Fixed(11)),
     (ObjectType::Integer, 0x02614, "Integer", Walk::Length),
+    (
+        ObjectType::SymbolicMatrix,
+        0x02686,
+        "Symbolic Matrix",
+        Walk::Composite,
+    ),
+    // Mantissa and exponent, each a length-prefixed integer body.
+    (
+        ObjectType::LongReal49,
+        0x0263A,
+        "Long Real (49G)",
+        Walk::Lengths(2),
+    ),
+    // Two long reals without their prologs.
+    (
+        ObjectType::LongComplex49,
+        0x02660,
+        "Long Complex (49G)",
+        Walk::Lengths(4),
+    ),
+    // Prolog, 3-nibble bank, 4-nibble address.
+    (
+        ObjectType::FlashPointer,
+        0x026AC,
+        "Flash Pointer",
+        Walk::Fixed(12),
+    ),
+    // FixObj.pas marks these two as string-like (length-prefixed) without
+    // walking them; not verified against a real object.
+    (ObjectType::Aplet, 0x026D5, "Aplet", Walk::Length),
+    (ObjectType::MiniFont, 0x026FE, "Mini Font", Walk::Length),
+    // Prolog and two 5-nibble fields.
+    (
+        ObjectType::ExtendedPointer,
+        0x02BAA,
+        "Extended Pointer",
+        Walk::Fixed(15),
+    ),
+    (ObjectType::Extended2, 0x02BCC, "Extended 2", Walk::Length),
+    (ObjectType::Extended3, 0x02BEE, "Extended 3", Walk::Length),
+    (ObjectType::Extended4, 0x02C10, "Extended 4", Walk::Length),
 ];
 
 impl ObjectType {
@@ -360,11 +433,17 @@ pub fn object_size(nibbles: &[u8], at: usize) -> Result<usize> {
 }
 
 /// Size of an embedded object (composite element, tagged payload, directory
-/// variable): an object with a known prolog, otherwise a 5-nibble ROM pointer.
+/// variable): an object with a known prolog, otherwise a 5-nibble ROM
+/// pointer. A value in [`PROLOG_RANGE`] with no known prolog is an error:
+/// guessing 5 nibbles would end the walk early and cut real data.
 fn element_size(nibbles: &[u8], at: usize, depth: usize) -> Result<usize> {
-    let p = field(nibbles, at, 5)?;
-    if ObjectType::from_prolog(p as u32).is_some() {
+    let p = field(nibbles, at, 5)? as u32;
+    if ObjectType::from_prolog(p).is_some() {
         walk(nibbles, at, depth)
+    } else if PROLOG_RANGE.contains(&p) {
+        Err(Error::Object(format!(
+            "unknown prolog #{p:05X} at nibble {at}"
+        )))
     } else {
         Ok(5)
     }
@@ -382,15 +461,8 @@ fn walk(nibbles: &[u8], at: usize, depth: usize) -> Result<usize> {
     let body = add(at, 5)?;
     let size = match ty.entry().3 {
         Walk::Fixed(n) => n,
-        Walk::Length => {
-            let len = field(nibbles, body, 5)?;
-            if len < 5 {
-                return Err(Error::Object(format!(
-                    "length field #{len:05X} at nibble {body} is shorter than itself"
-                )));
-            }
-            add(5, len)?
-        }
+        Walk::Length => add(5, lengths_size(nibbles, body, 1)?)?,
+        Walk::Lengths(n) => add(5, lengths_size(nibbles, body, n)?)?,
         Walk::Composite => {
             let mut pos = body;
             loop {
@@ -416,6 +488,22 @@ fn walk(nibbles: &[u8], at: usize, depth: usize) -> Result<usize> {
         )));
     }
     Ok(size)
+}
+
+/// Total size of `count` consecutive length-prefixed fields starting at
+/// nibble `at`; each 5-nibble length counts itself and its body.
+fn lengths_size(nibbles: &[u8], at: usize, count: usize) -> Result<usize> {
+    let mut pos = at;
+    for _ in 0..count {
+        let len = field(nibbles, pos, 5)?;
+        if len < 5 {
+            return Err(Error::Object(format!(
+                "length field #{len:05X} at nibble {pos} is shorter than itself"
+            )));
+        }
+        pos = add(pos, len)?;
+    }
+    Ok(pos - at)
 }
 
 /// Directory layout (verified against the fixtures): prolog, 3-nibble
@@ -487,13 +575,27 @@ pub fn inspect(data: &[u8]) -> Result<ObjectInfo> {
     })
 }
 
+/// Padding allowance for [`strip_padding`] on Kermit transfers: the HP adds
+/// at most the spare half byte of an odd nibble count, so anything beyond a
+/// few bytes means the walk was wrong, not that the file was padded.
+/// wiki: protocols/hp-object-format (Observed on the saturnng emulator)
+pub const KERMIT_PADDING_ALLOWANCE: usize = 4;
+
 /// Cuts trailing bytes after the object: header + ceil(size / 2) bytes when
-/// the walk succeeds and fits in `data`, otherwise `data` unchanged.
-pub fn strip_padding(data: &[u8]) -> &[u8] {
+/// the walk succeeds, fits in `data` and leaves at most `allowance` excess
+/// bytes; otherwise returns `data` unchanged. The allowance bounds the
+/// damage of a wrong walk: a too-short walk cannot silently cut real data.
+/// Use [`KERMIT_PADDING_ALLOWANCE`] for Kermit; XModem pads whole blocks and
+/// needs a larger allowance.
+pub fn strip_padding(data: &[u8], allowance: usize) -> &[u8] {
     let Some(size) = inspect(data).ok().and_then(|i| i.size_nibbles) else {
         return data;
     };
-    data.get(..HEADER_LEN + size.div_ceil(2)).unwrap_or(data)
+    let want = HEADER_LEN + size.div_ceil(2);
+    match data.len().checked_sub(want) {
+        Some(excess) if excess <= allowance => data.get(..want).unwrap_or(data),
+        _ => data,
+    }
 }
 
 #[cfg(test)]
@@ -554,10 +656,13 @@ mod tests {
                     size == full || size + 1 == full,
                     "{model}-{kind}: {size} vs {full}"
                 );
-                assert_eq!(strip_padding(&data), &data[..], "{model}-{kind}");
+                let allow = KERMIT_PADDING_ALLOWANCE;
+                assert_eq!(strip_padding(&data, allow), &data[..], "{model}-{kind}");
                 let mut padded = data.clone();
-                padded.extend_from_slice(b"garbage");
-                assert_eq!(strip_padding(&padded), &data[..], "{model}-{kind}");
+                padded.extend_from_slice(&[0; KERMIT_PADDING_ALLOWANCE]);
+                assert_eq!(strip_padding(&padded, allow), &data[..], "{model}-{kind}");
+                padded.push(0);
+                assert_eq!(strip_padding(&padded, allow), &padded[..], "{model}-{kind}");
             }
         }
     }
@@ -706,6 +811,97 @@ mod tests {
         let huge = cat(&[f(0x02A2C, 5), f(0xFFFFF, 5)]);
         assert!(object_size(&huge, 0).is_err());
         assert!(object_size(&real(), 100).is_err());
+    }
+
+    /// A 49G list holding a symbolic matrix `[[ 1. ]]`. Before #02686 was in
+    /// TYPES the walk took the matrix prolog for a 5-nibble ROM pointer,
+    /// stopped at the matrix's SEMI and came out 5 nibbles short, so
+    /// strip_padding cut the list's real SEMI off.
+    #[test]
+    fn list_with_symbolic_matrix_walks_full_length_regression() {
+        let list = |matrix_prolog: u32| {
+            cat(&[
+                f(0x02A74, 5),
+                f(matrix_prolog, 5),
+                real(),
+                f(SEMI, 5),
+                f(SEMI, 5),
+            ])
+        };
+        let fixed = list(0x02686);
+        assert_eq!(object_size(&fixed, 0).unwrap(), fixed.len());
+        // What the old walk saw: the matrix prolog as an opaque pointer.
+        let as_pointer = list(0x1ABCD);
+        assert_eq!(object_size(&as_pointer, 0).unwrap(), as_pointer.len() - 5);
+
+        let mut file = BinaryHeader {
+            family: Family::Hp49,
+            rom: b'C',
+        }
+        .to_bytes()
+        .to_vec();
+        file.extend(pack(&fixed));
+        assert_eq!(strip_padding(&file, KERMIT_PADDING_ALLOWANCE), &file[..]);
+    }
+
+    #[test]
+    fn unknown_value_in_prolog_range_errors() {
+        for p in [0x02600, 0x02700, 0x02FFF] {
+            let list = cat(&[f(0x02A74, 5), f(p, 5), real(), f(SEMI, 5)]);
+            let err = object_size(&list, 0).unwrap_err().to_string();
+            assert!(err.contains(&format!("unknown prolog #{p:05X}")), "{err}");
+        }
+        // Just outside the range: still a ROM pointer.
+        for p in [0x025FF, 0x03000] {
+            let list = cat(&[f(0x02A74, 5), f(p, 5), f(SEMI, 5)]);
+            assert_eq!(object_size(&list, 0).unwrap(), 15);
+        }
+    }
+
+    #[test]
+    fn strip_padding_keeps_data_when_excess_exceeds_allowance() {
+        let mut file = BinaryHeader {
+            family: Family::Hp48,
+            rom: b'R',
+        }
+        .to_bytes()
+        .to_vec();
+        file.extend(pack(&real()));
+        let object_len = file.len();
+        file.extend([0xAA; 10]);
+        assert_eq!(strip_padding(&file, 4), &file[..]);
+        assert_eq!(strip_padding(&file, 9), &file[..]);
+        assert_eq!(strip_padding(&file, 10), &file[..object_len]);
+        assert_eq!(strip_padding(&file, 64), &file[..object_len]);
+        assert_eq!(strip_padding(b"not a file", 64), b"not a file");
+    }
+
+    #[test]
+    fn hp49_and_extended_types_walk() {
+        let long_real = cat(&[f(0x0263A, 5), f(7, 5), vec![1, 2], f(6, 5), vec![3]]);
+        assert_eq!(object_size(&long_real, 0).unwrap(), long_real.len());
+        let long_cmp = cat(&[
+            f(0x02660, 5),
+            f(6, 5),
+            vec![1],
+            f(5, 5),
+            f(8, 5),
+            vec![1, 2, 3],
+            f(6, 5),
+            vec![4],
+        ]);
+        assert_eq!(object_size(&long_cmp, 0).unwrap(), long_cmp.len());
+        assert!(object_size(&long_cmp[..long_cmp.len() - 1], 0).is_err());
+        let flash = cat(&[f(0x026AC, 5), f(0x123, 3), f(0x4567, 4)]);
+        assert_eq!(object_size(&flash, 0).unwrap(), 12);
+        let acptr = cat(&[f(0x02BAA, 5), f(0x12345, 5), f(0x6789A, 5)]);
+        assert_eq!(object_size(&acptr, 0).unwrap(), 15);
+        for p in [0x026D5, 0x026FE, 0x02BCC, 0x02BEE, 0x02C10] {
+            let obj = cat(&[f(p, 5), f(8, 5), vec![1, 2, 3]]);
+            assert_eq!(object_size(&obj, 0).unwrap(), 13, "#{p:05X}");
+        }
+        let in_list = cat(&[f(0x02A74, 5), flash, acptr, long_real, f(SEMI, 5)]);
+        assert_eq!(object_size(&in_list, 0).unwrap(), in_list.len());
     }
 
     #[test]

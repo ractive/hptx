@@ -189,10 +189,16 @@ impl Session {
                 (Some(t), _) => t.saturating_duration_since(now),
                 (None, None) => IDLE_WAIT,
             };
-            match self.transport.read(&mut buf, wait.max(MIN_WAIT))? {
-                0 => self.client.handle_timeout(Instant::now()),
-                n => self.client.handle_input(Instant::now(), &buf[..n]),
+            let n = self.transport.read(&mut buf, wait.max(MIN_WAIT))?;
+            let now = Instant::now();
+            if n > 0 {
+                self.client.handle_input(now, &buf[..n]);
             }
+            // Also after input: handle_input does not check the deadline, so
+            // a peer that keeps sending garbage (noise, wrong speed) would
+            // otherwise stall the transaction forever. A no-op until the
+            // deadline has passed.
+            self.client.handle_timeout(now);
         }
         match outcome {
             Some(Err(e)) => Err(e),
@@ -372,6 +378,63 @@ mod tests {
             }
             replies
         }
+    }
+
+    /// Reads that never stop delivering noise: no SOH, so no frame ever
+    /// completes. Fails the read after `MAX_READS` so a regression cannot
+    /// hang the test.
+    struct NoisyLine {
+        reads: usize,
+    }
+
+    const MAX_READS: usize = 5_000;
+
+    impl Transport for NoisyLine {
+        fn write_packet(&mut self, _packet: &[u8]) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn read(&mut self, buf: &mut [u8], _timeout: Duration) -> std::io::Result<usize> {
+            self.reads += 1;
+            if self.reads > MAX_READS {
+                return Err(std::io::Error::other("read cap hit: timeout never fired"));
+            }
+            std::thread::sleep(Duration::from_millis(1));
+            let noise = b"zq~";
+            buf[..noise.len()].copy_from_slice(noise);
+            Ok(noise.len())
+        }
+    }
+
+    #[test]
+    fn continuous_garbage_still_times_out() {
+        let options = Options {
+            kermit: Config {
+                timeout: Duration::from_millis(20),
+                retries: 2,
+                ..Config::default()
+            },
+            drain: Duration::ZERO,
+            turnaround: Duration::ZERO,
+        };
+        let mut s = Session {
+            transport: Box::new(NoisyLine { reads: 0 }),
+            client: Client::new(options.kermit.clone()),
+            config: options.kermit,
+            turnaround: options.turnaround,
+            last_end: None,
+        };
+        let start = Instant::now();
+        let err = s.transact(Command::Host(b"6 7 *".to_vec())).unwrap_err();
+        assert!(
+            matches!(err, Error::Kermit(kermit_proto::Error::Timeout)),
+            "{err:?}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            start.elapsed()
+        );
     }
 
     #[test]

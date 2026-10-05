@@ -15,7 +15,7 @@ use kermit_proto::{Command, OutgoingFile};
 
 use crate::charset::{decode, encode, encode_command};
 use crate::grob::Grob;
-use crate::object::{ObjectType, inspect, strip_padding};
+use crate::object::{KERMIT_PADDING_ALLOWANCE, ObjectType, inspect, strip_padding};
 use crate::reply::{Iopar, Listing, StackReply, parse_list, parse_listing, parse_real};
 use crate::reply::{parse_name, parse_stack, parse_string};
 use crate::session::Session;
@@ -305,7 +305,7 @@ impl Calculator {
             ))
         })?;
         Ok(match mode {
-            TransferMode::Binary => strip_padding(&file.data).to_vec(),
+            TransferMode::Binary => strip_padding(&file.data, KERMIT_PADDING_ALLOWANCE).to_vec(),
             TransferMode::Ascii => file.data,
         })
     }
