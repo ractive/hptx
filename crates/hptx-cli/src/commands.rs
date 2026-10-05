@@ -337,7 +337,11 @@ impl Ctx {
         options.kermit.timeout = self.link.timeout;
         options.kermit.retries = self.link.retries;
         let session = Session::new(link, options).with_context(|| format!("cannot open {addr}"))?;
-        Ok(Calculator::new(session))
+        let mut calc = Calculator::new(session);
+        // A late reply from an aborted client lands on this query, not on
+        // the command the user asked for.
+        calc.sync()?;
+        Ok(calc)
     }
 
     /// A file in the temp directory that says a restore on this port still

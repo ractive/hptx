@@ -111,9 +111,42 @@ impl Calculator {
         }
     }
 
-    /// Open `addr` (see [`crate::transport::open`]) with default options.
+    /// Open `addr` (see [`crate::transport::open`]) with default options
+    /// and [`sync`](Calculator::sync).
     pub fn open(addr: &str) -> Result<Self> {
-        Ok(Calculator::new(Session::open(addr)?))
+        let mut calc = Calculator::new(Session::open(addr)?);
+        calc.sync()?;
+        Ok(calc)
+    }
+
+    /// Get in step with the server at the start of a session.
+    ///
+    /// When a client dies while a host command runs, the calculator still
+    /// finishes the command and offers its reply (an S packet repeated
+    /// every 5 s for about a minute). The next client's first command is
+    /// eaten as a bad ACK and the late reply arrives in its place. Sequence
+    /// numbers restart at zero for every command and host commands and
+    /// `G D` both answer with text, so the late reply cannot be told apart
+    /// on the wire, and repeating an arbitrary command would repeat its
+    /// effect. Instead the session starts with a sacrificial, idempotent
+    /// `PATH` query: its first reply is accepted whatever it is, and if it
+    /// is not a path (a list starting with `HOME`) the query runs once
+    /// more. Only a path answer is dropped again, so a late reply leaves
+    /// the user's stack as it was. Never fails on an unexpected reply;
+    /// link errors are returned.
+    pub fn sync(&mut self) -> Result<()> {
+        for _ in 0..2 {
+            let reply = self.host("PATH")?;
+            let is_path = reply.error.is_none()
+                && reply
+                    .level(1)
+                    .and_then(parse_list)
+                    .is_some_and(|path| path.first().is_some_and(|p| p == "HOME"));
+            if is_path {
+                return self.drop_levels(1);
+            }
+        }
+        Ok(())
     }
 
     /// The underlying session. Forgets the cached transfer mode, since the
@@ -787,6 +820,52 @@ mod tests {
         });
         assert_eq!(c.path().unwrap(), ["HOME", "D1"]);
         assert_eq!(sent(&log), ["G D"]);
+    }
+
+    /// The first command after an aborted client is eaten by the server and
+    /// answered with the late reply of the aborted command (here a stack
+    /// display): sync accepts it, asks again and drops only its own path.
+    #[test]
+    fn sync_skips_a_stale_reply() {
+        let mut first = true;
+        let (mut c, log) = calc(move |cmd| match cmd {
+            "PATH" if std::mem::take(&mut first) => {
+                "2:                  1\r\n1:                  2\r\n".into()
+            }
+            "PATH" => "1:          { HOME }\r\n".into(),
+            "DROP" => "2:                  1\r\n1:                  2\r\n".into(),
+            _ => panic!("unexpected {cmd}"),
+        });
+        c.sync().unwrap();
+        assert_eq!(sent(&log), ["PATH", "PATH", "DROP"]);
+    }
+
+    #[test]
+    fn sync_in_step_costs_one_query() {
+        let (mut c, log) = calc(|cmd| match cmd {
+            "PATH" => "1:          { HOME D1 }\r\n".into(),
+            "DROP" => EMPTY.into(),
+            _ => panic!("unexpected {cmd}"),
+        });
+        c.sync().unwrap();
+        assert_eq!(sent(&log), ["PATH", "DROP"]);
+    }
+
+    #[test]
+    fn sync_never_drops_what_it_did_not_push() {
+        // Two replies that are not paths (a late error reply, then an
+        // empty stack): accepted, nothing dropped, no error.
+        let mut n = 0;
+        let (mut c, log) = calc(move |cmd| {
+            n += 1;
+            match (cmd, n) {
+                ("PATH", 1) => "Error: Bad Argument Type\r\n1:                  1\r\n".into(),
+                ("PATH", _) => EMPTY.into(),
+                _ => panic!("unexpected {cmd}"),
+            }
+        });
+        c.sync().unwrap();
+        assert_eq!(sent(&log), ["PATH", "PATH"]);
     }
 
     #[test]
