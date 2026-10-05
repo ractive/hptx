@@ -325,17 +325,33 @@ impl Iopar {
         })
     }
 
-    /// The list as RPL source, e.g. `{ 9600 0 0 0 3 1 }`.
+    /// The list as RPL source with real numbers, `{ 9600. 0. 0. 0. 3. 1. }`.
+    /// The trailing dots matter on the 49G: in exact mode it parses `9600`
+    /// as an exact integer, and a list of integers stored as `IOPAR` makes
+    /// the Kermit server stop with "Invalid IOPAR". The 48 reads `9600.` as
+    /// the real 9600 too.
     pub fn to_rpl(&self) -> String {
-        format!(
-            "{{ {} {} {} {} {} {} }}",
-            self.baud,
-            self.parity,
-            u8::from(self.receive_pacing),
-            u8::from(self.transmit_pacing),
-            self.checksum,
-            self.translate
-        )
+        let [baud, parity, rx, tx, checksum, translate] = self.values();
+        format!("{{ {baud}. {parity}. {rx}. {tx}. {checksum}. {translate}. }}")
+    }
+
+    fn values(&self) -> [i64; 6] {
+        [
+            i64::from(self.baud),
+            i64::from(self.parity),
+            i64::from(self.receive_pacing),
+            i64::from(self.transmit_pacing),
+            i64::from(self.checksum),
+            i64::from(self.translate),
+        ]
+    }
+}
+
+impl std::fmt::Display for Iopar {
+    /// The list as the 48 displays it, `{ 9600 0 0 0 3 1 }`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let [baud, parity, rx, tx, checksum, translate] = self.values();
+        write!(f, "{{ {baud} {parity} {rx} {tx} {checksum} {translate} }}")
     }
 }
 
@@ -507,7 +523,9 @@ mod tests {
             assert_eq!(iopar, Some(Iopar::default()), "{model}");
         }
         let d = Iopar::default();
-        assert_eq!(d.to_rpl(), "{ 9600 0 0 0 3 1 }");
+        assert_eq!(d.to_string(), "{ 9600 0 0 0 3 1 }");
+        // Reals, not 49G exact integers (which the server rejects).
+        assert_eq!(d.to_rpl(), "{ 9600. 0. 0. 0. 3. 1. }");
         let other = Iopar {
             baud: 2400,
             parity: -2,
@@ -517,6 +535,8 @@ mod tests {
             translate: 3,
         };
         assert_eq!(Iopar::parse(&other.to_rpl()), Some(other));
+        assert_eq!(other.to_rpl(), "{ 2400. -2. 1. 0. 1. 3. }");
+        assert_eq!(Iopar::parse(&other.to_string()), Some(other));
         assert_eq!(Iopar::parse("{ 9600 0 0 0 3 }"), None);
         assert_eq!(Iopar::parse("{ 9600 0 0 0 3 1.5 }"), None);
         assert_eq!(Iopar::parse("{ 9600 0 0 0 300 1 }"), None);

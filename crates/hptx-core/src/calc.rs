@@ -784,6 +784,38 @@ mod tests {
     }
 
     #[test]
+    fn set_iopar_stores_reals() {
+        // Recorded on the emulated 49G: `{ 9600 0 0 0 3 3 }` stored as exact
+        // integers, the server answered nothing and stopped with "Invalid
+        // IOPAR". The list must hold reals, in one command.
+        let (mut c, log) = calc(|_| EMPTY.into());
+        let iopar = Iopar {
+            translate: 3,
+            ..Iopar::default()
+        };
+        c.set_iopar(&iopar).unwrap();
+        assert_eq!(
+            sent(&log),
+            ["PATH HOME { 9600. 0. 0. 0. 3. 3. } 'IOPAR' STO EVAL"]
+        );
+        // The widest list still fits one `C` packet, so it is never split.
+        log.lock().unwrap().clear();
+        let wide = Iopar {
+            baud: 115_200,
+            parity: -4,
+            receive_pacing: true,
+            transmit_pacing: true,
+            checksum: 3,
+            translate: 255,
+        };
+        c.set_iopar(&wide).unwrap();
+        assert_eq!(
+            sent(&log),
+            ["PATH HOME { 115200. -4. 1. 1. 3. 255. } 'IOPAR' STO EVAL"]
+        );
+    }
+
+    #[test]
     fn command_too_long() {
         let (mut c, log) = calc(|_| EMPTY.into());
         let err = c.run(&"1".repeat(200)).unwrap_err();

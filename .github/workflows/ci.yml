@@ -38,17 +38,38 @@ jobs:
       # Deliberately not cached or pushed: the image contains HP ROMs.
       - name: Build emulator image
         run: docker build -t hp49g-emu emulator
-      - name: Start HP 48SX
+      - name: Start HP 48SX and HP 49G
         run: |
           docker run -d -p 4848:4848 -e MODEL=48sx --name calc hp49g-emu
-          timeout 90 sh -c 'until docker logs calc 2>&1 | grep -q bridged; do sleep 1; done'
-      - name: End-to-end tests
+          docker run -d -p 4850:4848 -e MODEL=49g --name calc49 hp49g-emu
+          for c in calc calc49; do
+            timeout 90 sh -c "until docker logs $c 2>&1 | grep -q bridged; do sleep 1; done"
+          done
+      - name: hptx-core end-to-end tests, 48SX
         env:
           HPTX_E2E_ADDR: tcp://localhost:4848
         run: cargo test -p hptx-core --test e2e -- --nocapture
-      - name: Screen and logs on failure
+      - name: hptx-core end-to-end tests, 49G
+        env:
+          HPTX_E2E_ADDR: tcp://localhost:4850
+        run: cargo test -p hptx-core --test e2e -- --nocapture
+      - name: CLI end-to-end script, 48SX
+        env:
+          HPTX_E2E_ADDR: tcp://localhost:4848
+          HPTX_E2E_MODEL: 48sx
+        run: scripts/e2e-cli.sh
+      - name: CLI end-to-end script, 49G
+        env:
+          HPTX_E2E_ADDR: tcp://localhost:4850
+          HPTX_E2E_MODEL: 49g
+        run: scripts/e2e-cli.sh
+      - name: Screens and logs on failure
         if: failure()
         run: |
-          docker exec calc calc-screen || true
-          docker exec calc cat /tmp/saturn.log || true
-          docker logs calc
+          for c in calc calc49; do
+            echo "::group::$c"
+            docker exec $c calc-screen || true
+            docker exec $c cat /tmp/saturn.log || true
+            docker logs $c
+            echo "::endgroup::"
+          done

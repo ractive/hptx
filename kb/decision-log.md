@@ -96,6 +96,56 @@ Decisions already made. Do not re-litigate; add a dated entry to change one.
   the three emulated models in `crates/hptx-core/fixtures/`; the object
   walk is checked against the size of every recorded file.
 
+## 2026-10-05 (iteration 4)
+
+- **Port auto-pick by name, no libudev.** `serialport` stays without default
+  features. A port is a candidate if serialport reports it as USB or its
+  name matches macOS `cu.usbserial*`/`cu.usbmodem*`/`cu.wchusbserial*`/
+  `cu.SLAB_USBtoUART*`/`cu.PL2303*`, Linux `ttyUSB*`/`ttyACM*`, or the only
+  `COM*` on Windows. Order: `--port`, `HPTX_PORT`, exactly one candidate;
+  otherwise the error lists the candidates with a ready `--port` command.
+- **CLI output follows hyalo.** Envelope `{dir?, results, total?, hints}`
+  with `hints: [{description, cmd}]`; text on a TTY, JSON when piped,
+  `--format`/`--json` override, `--jq` (jaq) filters the envelope. Errors go
+  to stderr, as `{error, hint}` in JSON mode (`stack` added for a failed
+  host command); exit 1, or 2 for usage errors.
+- **Directory navigation is stateless.** `--dir PATH` and `ls PATH` take a
+  path from HOME (`HOME/A/B`, `A/B`, `{ HOME A B }`) and call core `cd`; the
+  calculator stays there afterwards and the help says so.
+- **Model detection.** The 49G's `VERSION` says `HP48-C ... Copyright HP
+  2009`, so `HP49` or a copyright year of 1999 or later means 49G; `HP48`
+  otherwise means 48G/GX; no `VERSION` means 48S/SX.
+- **Never silently overwrite.** `put` refuses an existing name (`--overwrite`
+  deletes the old variable first, never a directory; `--dry-run` shows the
+  plan); `get`, `screenshot`, `backup` refuse to overwrite a local file
+  without `--force`; `-o -` writes to stdout.
+- **Restore cleanup.** `restore` prompts on a TTY (or needs `--yes`), checks
+  offline that the file is a Directory backup, then writes a marker file in
+  the temp directory keyed by port; the next hptx command on that port, or
+  `restore --cleanup`, purges `:0:HPTXRS`. Because `PURGE` of a missing port
+  object raises no error, the CLI checks `:0:HPTXRS VTYPE` (-1 = absent)
+  first.
+- **`run` arguments.** clap `allow_negative_numbers` (not
+  `allow_hyphen_values`, which swallowed a trailing `--format` into the RPL);
+  other words starting with `-` go after `--`. An `Error:` reply exits 1
+  with the stack in the error object.
+- **`--timeout` (20 s) and `--retries` (5)** are exposed; a timeout names
+  the port, tries and seconds and hints at "Awaiting Server Cmd.".
+- **`object convert` is a round trip through the calculator, not byte
+  equality with `get --ascii`.** Supported both ways: Real, Complex, String,
+  Binary Integer, 49G Integer, Graphic, and lists of these. Refused with the
+  type named: programs, algebraics, names, directories, units, symbolic
+  matrices, lists holding ROM pointers (the 48 stores `{ 1 2 }` as two ROM
+  pointers), and strings holding CR. `--model 48|49` picks the header and
+  whether `5` is a Real or an exact Integer.
+- **`settings` skips the store when nothing changed**: storing IOPAR on the
+  48SX grew the variable from 29.5 to 37.5 bytes with identical values.
+- **Numbers in generated RPL are reals with a trailing dot.** The 49G runs
+  in exact mode, so `{ 9600 0 0 0 3 3 } 'IOPAR' STO` stores exact integers;
+  the server then stops with "Invalid IOPAR" and answers nothing. `Iopar::to_rpl`
+  writes `{ 9600. 0. 0. 0. 3. 1. }` (the 48 reads that as reals too); the
+  plain form stays for display.
+
 ## 2026-10-05 (iteration 8)
 
 - **saturnus in-process, behind a feature.** `hptx-core` has an optional
