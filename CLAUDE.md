@@ -12,19 +12,27 @@ report. The main session reviews. Agents never edit `CLAUDE.md`.
 
 Rules for every session and agent working in this repo:
 - When a step needs no input from the user, keep going; put status notes in
-  the same message as the next action. Stop and ask only when you cannot
-  continue without the user, or before anything destructive: deleting data,
-  force-pushing, or changing anything outside this repository.
+  the same message as the next action. Stop only when you cannot continue
+  without the user, or before anything destructive: deleting data,
+  force-pushing, rewriting history, or modifying another repository or the
+  user's configuration (building, Docker, cargo caches and the scratchpad are
+  routine). An agent has no channel to the user: it puts the question in its
+  final report; only the main session asks.
 - Do not write "think hard" or "think step by step", and do not ask for
   reasoning in replies; reasoning depth is set by the effort setting. Explain
   a design choice in three sentences at most.
-- The task list lives in the iteration file: tick each task when its work has
-  landed (`hyalo task toggle`), never speculatively, and add anything new you
-  find.
+- The task list lives in the iteration file: tick a task once its code and
+  tests are committed on the branch and the gates pass, never speculatively
+  (`hyalo task set FILE --line N --status x`, one task at a time; `toggle`
+  flips, it does not set), and add anything new you find.
 - Mark anything you could not confirm, and say where you looked.
-- End every run with three headings: Blocked on me, Changed, Found.
-- Reviews list only problems that would block the merge, each with file and
-  line, why it is wrong, and how to show it fails.
+- An implementation run ends with three headings: "Needs the user" (what
+  only the user can unblock), "Changed", "Found". A review run returns only
+  its findings in the format the caller asked for.
+- A PR review lists only problems that would block the merge, each with file
+  and line, why it is wrong, and how to show it fails. A whole-crate audit
+  (review-only PR, `kb/docs/test-policy.md`) records every verified finding;
+  its PR is never merged, the findings become the next iteration.
 
 # Documentation
 All project knowledge lives in `./kb/` as markdown with YAML frontmatter.
@@ -47,7 +55,10 @@ also hyalo-driven.
 - Edition 2024, stable. Windows, Linux, macOS.
 - Before committing or a PR, in order: `cargo fmt`,
   `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace -q`,
-  `cargo deny --locked check`.
+  `cargo deny --locked check` (`deny.toml` checks the all-features graph).
+  This is the local minimum; CI (`.github/workflows/ci.yml`) is authoritative
+  and adds `--locked`, `--all-features` clippy, the `saturnus` feature tests,
+  the wasm32 check of the proto crates and the emulator e2e suites.
 - No `.unwrap()`/`.expect()` outside tests; `anyhow::Context` with `?`.
 - Test policy in `kb/docs/test-policy.md`: fast unit tests, one e2e binary per
   crate, emulator tests gated by `HPTX_E2E_ADDR`.
