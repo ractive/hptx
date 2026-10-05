@@ -17,6 +17,12 @@
 # sets the expectation; without it the port decides (4848: 48sx, 4850 and
 # 4852: 49g, the CI and local conventions); other ports need HPTX_E2E_MODEL.
 #
+# XModem (put/get --protocol xmodem): on a 48G/GX or 49G, with
+# HPTX_E2E_CONTAINER naming the emulator's Docker container, the script types
+# XRECV/XSEND and SERVER on the calculator with `docker exec CONTAINER
+# calc-keys`; without it these steps print "skipped". On the 48S/SX the
+# script checks that XModem is refused.
+#
 # HPTX_BIN overrides the binary (default: build target/debug/hptx).
 set -euo pipefail
 
@@ -27,6 +33,7 @@ if [[ -z ${HPTX_BIN:-} ]]; then
     HPTX_BIN=$root/target/debug/hptx
 fi
 command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }
+container=${HPTX_E2E_CONTAINER:-}
 
 expected=${HPTX_E2E_MODEL:-}
 if [[ -z $expected ]]; then
@@ -55,6 +62,10 @@ passed=0
 # Set once `info` confirmed the expected model; cleanup leaves any other
 # calculator alone.
 verified=0
+# Set while an XModem step may have left the calculator out of server mode.
+server_down=0
+# Set when the script switched a 49G to RPN for XModem.
+xm_switched=0
 
 hptx() { "$HPTX_BIN" "$@"; }
 # Object bytes without the 8-byte HPHP4x-x header.
@@ -72,6 +83,50 @@ walks_whole_file() {
 step() { printf '%-44s' "$1"; }
 ok() { passed=$((passed + 1)); echo "ok${1:+  $1}"; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
+skip() { echo "skipped: $*"; }
+
+# Press keys on the emulated calculator (`;` is ALPHA, `\` is ON).
+keys() { docker exec "$container" calc-keys "$@" >/dev/null; }
+# Type a lowercase word in alpha-lock, then ENTER. ON first: it clears a
+# command line and an alpha mode left over (the 49G can come out of the
+# Kermit server with alpha still on, and ;; would then switch it off).
+type_word() {
+    local -a letters
+    local i
+    for ((i = 0; i < ${#1}; i++)); do letters+=("${1:i:1}"); done
+    keys "\\"
+    sleep 0.5
+    keys ';' ';' "${letters[@]}" Enter
+}
+# Cancel whatever runs (ON) and start the Kermit server again.
+restart_server() {
+    sleep 2
+    keys "\\"
+    sleep 1
+    type_word server
+    sleep 2
+    server_down=0
+}
+# Run `hptx ARGS --format text` in the background; once it prints the
+# instructions (server ended), type WORD on the calculator. Fails unless
+# hptx succeeds. The calculator is out of server mode afterwards.
+xmodem_run() {
+    local word=$1
+    shift
+    server_down=1
+    hptx "$@" --format text >"$work/xm.out" 2>"$work/xm.err" &
+    local pid=$! i
+    for ((i = 0; i < 300; i++)); do
+        grep -q "On the calculator, type" "$work/xm.err" && break
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.1
+    done
+    grep -q "On the calculator, type" "$work/xm.err" \
+        || { wait "$pid" || true; fail "no instructions from hptx: $(cat "$work/xm.err")"; }
+    sleep 1
+    type_word "$word"
+    wait "$pid" || fail "hptx $*: $(cat "$work/xm.err")"
+}
 
 cleanup() {
     local status=$?
@@ -79,10 +134,15 @@ cleanup() {
         rm -rf "$work"
         exit "$status"
     fi
+    if ((server_down)) && [[ -n $container ]]; then
+        echo "cleanup: restarting SERVER on the calculator" >&2
+        restart_server || true
+    fi
+    if ((xm_switched)); then hptx run -95 SF >/dev/null 2>&1 || true; fi
     # Best effort: remove what this script may have created.
     local names
     names=$(hptx --dir HOME ls --jq '.results[].name' 2>/dev/null || true)
-    for n in HPTXCLI HPTXPT HPTXSM HPTXCD HPTXCE HPTXGR HPTXG2 HPTXCV HPTXCW HPTXCX; do
+    for n in HPTXCLI HPTXPT HPTXSM HPTXCD HPTXCE HPTXGR HPTXG2 HPTXCV HPTXCW HPTXCX HPTXXM; do
         if grep -qx "$n" <<<"$names"; then
             echo "cleanup: removing $n" >&2
             hptx rm "$n" >/dev/null 2>&1 || true
@@ -235,6 +295,72 @@ if [[ $model == "HP 49G" ]]; then
     jq -e '.error | test("Symbolic Matrix")' <<<"$out" >/dev/null || fail "$out"
     hptx rm HPTXSM --json >/dev/null
     ok "$size bytes, inspect: walked size = file size"
+fi
+
+if [[ $model == "HP 48S/SX" ]]; then
+    step "xmodem: refused on the 48S/SX"
+    if out=$(hptx put "$work/all.hp" --as HPTXXM --protocol xmodem --json 2>&1); then
+        fail "put --protocol xmodem succeeded on the 48S/SX: $out"
+    fi
+    jq -e '(.error | test("no XModem")) and (.hint | test("Kermit"))' <<<"$out" >/dev/null \
+        || fail "$out"
+    hptx ls --json >/dev/null || fail "server not running after the refusal"
+    ok
+elif [[ -z $container ]]; then
+    step "xmodem put/get"
+    skip "set HPTX_E2E_CONTAINER to the emulator's container to type on the calculator"
+else
+    step "xmodem: put --dry-run keeps the server"
+    dry=$(hptx put "$work/all.hp" --as HPTXXM --protocol xmodem --dry-run --json)
+    jq -e --arg keys "'HPTXXM' XRECV" \
+        '.results.dry_run and .results.keys == $keys and .results.bytes == 269' \
+        <<<"$dry" >/dev/null || fail "$dry"
+    hptx ls --json >/dev/null || fail "server not running after --dry-run"
+    if hptx ls --jq '.results[].name' | grep -qx HPTXXM; then fail "dry run stored HPTXXM"; fi
+    ok "$(jq -r '.results.model' <<<"$dry")"
+
+    if [[ $model == "HP 49G" ]]; then
+        # Typed commands need RPN mode.
+        if [[ $(hptx run -95 'FS?' --jq '.results.stack[0]') == 1* ]]; then
+            hptx run -95 CF --json >/dev/null
+            xm_switched=1
+        fi
+        hptx run DROP --json >/dev/null
+    fi
+
+    step "xmodem: put (XRECV), Kermit get byte-exact"
+    # As tests/e2e.rs: the name goes on the stack over Kermit, XRECV is typed.
+    hptx run "'HPTXXM'" --json >/dev/null
+    xmodem_run xrecv put "$work/all.hp" --as HPTXXM --protocol xmodem --start-timeout 60
+    grep -q "Type SERVER" "$work/xm.out" || fail "no SERVER note: $(cat "$work/xm.out")"
+    restart_server
+    hptx get HPTXXM -o "$work/xm-kermit.hp" --json >/dev/null
+    cmp "$work/all.hp" "$work/xm-kermit.hp" || fail "XRECV stored something else"
+    ok "$(head -1 "$work/xm.out" | sed 's/.*(//; s/)//')"
+
+    step "xmodem: get (XSEND) byte-exact"
+    hptx run "'HPTXXM'" --json >/dev/null
+    xmodem_run xsend get HPTXXM -o "$work/xm-back.hp" --protocol xmodem --start-timeout 60
+    restart_server
+    cmp "$work/all.hp" "$work/xm-back.hp" || fail "XSEND gave something else"
+    ok "$(head -1 "$work/xm.out" | sed 's/.*(//; s/)//')"
+
+    step "xmodem: put refuses an existing name"
+    if out=$(hptx put "$work/all.hp" --as HPTXXM --protocol xmodem --json 2>&1); then
+        fail "put --protocol xmodem over an existing name succeeded: $out"
+    fi
+    jq -e '.hint | test("hptx rm HPTXXM")' <<<"$out" >/dev/null || fail "$out"
+    hptx rm HPTXXM --json >/dev/null
+    if [[ $model == "HP 49G" ]]; then
+        # SERVER typed in RPN mode on the 49G leaves a tagged `SERVER` and
+        # NOVAL on the stack (not in algebraic mode, not on the 48GX).
+        hptx run CLEAR --json >/dev/null
+    fi
+    if ((xm_switched)); then
+        hptx run -95 SF --json >/dev/null
+        xm_switched=0
+    fi
+    ok
 fi
 
 step "grob to-png of a stored LCD\\-> GROB"

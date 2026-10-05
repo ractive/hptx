@@ -311,13 +311,19 @@ mod tests {
         let got = decode_block(&b, Check::Crc16).unwrap();
         assert_eq!(got.num, 3);
         assert!(got.data.starts_with(b"hello"));
-        assert_eq!(decode_block(&b, Check::Checksum), Err(BlockError::BadLength));
+        assert_eq!(
+            decode_block(&b, Check::Checksum),
+            Err(BlockError::BadLength)
+        );
         let mut bad = b.clone();
         bad[10] ^= 1;
         assert_eq!(decode_block(&bad, Check::Crc16), Err(BlockError::BadCheck));
         let mut bad = b.clone();
         bad[2] = 0;
         assert_eq!(decode_block(&bad, Check::Crc16), Err(BlockError::BadNumber));
-        assert_eq!(decode_block(&[EOT], Check::Crc16), Err(BlockError::BadHeader));
+        assert_eq!(
+            decode_block(&[EOT], Check::Crc16),
+            Err(BlockError::BadHeader)
+        );
     }
 }

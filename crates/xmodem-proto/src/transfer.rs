@@ -6,18 +6,24 @@ use std::fmt;
 use std::time::{Duration, Instant};
 
 use crate::codec::{
-    ACK, BlockSize, CAN, CR_KERMIT, Check, EOT, NAK, SOH, STX, SUB, decode_block,
-    encode_block, frame_len,
+    ACK, BlockSize, CAN, CR_KERMIT, Check, EOT, NAK, SOH, STX, SUB, decode_block, encode_block,
+    frame_len,
 };
 
 /// Tunables of a [`Transfer`].
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// Receiver: the check asked for first. [`Check::Crc16`] (default) sends
-    /// `C`, [`Check::HpCrc`] sends `D`; both fall back to NAK (checksum)
+    /// Receiver: the check asked for first. [`Check::HpCrc`] (default) sends
+    /// `D`, [`Check::Crc16`] sends `C`; both fall back to NAK (checksum)
     /// after [`Config::crc_attempts`] unanswered start characters.
     /// [`Check::Checksum`] sends NAK from the start. The sender ignores this
     /// and uses whatever the receiver asks for (NAK, `C` or `D`).
+    ///
+    /// `D` is the default because no HP calculator answers `C`: the 49G's
+    /// XSEND answers `D` with HP-CRC blocks (1k blocks when the object is big
+    /// enough) and ignores `C`; the 48GX's XSEND ignores both and answers the
+    /// NAK. Verified on the emulated 49G and 48GX (traces `49g-xsend*`,
+    /// `48gx-xsend*`).
     pub check: Check,
     /// Receiver: `C`s (or `D`s) sent before falling back to checksum
     /// (default 3).
@@ -25,8 +31,16 @@ pub struct Config {
     /// Receiver: wait after each `C` or `D` before the next start character
     /// (default 3 s).
     pub crc_interval: Duration,
-    /// Sender: block size for full blocks (default 128).
+    /// Sender: block size for full blocks (default 128). 1k blocks go out
+    /// only when the receiver asked for a CRC (`C` or `D`), unless
+    /// [`Config::checksum_1k`] is set: a receiver that opens with NAK gets
+    /// 128-byte blocks.
     pub block_size: BlockSize,
+    /// Sender: also send 1k blocks when the receiver asked for checksum mode
+    /// (default false). The 48GX, which knows only checksum mode, NAKs every
+    /// 1k block and cancels after nine (trace `48gx-xrecv-1k`); XModem-1K
+    /// is classically used with CRC only.
+    pub checksum_1k: bool,
     /// Sender with 1k blocks: send the tail of the file in 128-byte blocks once
     /// no more than 896 bytes (7 x 128) remain, so no block carries 128 or
     /// more bytes of padding (default true). The 49G does not convert a
@@ -37,7 +51,8 @@ pub struct Config {
     pub pad: u8,
     /// Sender: how long to wait for the receiver's first start character
     /// (default 60 s). Receiver: the overall wait for the first block is
-    /// bounded by the start-character retries instead.
+    /// bounded by the start-character retries instead, or by
+    /// [`Config::recv_start_timeout`].
     pub start_timeout: Duration,
     /// Wait for an ACK/NAK (sender) or for the next block (receiver)
     /// (default 10 s).
@@ -50,15 +65,22 @@ pub struct Config {
     /// Retries per block (or per EOT, or NAKs while starting) before giving
     /// up (default 10).
     pub retries: u32,
+    /// Receiver: keep sending start characters until this much time has
+    /// passed since [`Transfer::start`], instead of stopping after
+    /// `crc_attempts + retries` of them (default `None`: count only). For
+    /// a transfer a human starts on the calculator keyboard. The switch
+    /// from `C`/`D` to NAK still happens after [`Config::crc_attempts`].
+    pub recv_start_timeout: Option<Duration>,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Config {
-            check: Check::Crc16,
+            check: Check::HpCrc,
             crc_attempts: 3,
             crc_interval: Duration::from_secs(3),
             block_size: BlockSize::B128,
+            checksum_1k: false,
             short_tail: true,
             pad: SUB,
             start_timeout: Duration::from_secs(60),
@@ -66,6 +88,7 @@ impl Default for Config {
             byte_timeout: Duration::from_secs(1),
             purge: Duration::from_secs(1),
             retries: 10,
+            recv_start_timeout: None,
         }
     }
 }
@@ -106,7 +129,9 @@ pub enum Event {
         last_block: usize,
         /// Trailing bytes of the last block equal to its final byte, when that
         /// byte is 0x1A or 0x00: the likely padding. A hint only; real data
-        /// may end in such bytes.
+        /// may end in such bytes, and the 49G's XSEND pads with whatever
+        /// follows the object in memory (hint 0), while the 48GX pads with
+        /// zeros. Only the object-length walk finds the real end.
         padding: usize,
     },
     /// Terminal failure; the machine is idle.
@@ -172,9 +197,13 @@ enum Phase {
     Idle,
     /// Sender: waiting for NAK, `C` or `D`. `skip`: bytes left to skip of a
     /// Kermit packet (SOH .. CR) the calculator may still send.
-    SendStart { skip: u8 },
+    SendStart {
+        skip: u8,
+    },
     /// Sender: block at `pos` of `len` data bytes is out, awaiting ACK.
-    SendBlock { len: usize },
+    SendBlock {
+        len: usize,
+    },
     /// Sender: EOT is out, awaiting ACK.
     SendEot,
     /// Receiver: start characters going out, no block yet.
@@ -215,6 +244,9 @@ pub struct Transfer {
     purging: bool,
     /// Receive: size of the last accepted block.
     last_block: usize,
+    /// Receive: when [`Transfer::start`] ran (for
+    /// [`Config::recv_start_timeout`]).
+    started_at: Option<Instant>,
 }
 
 const CANCEL: [u8; 3] = [CAN, CAN, CAN];
@@ -244,6 +276,7 @@ impl Transfer {
             last_byte: None,
             purging: false,
             last_block: 0,
+            started_at: None,
         }
     }
 
@@ -266,6 +299,7 @@ impl Transfer {
         self.purging = false;
         self.last_block = 0;
         self.last_sent.clear();
+        self.started_at = Some(now);
         match command {
             Command::Send(data) => {
                 self.data = data;
@@ -277,7 +311,7 @@ impl Transfer {
                 self.check = self.config.check;
                 self.phase = Phase::RecvStart;
                 self.deadline = None;
-                self.send_start_char();
+                self.send_start_char(now);
             }
         }
         Ok(())
@@ -314,7 +348,7 @@ impl Transfer {
             Phase::RecvStart => {
                 self.buf.clear();
                 self.purging = false;
-                self.send_start_char();
+                self.send_start_char(now);
             }
             Phase::RecvBlocks => {
                 if self.purging || !self.buf.is_empty() {
@@ -449,6 +483,9 @@ impl Transfer {
     fn block_len(&self) -> (BlockSize, usize) {
         let left = self.data.len().saturating_sub(self.pos);
         let size = match self.config.block_size {
+            BlockSize::B1k if self.check == Check::Checksum && !self.config.checksum_1k => {
+                BlockSize::B128
+            }
             BlockSize::B1k if self.config.short_tail && left <= 7 * 128 => BlockSize::B128,
             s => s,
         };
@@ -535,13 +572,20 @@ impl Transfer {
 
     // ---- receiver ----
 
-    fn send_start_char(&mut self) {
+    fn send_start_char(&mut self, now: Instant) {
         let crc = self.config.check != Check::Checksum && self.starts < self.config.crc_attempts;
         let limit = match self.config.check {
             Check::Checksum => self.config.retries,
-            Check::Crc16 | Check::HpCrc => self.config.crc_attempts + self.config.retries,
+            Check::Crc16 | Check::HpCrc => {
+                self.config.crc_attempts.saturating_add(self.config.retries)
+            }
         };
-        if self.starts >= limit {
+        let exhausted = match (self.config.recv_start_timeout, self.started_at) {
+            // Overflow (absurd timeout) means no limit.
+            (Some(window), Some(at)) => at.checked_add(window).is_some_and(|end| now >= end),
+            _ => self.starts >= limit,
+        };
+        if exhausted {
             self.fail(Error::Timeout, true);
             return;
         }
@@ -678,46 +722,6 @@ impl Transfer {
 }
 
 #[cfg(test)]
-pub(crate) mod test_support {
-    use super::*;
-    use kermit_proto::trace::{self, Direction};
-
-    /// Replay `trace` at a fixed `now`: Out lines must match `poll_output`, In
-    /// lines are fed to `handle_input`. Returns all events.
-    #[allow(clippy::unwrap_used)]
-    pub(crate) fn replay(cmd: Command, config: Config, text: &str) -> Vec<Event> {
-        let now = Instant::now();
-        let mut t = Transfer::new(config);
-        t.start(now, cmd).unwrap();
-        let mut events = Vec::new();
-        for (i, (dir, bytes)) in trace::parse(text).unwrap().into_iter().enumerate() {
-            match dir {
-                Direction::Out => {
-                    let got = t.poll_output(now);
-                    assert_eq!(
-                        got.as_deref().map(trace::escape),
-                        Some(trace::escape(&bytes)),
-                        "trace entry {i}: expected output > {}",
-                        trace::escape(&bytes)
-                    );
-                }
-                Direction::In => t.handle_input(now, &bytes),
-            }
-            while let Some(e) = t.poll_event() {
-                events.push(e);
-            }
-        }
-        let extra = t.poll_output(now);
-        assert_eq!(
-            extra.as_deref().map(trace::escape),
-            None,
-            "unexpected trailing output"
-        );
-        events
-    }
-}
-
-#[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
@@ -746,6 +750,20 @@ mod tests {
         (t, now)
     }
 
+    /// Receiver asking with `C` (CRC-16), the standard XModem start.
+    fn crc() -> Config {
+        Config {
+            check: Check::Crc16,
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn default_receiver_asks_with_d() {
+        let (mut t, now) = receiver(Config::default());
+        assert_eq!(drain(&mut t, now), vec![b"D".to_vec()]);
+    }
+
     fn receiver(config: Config) -> (Transfer, Instant) {
         let now = t0();
         let mut t = Transfer::new(config);
@@ -760,7 +778,10 @@ mod tests {
         let (mut t, now) = sender(b"hello", Config::default());
         assert_eq!(t.poll_output(now), None, "sender waits for the receiver");
         t.handle_input(now, &[NAK]);
-        assert_eq!(drain(&mut t, now), vec![block(1, b"hello", Check::Checksum)]);
+        assert_eq!(
+            drain(&mut t, now),
+            vec![block(1, b"hello", Check::Checksum)]
+        );
         t.handle_input(now, &[ACK]);
         assert_eq!(drain(&mut t, now), vec![vec![EOT]]);
         t.handle_input(now, &[ACK]);
@@ -788,7 +809,10 @@ mod tests {
         assert_eq!(out, vec![block(1, &[0x55; 128], Check::Crc16)]);
         assert_eq!(out[0].len(), 133);
         t.handle_input(now, &[ACK]);
-        assert_eq!(drain(&mut t, now), vec![block(2, &[0x55; 72], Check::Crc16)]);
+        assert_eq!(
+            drain(&mut t, now),
+            vec![block(2, &[0x55; 72], Check::Crc16)]
+        );
         // `C` after the first ACK is ignored.
         t.handle_input(now, b"C");
         assert_eq!(drain(&mut t, now), Vec::<Vec<u8>>::new());
@@ -811,7 +835,13 @@ mod tests {
         let out = drain(&mut t, now);
         assert_eq!(
             out,
-            vec![encode_block(1, BlockSize::B1k, &data[..1024], SUB, Check::HpCrc)]
+            vec![encode_block(
+                1,
+                BlockSize::B1k,
+                &data[..1024],
+                SUB,
+                Check::HpCrc
+            )]
         );
         let crc = crate::codec::hp_crc(&data[..1024]);
         assert_eq!(&out[0][1027..], &crc.to_be_bytes());
@@ -1012,11 +1042,36 @@ mod tests {
             ..Config::default()
         };
         let (mut t, now) = sender(&[1; 300], cfg);
+        t.handle_input(now, b"D");
+        let out = drain(&mut t, now);
+        assert_eq!(out[0].len(), 3 + 1024 + 2);
+        assert_eq!(out[0][0], STX);
+        assert_eq!(out[0][303], SUB);
+    }
+
+    #[test]
+    fn send_1k_needs_a_crc_receiver() {
+        // A receiver that opens with NAK (the 48GX) gets 128-byte blocks even
+        // with 1k configured; `checksum_1k` forces 1k anyway.
+        let cfg = Config {
+            block_size: BlockSize::B1k,
+            short_tail: false,
+            ..Config::default()
+        };
+        let (mut t, now) = sender(&[1; 300], cfg.clone());
+        t.handle_input(now, &[NAK]);
+        let out = drain(&mut t, now);
+        assert_eq!(out, vec![block(1, &[1; 128], Check::Checksum)]);
+
+        let forced = Config {
+            checksum_1k: true,
+            ..cfg
+        };
+        let (mut t, now) = sender(&[1; 300], forced);
         t.handle_input(now, &[NAK]);
         let out = drain(&mut t, now);
         assert_eq!(out[0].len(), 3 + 1024 + 1);
         assert_eq!(out[0][0], STX);
-        assert_eq!(out[0][303], SUB);
     }
 
     #[test]
@@ -1045,7 +1100,7 @@ mod tests {
 
     #[test]
     fn receive_crc() {
-        let (mut t, now) = receiver(Config::default());
+        let (mut t, now) = receiver(crc());
         assert_eq!(drain(&mut t, now), vec![b"C".to_vec()]);
         t.handle_input(now, &block(1, b"hi", Check::Crc16));
         assert_eq!(drain(&mut t, now), vec![vec![ACK]]);
@@ -1074,7 +1129,7 @@ mod tests {
 
     #[test]
     fn receive_falls_back_to_checksum() {
-        let (mut t, now) = receiver(Config::default());
+        let (mut t, now) = receiver(crc());
         let mut at = now;
         let mut starts = Vec::new();
         for _ in 0..4 {
@@ -1114,7 +1169,7 @@ mod tests {
         let cfg = Config {
             retries: 1,
             crc_attempts: 1,
-            ..Config::default()
+            ..crc()
         };
         let (mut t, mut at) = receiver(cfg);
         let mut out = Vec::new();
@@ -1129,8 +1184,37 @@ mod tests {
     }
 
     #[test]
+    fn receive_start_window_outlasts_the_count() {
+        // With `recv_start_timeout` the receiver keeps asking until the window
+        // closes, however many start characters that takes.
+        let cfg = Config {
+            retries: 1,
+            crc_attempts: 2,
+            crc_interval: Duration::from_secs(1),
+            timeout: Duration::from_secs(1),
+            recv_start_timeout: Some(Duration::from_secs(5)),
+            ..Config::default()
+        };
+        let (mut t, start) = receiver(cfg);
+        let mut at = start;
+        let mut out = Vec::new();
+        while !t.is_idle() {
+            out.extend(drain(&mut t, at));
+            at = t.next_timeout().unwrap();
+            t.handle_timeout(at);
+        }
+        out.extend(drain(&mut t, at));
+        assert_eq!(at.duration_since(start), Duration::from_secs(5));
+        let mut want = vec![b"D".to_vec(), b"D".to_vec()];
+        want.extend(vec![vec![NAK]; 3]);
+        want.push(CANCEL.to_vec());
+        assert_eq!(out, want);
+        assert_eq!(events(&mut t), vec![Event::Error(Error::Timeout)]);
+    }
+
+    #[test]
     fn receive_skips_kermit_packet_before_first_block() {
-        let (mut t, now) = receiver(Config::default());
+        let (mut t, now) = receiver(crc());
         drain(&mut t, now);
         t.handle_input(now, b"\x01# N3\r");
         t.handle_input(now, &block(1, b"ok", Check::Crc16));
@@ -1139,7 +1223,7 @@ mod tests {
 
     #[test]
     fn receive_duplicate_block_acked_and_dropped() {
-        let (mut t, now) = receiver(Config::default());
+        let (mut t, now) = receiver(crc());
         drain(&mut t, now);
         t.handle_input(now, &block(1, b"one", Check::Crc16));
         t.handle_input(now, &block(1, b"one", Check::Crc16));
@@ -1160,7 +1244,7 @@ mod tests {
 
     #[test]
     fn receive_out_of_sequence_cancels() {
-        let (mut t, now) = receiver(Config::default());
+        let (mut t, now) = receiver(crc());
         drain(&mut t, now);
         t.handle_input(now, &block(1, b"one", Check::Crc16));
         assert_eq!(drain(&mut t, now), vec![vec![ACK]]);
@@ -1174,7 +1258,7 @@ mod tests {
 
     #[test]
     fn receive_bad_check_purges_then_naks() {
-        let (mut t, now) = receiver(Config::default());
+        let (mut t, now) = receiver(crc());
         drain(&mut t, now);
         t.handle_input(now, &block(1, b"one", Check::Crc16));
         drain(&mut t, now);
@@ -1195,7 +1279,7 @@ mod tests {
 
     #[test]
     fn receive_split_block_and_byte_timeout() {
-        let (mut t, now) = receiver(Config::default());
+        let (mut t, now) = receiver(crc());
         drain(&mut t, now);
         let b = block(1, b"split", Check::Crc16);
         t.handle_input(now, &b[..50]);
@@ -1213,7 +1297,7 @@ mod tests {
     fn receive_block_timeout_naks_and_gives_up() {
         let cfg = Config {
             retries: 1,
-            ..Config::default()
+            ..crc()
         };
         let (mut t, now) = receiver(cfg);
         drain(&mut t, now);
@@ -1230,7 +1314,7 @@ mod tests {
 
     #[test]
     fn receive_remote_can() {
-        let (mut t, now) = receiver(Config::default());
+        let (mut t, now) = receiver(crc());
         drain(&mut t, now);
         t.handle_input(now, &block(1, b"a", Check::Crc16));
         drain(&mut t, now);
@@ -1244,7 +1328,7 @@ mod tests {
 
     #[test]
     fn receive_1k_and_mixed_blocks() {
-        let (mut t, now) = receiver(Config::default());
+        let (mut t, now) = receiver(crc());
         drain(&mut t, now);
         t.handle_input(
             now,
@@ -1270,7 +1354,7 @@ mod tests {
     #[test]
     fn receive_empty_transfer_eot_first_is_ignored_before_start() {
         // EOT before any block is noise while still starting.
-        let (mut t, now) = receiver(Config::default());
+        let (mut t, now) = receiver(crc());
         drain(&mut t, now);
         t.handle_input(now, &[EOT]);
         assert_eq!(t.poll_output(now), None);

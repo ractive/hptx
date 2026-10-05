@@ -7,15 +7,30 @@
 //! pure state machine in between, with the same seam as `kermit-proto`.
 //!
 //! - Sender ([`Command::Send`]): the calculator runs `XRECV`. We wait for its
-//!   start character, NAK (checksum) or `C` (CRC-16), and use whichever it
-//!   asks for. The 48G series knows only checksum.
-//! - Receiver ([`Command::Receive`]): the calculator runs `XSEND`. We send `C`
-//!   [`Config::crc_attempts`] times, then fall back to NAK (checksum).
+//!   start character, NAK (checksum), `C` (CRC-16) or `D` (HP's CRC,
+//!   [`Check::HpCrc`]), and use whichever it asks for. The 49G asks with `D`,
+//!   the 48GX with NAK.
+//! - Receiver ([`Command::Receive`]): the calculator runs `XSEND`. We send `D`
+//!   (by default; see [`Config::check`]) [`Config::crc_attempts`] times, then
+//!   fall back to NAK (checksum). The 49G answers `D`, the 48GX only NAK;
+//!   neither answers `C`.
 //!
 //! HP specifics live in the caller: starting `XRECV`/`XSEND` on the
 //! calculator, and stripping the padding of the last block (the receiver hands
 //! back every byte it received; [`Event::FileEnd`] says how much padding there
 //! can be). wiki: protocols/xmodem, protocols/xmodem-hp.
+//!
+//! # Starting a transfer on the calculator
+//!
+//! `XRECV` and `XSEND` do not run inside the Kermit server: sent as a Kermit
+//! `C` packet, both fail with "Port Not Available" on the 49G and the 48GX,
+//! even after `CLOSEIO`. The server answers the `C` packet with its usual
+//! reply (S, X, D packets carrying the error and the stack, which still holds
+//! the name) and stays in server mode. The calculator must leave the server
+//! (Kermit FINISH, or ON) and run the command itself, e.g. typed on the
+//! keyboard. The machine tolerates a Kermit packet in the pipe before the
+//! first start character or block. Verified on the emulated 49G and 48GX
+//! (traces `49g-server-xrecv`, `48gx-server-xsend`).
 //!
 //! # The seam
 //!

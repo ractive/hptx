@@ -1,15 +1,20 @@
 //! Record an XModem trace against a live calculator (or emulator) over TCP.
 //!
-//! Usage: `record ADDR [OPTIONS] send FILE | receive [OUT]`, e.g.
-//! `record localhost:4852 --host "'HPTXX' XRECV" send all.hp`.
+//! Usage: `record-xmodem ADDR [OPTIONS] send FILE | receive [OUT]`, e.g.
+//! `record-xmodem localhost:4852 --host "'HPTXX' XRECV" send all.hp`.
 //!
 //! Options:
 //! - `--host TEXT`: first send one raw Kermit `C` packet (block check 1, every
-//!   control character prefixed) carrying TEXT, to start `XRECV`/`XSEND` from
-//!   the calculator's Kermit server. TEXT takes the trace escapes.
-//! - `--1k`: send 1k blocks (with the 128-byte short tail).
-//! - `--check sum|crc|hp`: as receiver, ask for checksum (NAK), CRC-16 (`C`,
-//!   default) or HP's CRC (`D`) first.
+//!   control character prefixed) carrying TEXT to the calculator's Kermit
+//!   server. TEXT takes the trace escapes. Note that `XRECV`/`XSEND` started
+//!   this way fail with "Port Not Available" (49G, 48GX); for a transfer, put
+//!   the name on the stack, leave the server and type the command on the
+//!   calculator, then run this without `--host`.
+//! - `--1k`: send 1k blocks (with the 128-byte short tail) when the receiver
+//!   asks for a CRC; add `--checksum-1k` to send them in checksum mode too
+//!   (how `48gx-xrecv-1k` was recorded).
+//! - `--check sum|crc|hp`: as receiver, ask for checksum (NAK), CRC-16 (`C`)
+//!   or HP's CRC (`D`, default) first.
 //! - `--no-short-tail`: with `--1k`, pad the last 1k block instead of sending
 //!   the tail in 128-byte blocks.
 //! - `--pad HEX`: padding byte for the last block (default 1a).
@@ -28,7 +33,7 @@ use std::time::{Duration, Instant};
 use kermit_proto::trace::{escape, unescape};
 use xmodem_proto::{BlockSize, Check, Command, Config, Event, Transfer};
 
-const USAGE: &str = "usage: record ADDR [--host TEXT] [--1k] [--no-short-tail] \
+const USAGE: &str = "usage: record-xmodem ADDR [--host TEXT] [--1k] [--checksum-1k] [--no-short-tail] \
                      [--check sum|crc|hp] [--pad HEX] \
                      [--start-timeout SECS] [--linger SECS] send FILE | receive [OUT]";
 
@@ -54,6 +59,7 @@ fn parse_args(args: &[String]) -> Result<Args, Box<dyn std::error::Error>> {
         match it.next().map(String::as_str) {
             Some("--host") => host = Some(unescape(it.next().ok_or(USAGE)?)?),
             Some("--1k") => config.block_size = BlockSize::B1k,
+            Some("--checksum-1k") => config.checksum_1k = true,
             Some("--check") => {
                 config.check = match it.next().map(String::as_str) {
                     Some("sum") => Check::Checksum,
@@ -142,7 +148,10 @@ fn log_until_quiet(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let a = parse_args(&args)?;
-    println!("# record {}", escape(args.get(1..).unwrap_or_default().join(" ").as_bytes()));
+    println!(
+        "# record-xmodem {}",
+        escape(args.get(1..).unwrap_or_default().join(" ").as_bytes())
+    );
 
     let mut stream = TcpStream::connect(&a.addr)?;
     // Drain stale input (the idle server's periodic NAKs, start characters

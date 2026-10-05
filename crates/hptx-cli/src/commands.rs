@@ -42,6 +42,83 @@ pub struct GetArgs {
     /// Replace an existing file.
     #[arg(long)]
     pub force: bool,
+    #[command(flatten)]
+    pub xmodem: XmodemArgs,
+    /// Check the variable and show what would happen, transfer nothing (with
+    /// xmodem: the server keeps running).
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+/// How `get` and `put` move the bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+pub enum Protocol {
+    /// The calculator's Kermit server (SERVER): no typing on the calculator.
+    #[default]
+    Kermit,
+    /// XRECV/XSEND, typed on the calculator when hptx says so (48G/GX, 49G).
+    Xmodem,
+}
+
+/// `--protocol` and `--start-timeout`, shared by `get` and `put`.
+#[derive(Args, Debug, Clone, Copy)]
+pub struct XmodemArgs {
+    /// Transfer protocol.
+    #[arg(long, value_enum, default_value_t = Protocol::Kermit)]
+    pub protocol: Protocol,
+    /// xmodem: seconds to wait for XRECV/XSEND to start on the calculator
+    /// (1-600) [default: 60].
+    #[arg(
+        long,
+        value_parser = clap::value_parser!(u64).range(1..=600),
+        value_name = "SECS"
+    )]
+    pub start_timeout: Option<u64>,
+}
+
+impl XmodemArgs {
+    /// Refuse options that do not fit the protocol: `kermit_only` flags
+    /// (set, name) with xmodem, `--start-timeout` with kermit.
+    pub fn check(&self, kermit_only: &[(bool, &str)]) -> Result<()> {
+        match self.protocol {
+            Protocol::Xmodem => {
+                if let Some((_, flag)) = kermit_only.iter().find(|(set, _)| *set) {
+                    return Err(Hinted::new(
+                        format!("{flag} works with Kermit only"),
+                        xmodem_conflict_hint(flag),
+                    )
+                    .into());
+                }
+            }
+            Protocol::Kermit => {
+                if self.start_timeout.is_some() {
+                    return Err(Hinted::new(
+                        "--start-timeout applies to --protocol xmodem only",
+                        "add --protocol xmodem, or drop --start-timeout (Kermit uses --timeout)",
+                    )
+                    .into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The XModem start window.
+    pub fn start_timeout(&self) -> Duration {
+        Duration::from_secs(self.start_timeout.unwrap_or(DEFAULT_START_TIMEOUT))
+    }
+}
+
+/// `--start-timeout` default in seconds.
+const DEFAULT_START_TIMEOUT: u64 = 60;
+
+fn xmodem_conflict_hint(flag: &str) -> &'static str {
+    match flag {
+        "--overwrite" => {
+            "XModem cannot replace a variable (the 49G stores NAME.1, the 48G/GX refuses):              drop --protocol xmodem, or `hptx rm NAME` first"
+        }
+        _ => "XModem moves the file byte for byte; drop the flag or use --protocol kermit",
+    }
 }
 
 /// `put` options.
@@ -58,12 +135,14 @@ pub struct PutArgs {
     /// Transfer in binary even for a %%HP: text file.
     #[arg(long)]
     pub binary: bool,
-    /// Replace an existing variable (sends as HPTXPT, then swaps it in).
+    /// Replace an existing variable (sends as HPTXPT, then swaps it in; Kermit only).
     #[arg(long)]
     pub overwrite: bool,
-    /// Show what would happen, send nothing.
+    /// Show what would happen, send nothing (with xmodem: the server keeps running).
     #[arg(long)]
     pub dry_run: bool,
+    #[command(flatten)]
+    pub xmodem: XmodemArgs,
 }
 
 /// `restore` options.
@@ -171,11 +250,11 @@ pub fn main_entry() -> ExitCode {
     }
 }
 
-struct Ctx {
-    global: Global,
-    format: Format,
-    link: LinkInfo,
-    port_on_command_line: bool,
+pub(crate) struct Ctx {
+    pub(crate) global: Global,
+    pub(crate) format: Format,
+    pub(crate) link: LinkInfo,
+    pub(crate) port_on_command_line: bool,
 }
 
 impl Ctx {
@@ -198,6 +277,7 @@ impl Ctx {
             Command::Restore(args) => self.restore(&args)?,
             Command::Settings(args) => self.settings(&args)?,
             Command::Finish => self.finish()?,
+            Command::Xserv { command } => return self.xserv(command),
             Command::Object {
                 command: ObjectCommand::Inspect { files },
             } => offline::inspect(&files)?,
@@ -217,7 +297,7 @@ impl Ctx {
     }
 
     /// A command line for a hint: `hptx [--port P] ARGS`.
-    fn cmd(&self, args: &str) -> String {
+    pub(crate) fn cmd(&self, args: &str) -> String {
         match (&self.global.port, self.port_on_command_line) {
             (Some(port), true) => format!("hptx --port {} {args}", shell_quote(port)),
             _ => format!("hptx {args}"),
@@ -225,14 +305,14 @@ impl Ctx {
     }
 
     /// Progress note on stderr, only for a person watching a terminal.
-    fn status(&self, text: &str) {
+    pub(crate) fn status(&self, text: &str) {
         if self.format == Format::Text && std::io::stderr().is_terminal() {
             eprintln!("{text}");
         }
     }
 
     /// Open the link, finish a pending restore cleanup, change to `--dir`.
-    fn connect(&mut self) -> Result<Calculator> {
+    pub(crate) fn connect(&mut self) -> Result<Calculator> {
         let mut calc = self.open()?;
         let marker = self.restore_marker();
         if marker.exists() {
@@ -331,7 +411,7 @@ impl Ctx {
         let path = calc.path().context("PATH")?;
         let iopar = calc.iopar().context("IOPAR")?;
         let mode = calc.transfer_mode().context("flag -35")?;
-        let model = util::model(version.as_deref());
+        let model = hptx_core::Model::from_version(version.as_deref()).name();
         let addr = self.link.addr.clone().unwrap_or_default();
         let mut text = String::new();
         let _ = writeln!(text, "model     {model}");
@@ -475,6 +555,12 @@ impl Ctx {
 
     fn get(&mut self, args: &GetArgs) -> Result<Option<Outcome>> {
         validate_name(&args.name).with_context(|| format!("get {}", args.name))?;
+        args.xmodem
+            .check(&[(args.ascii, "--ascii")])
+            .with_context(|| format!("get {}", args.name))?;
+        if args.xmodem.protocol == Protocol::Xmodem {
+            return self.get_xmodem(args);
+        }
         let to_stdout = args.output.as_deref() == Some(Path::new("-"));
         let file = args
             .output
@@ -489,6 +575,11 @@ impl Ctx {
             TransferMode::Binary
         };
         let mut calc = self.connect()?;
+        if args.dry_run {
+            return self
+                .get_dry_run(&mut calc, args, &file, to_stdout)
+                .map(Some);
+        }
         let data = calc
             .get(&args.name, mode)
             .with_context(|| format!("get {}", args.name))?;
@@ -526,6 +617,62 @@ impl Ctx {
         }))
     }
 
+    /// `get --dry-run` over Kermit: the variable exists, nothing is written.
+    fn get_dry_run(
+        &self,
+        calc: &mut Calculator,
+        args: &GetArgs,
+        file: &Path,
+        to_stdout: bool,
+    ) -> Result<Outcome> {
+        let listing = calc.list().context("ls")?;
+        let Some(e) = listing.entries.iter().find(|e| e.name == args.name) else {
+            return Err(Hinted::new(
+                format!(
+                    "get {}: no such variable in the current directory",
+                    args.name
+                ),
+                format!("`{}` lists the names", self.cmd("ls")),
+            )
+            .into());
+        };
+        let target = if to_stdout {
+            "stdout".to_string()
+        } else {
+            file.display().to_string()
+        };
+        let mode = if args.ascii { "ascii" } else { "binary" };
+        let mut again = format!("get {}", shell_quote(&args.name));
+        if let Some(o) = &args.output {
+            let _ = write!(again, " -o {}", shell_quote(&o.display().to_string()));
+        }
+        if args.ascii {
+            again.push_str(" --ascii");
+        }
+        if args.force {
+            again.push_str(" --force");
+        }
+        Ok(Outcome {
+            results: json!({
+                "name": args.name,
+                "file": target,
+                "type": e.kind,
+                "size": util::number(e.size),
+                "mode": mode,
+                "dry_run": true,
+            }),
+            total: None,
+            dir: None,
+            hints: vec![Hint::cmd("Download it", self.cmd(&again))],
+            text: format!(
+                "Would download {} ({}, {} bytes) to {target} ({mode}).",
+                args.name,
+                e.kind,
+                util::number_text(e.size)
+            ),
+        })
+    }
+
     fn put(&mut self, args: &PutArgs) -> Result<Outcome> {
         let from_stdin = args.file.as_path() == Path::new("-");
         let name = match (&args.name, from_stdin) {
@@ -561,12 +708,22 @@ impl Ctx {
             )
             .into());
         }
+        args.xmodem
+            .check(&[
+                (args.ascii, "--ascii"),
+                (args.binary, "--binary"),
+                (args.overwrite, "--overwrite"),
+            ])
+            .with_context(|| format!("put {name}"))?;
+        let file_label = args.file.display().to_string();
+        if args.xmodem.protocol == Protocol::Xmodem {
+            return self.put_xmodem(args, &name, &data, &file_label);
+        }
         let mode = if args.ascii || (!args.binary && data.starts_with(b"%%HP:")) {
             TransferMode::Ascii
         } else {
             TransferMode::Binary
         };
-        let file_label = args.file.display().to_string();
         let mut calc = self.connect()?;
         let listing = calc.list().context("ls")?;
         let existing = listing.entries.iter().find(|e| e.name == name).cloned();
@@ -1218,6 +1375,11 @@ fn object_type_name(data: &[u8], mode: TransferMode) -> Option<String> {
     if mode != TransferMode::Binary {
         return None;
     }
+    object_type_name_binary(data)
+}
+
+/// The object type of a binary file, or its prolog when unknown.
+pub(crate) fn object_type_name_binary(data: &[u8]) -> Option<String> {
     let info = object::inspect(data).ok()?;
     Some(info.object_type.map_or_else(
         || format!("prolog {:05X}", info.prolog),

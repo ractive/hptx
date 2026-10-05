@@ -10,6 +10,7 @@ workspace = true
 
 [dependencies]
 kermit-proto = { version = "0.1.0", path = "../kermit-proto" }
+xmodem-proto = { version = "0.1.0", path = "../xmodem-proto" }
 png = "0.18.1"
 serialport = { version = "4.10.1", default-features = false }
 thiserror = "2.0.21"

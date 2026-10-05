@@ -3,13 +3,25 @@
 //! Skipped unless `HPTX_E2E_ADDR` is set, e.g. `tcp://localhost:4848`. Must
 //! pass on the 48SX, 48GX and 49G. Every scenario leaves the calculator in
 //! HOME and in ASCII transfer mode, as a fresh one is.
+//!
+//! The XModem scenario also needs `HPTX_E2E_CONTAINER`, the name of the
+//! emulator's docker container: XRECV/XSEND cannot be started through the
+//! Kermit server, so it types them with `docker exec CONTAINER calc-keys`.
+//! It runs only on a detected 49G or 48G/GX.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::process::Command;
 use std::sync::Mutex;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use hptx_core::object::{self, Family, HEADER_LEN, ObjectType};
 use hptx_core::reply::{Iopar, parse_real};
-use hptx_core::{Calculator, Error, TransferMode};
+use hptx_core::xmodem::XmodemDirection;
+use hptx_core::xmodem_proto::{Check, Event};
+use hptx_core::{
+    Calculator, Error, Model, Options, Session, TransferMode, XmodemOptions, XmodemSession,
+};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -17,7 +29,9 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 static LOCK: Mutex<()> = Mutex::new(());
 
 /// Variables a scenario may create in HOME.
-const LEFTOVERS: &[&str] = &["HPTXE2E", "HPTXE2F", "HPTXRT", "HPTXTMP", "HPTXBK"];
+const LEFTOVERS: &[&str] = &[
+    "HPTXE2E", "HPTXE2F", "HPTXRT", "HPTXTMP", "HPTXBK", "HPTXXM",
+];
 
 /// Run `body` against a fresh connection, then clean up whatever happened.
 /// Does nothing when `HPTX_E2E_ADDR` is unset.
@@ -193,4 +207,161 @@ fn backup() -> TestResult {
         assert!(!names(calc)?.iter().any(|n| n == "HPTXBK"));
         Ok(())
     })
+}
+
+// ---- XModem ----
+
+/// Variable the XModem scenario transfers.
+const XMODEM_VAR: &str = "HPTXXM";
+
+/// Press `keys` on the emulated calculator (`calc-keys`, one tmux key name
+/// each; `;` is ALPHA, `\` is ON).
+fn press(container: &str, keys: &[&str]) -> TestResult {
+    let status = Command::new("docker")
+        .args(["exec", container, "calc-keys"])
+        .args(keys)
+        .status()?;
+    if !status.success() {
+        return Err(format!("calc-keys {keys:?}: {status}").into());
+    }
+    Ok(())
+}
+
+/// Press ON first (alpha mode can still be on after the Kermit server ended;
+/// on the 49G a stale alpha lock turned `xsend` into `SIN(X)!`), then type
+/// `word` in alpha-lock mode, then ENTER.
+fn type_word(container: &str, word: &str) -> TestResult {
+    let letters: Vec<String> = word.chars().map(|c| c.to_string()).collect();
+    let mut keys = vec!["\\", ";", ";"];
+    keys.extend(letters.iter().map(String::as_str));
+    keys.push("Enter");
+    press(container, &keys)
+}
+
+/// Type `word` after `delay`, in the background (the transfer is waiting
+/// meanwhile).
+fn type_later(container: &str, word: &str, delay: Duration) -> JoinHandle<Result<(), String>> {
+    let (container, word) = (container.to_string(), word.to_string());
+    thread::spawn(move || {
+        thread::sleep(delay);
+        type_word(&container, &word).map_err(|e| e.to_string())
+    })
+}
+
+/// Cancel whatever runs (ON) and type SERVER, then reconnect Kermit on the
+/// same link. The calculator is out of server mode after XRECV/XSEND.
+fn restart_server(
+    container: &str,
+    xs: XmodemSession,
+) -> Result<Calculator, Box<dyn std::error::Error>> {
+    thread::sleep(Duration::from_secs(2));
+    press(container, &["\\"])?;
+    thread::sleep(Duration::from_secs(1));
+    type_word(container, "server")?;
+    thread::sleep(Duration::from_secs(2));
+    Ok(Calculator::new(Session::new(
+        xs.into_transport(),
+        Options::default(),
+    )?))
+}
+
+fn print_progress(event: &Event) {
+    match event {
+        Event::Started { check } => eprintln!("xmodem: started, check {check:?}"),
+        Event::Done => eprintln!("xmodem: done"),
+        Event::Error(e) => eprintln!("xmodem: error {e}"),
+        _ => {}
+    }
+}
+
+/// Put a 269-byte string holding all 256 byte values with XRECV, check it
+/// with a Kermit GET, get it back with XSEND and compare byte for byte after
+/// the padding cut. 49G: HP's CRC (`D`); 48G/GX: checksum.
+#[test]
+fn xmodem_round_trip() -> TestResult {
+    let Some(addr) = std::env::var("HPTX_E2E_ADDR")
+        .ok()
+        .filter(|a| !a.is_empty())
+    else {
+        return Ok(());
+    };
+    let Some(container) = std::env::var("HPTX_E2E_CONTAINER")
+        .ok()
+        .filter(|c| !c.is_empty())
+    else {
+        eprintln!("xmodem: HPTX_E2E_CONTAINER not set, skipped");
+        return Ok(());
+    };
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut calc = Calculator::open(&addr)?;
+    let model = calc.model()?;
+    if !matches!(model, Model::Hp49G | Model::Hp48Gx) {
+        eprintln!("xmodem: {} has no XModem, skipped", model.name());
+        return Ok(());
+    }
+    cleanup(&mut calc)?;
+    let iopar = calc.get("IOPAR", TransferMode::Binary)?;
+    let file = all_bytes_string(&iopar[..HEADER_LEN]);
+    let options = XmodemOptions::for_model(model)?;
+    let want_check = match model {
+        Model::Hp49G => Check::HpCrc,
+        _ => Check::Checksum,
+    };
+
+    // XRECV: the name goes on the stack over Kermit (the same as typing
+    // `'HPTXXM'`), XRECV is typed.
+    calc.run(&format!("'{XMODEM_VAR}'"))?;
+    let plan = calc.prepare_for_xmodem(XmodemDirection::ToCalculator, XMODEM_VAR)?;
+    eprintln!("xmodem: {}", plan.instructions());
+    let switched_to_rpn = plan.switched_to_rpn;
+    let mut xs = XmodemSession::new(calc.into_transport(), options.clone());
+    let typer = type_later(&container, "xrecv", Duration::from_secs(2));
+    let start = Instant::now();
+    let sent = xs.send_with(&file, &mut print_progress);
+    eprintln!("xmodem: XRECV took {:?}", start.elapsed());
+    let typed = typer.join().map_err(|_| "typing thread panicked")?;
+    let mut calc = restart_server(&container, xs)?;
+    let result = (|| -> TestResult {
+        typed?;
+        let report = sent?;
+        assert_eq!(report.check, want_check);
+        assert_eq!(report.bytes, file.len() as u64);
+        let back = calc.get(XMODEM_VAR, TransferMode::Binary)?;
+        assert_eq!(back, file, "XRECV stored something else");
+        Ok(())
+    })();
+    if let Err(e) = result {
+        let _ = cleanup(&mut calc);
+        return Err(e);
+    }
+
+    // XSEND.
+    calc.run(&format!("'{XMODEM_VAR}'"))?;
+    let plan = calc.prepare_for_xmodem(XmodemDirection::FromCalculator, XMODEM_VAR)?;
+    eprintln!("xmodem: {}", plan.instructions());
+    let mut xs = XmodemSession::new(calc.into_transport(), options);
+    let typer = type_later(&container, "xsend", Duration::from_secs(2));
+    let start = Instant::now();
+    let received = xs.receive_with(&mut print_progress);
+    eprintln!("xmodem: XSEND took {:?}", start.elapsed());
+    let typed = typer.join().map_err(|_| "typing thread panicked")?;
+    let mut calc = restart_server(&container, xs)?;
+    let result = (|| -> TestResult {
+        typed?;
+        let got = received?;
+        eprintln!(
+            "xmodem: received {} bytes, last block {}, cut {:?}",
+            got.received, got.last_block, got.stripped
+        );
+        assert_eq!(got.check, want_check);
+        assert_eq!(got.stripped, Some(got.received - file.len()));
+        assert_eq!(got.data, file, "XSEND sent something else");
+        Ok(())
+    })();
+    if switched_to_rpn {
+        calc.run("-95 SF")?;
+    }
+    let cleaned = cleanup(&mut calc);
+    result?;
+    cleaned
 }

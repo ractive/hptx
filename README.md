@@ -54,6 +54,20 @@ hptx completions zsh > ~/.local/share/zsh/site-functions/_hptx
 `hptx --help` lists every command, and `hptx <command> --help` has the
 details and examples.
 
+XModem is the alternative to Kermit on the 48G/GX and 49G (the 48S/SX has
+none): `hptx put prg.hp --protocol xmodem` or `hptx get PRG --protocol
+xmodem`. The Kermit server cannot start XRECV/XSEND, so hptx ends server
+mode, prints what to type on the calculator (`'PRG' XRECV` or `'PRG'
+XSEND`, then ENTER) and waits `--start-timeout` seconds (default 60). After
+the transfer, type `SERVER` on the calculator again. Kermit stays the
+default because it needs no typing on the calculator; XModem is for when the
+Kermit server is not wanted, and on the 49G it moves 1k blocks. `--dry-run`
+shows the plan without ending the server.
+
+`hptx xserv ls|get|put|eval|mem` talks to the XSERV command server of the
+49g+/50g. It is **unverified on hardware**: it follows HP's client code as
+documented in the wiki, and the emulated 49G has no XSERV.
+
 Developing hptx itself:
 
 ```sh
