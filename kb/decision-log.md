@@ -351,7 +351,9 @@ Decisions already made. Do not re-litigate; add a dated entry to change one.
   digits, short enough that no model truncates it). A reply whose level
   1 is the marker is ours, and the marker copies on top of the stack are
   dropped; any other reply was a late one and our command was eaten, so
-  the marker command is sent once more. Nothing but the marker is ever
+  the marker command is sent once more. An E packet, or a timeout on the
+  first attempt (late reply and marker crossed; seen on the emulated 49G
+  under load), counts as an odd reply too. Nothing but the marker is ever
   dropped and an odd reply is never an error. (A `PATH` query was the
   first design; the PR #16 review rejected it: the 49G cuts a long path at
   the display width, and a path-shaped late reply would have been dropped.)

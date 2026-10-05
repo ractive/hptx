@@ -143,12 +143,17 @@ impl Calculator {
 
     fn sync_with(&mut self, marker: &str) -> Result<()> {
         let command = format!("\"{marker}\"");
-        for _ in 0..2 {
+        for attempt in 0..2 {
             let reply = match self.host(&command) {
                 // The calculator aborted a transfer left over from the dead
                 // client (seen: "Transfer Failed" on the 48SX): an odd
-                // reply like any other, our command did not run.
+                // reply like any other.
                 Err(Error::Remote(_)) => continue,
+                // The late reply and our command crossed and the exchange
+                // stalled (seen on the emulated 49G under load: the marker
+                // ran, its reply never came). Once more: the second reply
+                // shows both markers and both are dropped.
+                Err(Error::Kermit(kermit_proto::Error::Timeout)) if attempt == 0 => continue,
                 reply => reply?,
             };
             let ours = reply
@@ -786,7 +791,12 @@ mod tests {
                         };
                         log.lock().unwrap().push(command.clone());
                         let reply = reply(&command);
+                        // `SILENT` never answers (the client times out);
                         // `E:message` plays an E packet instead of a reply.
+                        if reply == "SILENT" {
+                            queue.clear();
+                            continue;
+                        }
                         if let Some(message) = reply.strip_prefix("E:") {
                             queue.clear();
                             out.push(wire(&Packet::new(0, b'E', message.as_bytes().to_vec())));
@@ -811,6 +821,8 @@ mod tests {
                             out.push(wire(next));
                         }
                     }
+                    // The client gave up (timeout).
+                    b'E' => queue.clear(),
                     kind => panic!("unexpected packet {}", char::from(kind)),
                 }
             }
@@ -966,6 +978,39 @@ mod tests {
             sync_against(vec!["E:Transfer Failed", "E:Transfer Failed"]),
             [MARKER_CMD, MARKER_CMD]
         );
+    }
+
+    /// The first marker command ran but its reply never came (timeout): the
+    /// second reply shows both markers and both go. A second timeout is a
+    /// link failure.
+    #[test]
+    fn sync_retries_once_after_a_timeout() {
+        let mut n = 0;
+        let (mut c, log) = calc(move |cmd| {
+            n += 1;
+            match (cmd, n) {
+                (MARKER_CMD, 1) => "SILENT".into(),
+                (MARKER_CMD, _) => {
+                    "3:                  7\r\n2:      \"HPTX-0a1b2c\"\r\n1:      \"HPTX-0a1b2c\"\r\n"
+                        .into()
+                }
+                ("DROP2", _) => EMPTY.into(),
+                _ => panic!("unexpected {cmd}"),
+            }
+        });
+        c.sync_with(MARKER).unwrap();
+        assert_eq!(sent(&log), [MARKER_CMD, MARKER_CMD, "DROP2"]);
+
+        let (mut c, log) = calc(|_| "SILENT".into());
+        let err = c.sync_with(MARKER).unwrap_err();
+        assert!(
+            matches!(err, Error::Kermit(kermit_proto::Error::Timeout)),
+            "{err:?}"
+        );
+        // Two transactions of 1 + 5 retransmissions each; only the marker.
+        let log = sent(&log);
+        assert_eq!(log.len(), 12, "{log:?}");
+        assert!(log.iter().all(|c| c == MARKER_CMD), "{log:?}");
     }
 
     #[test]
