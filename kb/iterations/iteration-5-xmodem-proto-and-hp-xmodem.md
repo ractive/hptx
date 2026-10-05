@@ -3,7 +3,7 @@ title: "Iteration 5: xmodem-proto and HP XModem"
 type: iteration
 date: 2026-10-04
 status: completed
-branch: iter-5/xmodem-proto-and-hp-xmodem
+branch: iter-5/xmodem
 tags:
   - iteration
   - hptx
