@@ -9,9 +9,16 @@ pub enum Error {
     /// The serial port could not be opened or configured.
     #[error("serial port: {0}")]
     Serial(#[from] serialport::Error),
-    /// The link address is neither `tcp://host:port` nor a device path.
-    #[error("bad address {0:?}: expected a serial device path or tcp://host:port")]
+    /// The link address is not `tcp://host:port`, `saturnus://ROM` or a
+    /// device path.
+    #[error(
+        "bad address {0:?}: expected a serial device path, tcp://host:port or saturnus://ROM-PATH"
+    )]
     Address(String),
+    /// The in-process emulator could not be started (missing ROM, wrong
+    /// size, no `saturnus` feature).
+    #[error("emulator: {0}")]
+    Emulator(String),
     /// The calculator sent a Kermit E packet (text translated from the HP
     /// character set), e.g. `Undefined Name` for a GET of a missing variable.
     #[error("calculator: {0}")]

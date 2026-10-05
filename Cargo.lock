@@ -193,6 +193,7 @@ version = "0.1.0"
 dependencies = [
  "kermit-proto",
  "png",
+ "saturnus",
  "serialport",
  "thiserror",
 ]
@@ -299,6 +300,11 @@ checksum = "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001"
 dependencies = [
  "proc-macro2",
 ]
+
+[[package]]
+name = "saturnus"
+version = "0.1.0"
+source = "git+https://github.com/ractive/saturnus?rev=4fc75738d8410d3693e64e37592bcc5e0454add2#4fc75738d8410d3693e64e37592bcc5e0454add2"
 
 [[package]]
 name = "scopeguard"
