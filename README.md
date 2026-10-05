@@ -57,9 +57,10 @@ details and examples.
 `hptx repl` keeps one link open and sends each line you type as RPL, then
 prints the stack as the calculator displays it. Lines starting with a colon
 are hptx commands (`:ls`, `:cd`, `:get`, `:put`, `:rm`, `:pict`, `:info`,
-`:help`, `:quit`), and `::` sends RPL that starts with a colon.
-Line editing and history work on a terminal. Piped lines run without a
-prompt, for scripts and agents:
+`:help`, `:quit`), and `::` sends RPL that starts with a colon. `:put`
+replaces an existing variable only with `--overwrite`. Line editing and
+history work on a terminal. Piped lines run without a prompt, for scripts
+and agents:
 
 ```text
 > 42 'X' STO

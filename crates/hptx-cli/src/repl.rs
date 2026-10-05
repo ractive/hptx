@@ -24,16 +24,16 @@ macro_rules! repl_commands {
     () => {
         "\
 Commands (everything else is RPL for the calculator):
-  :ls [PATH]                    list a directory; PATH (from HOME) becomes current
-  :cd PATH                      change directory, from HOME: HOME/GAMES or GAMES
-  :get NAME [FILE] [--force]    download NAME in binary to FILE [default: NAME]
-  :put FILE [NAME]              upload FILE as NAME [default: the file name]
-  :rm NAME...                   delete variables (directories with their contents)
-  :pict [FILE] [--force]        graphics screen PICT as PNG [default: hptx-pict-<time>.png]
-  :info                         model, version, free memory, path, IOPAR
-  :help                         this list
-  :quit, :q                     leave (Ctrl-D too)
-  ::RPL                         send RPL that starts with a colon: ::a:1 sends :a:1"
+  :ls [PATH]                      list a directory; PATH (from HOME) becomes current
+  :cd PATH                        change directory, from HOME: HOME/GAMES or GAMES
+  :get NAME [FILE] [--force]      download NAME in binary to FILE [default: NAME]
+  :put FILE [NAME] [--overwrite]  upload FILE as NAME [default: the file name]
+  :rm NAME...                     delete variables (directories with their contents)
+  :pict [FILE] [--force]          graphics screen as PNG [default: hptx-pict-<time>.png]
+  :info                           model, version, free memory, path, IOPAR
+  :help                           this list
+  :quit, :q                       leave (Ctrl-D too)
+  ::RPL                           send RPL that starts with a colon: ::a:1 sends :a:1"
     };
 }
 
@@ -47,7 +47,8 @@ the stack comes back as the calculator displays it, deepest level first: the
 49G truncates long values and shows lists with commas. An empty stack prints
 nothing. After an error the calculator's message and the stack it left are
 printed (to stderr) and the session goes on. One line must fit in one Kermit
-packet (77 encoded bytes). Files that exist are kept unless --force.
+packet (77 encoded bytes). Files that exist are kept unless --force, and
+:put replaces a variable only with --overwrite.
 
 Ctrl-C clears the line, Ctrl-D or :quit leaves. History is kept in
   Linux    $XDG_DATA_HOME/hptx/history (default ~/.local/share/hptx/history)
@@ -101,6 +102,7 @@ pub enum Meta {
     Put {
         file: PathBuf,
         name: Option<String>,
+        overwrite: bool,
     },
     Rm(Vec<String>),
     Pict {
@@ -112,7 +114,7 @@ pub enum Meta {
     Quit,
 }
 
-const META_LIST: &str = "commands: :ls [PATH], :cd PATH, :get NAME [FILE], :put FILE [NAME], :rm NAME..., \
+const META_LIST: &str = "commands: :ls [PATH], :cd PATH, :get NAME [FILE], :put FILE [NAME] [--overwrite], :rm NAME..., \
      :pict [FILE], :info, :help, :quit; ::RPL sends RPL that starts with a colon";
 
 /// Parse the text after the colon.
@@ -121,21 +123,22 @@ pub fn parse_meta(text: &str) -> std::result::Result<Meta, Hinted> {
     let Some((command, args)) = words.split_first() else {
         return Err(Hinted::new("a colon command needs a name", META_LIST));
     };
-    let force = args.iter().any(|a| a == "--force");
-    let plain: Vec<&String> = args.iter().filter(|a| *a != "--force").collect();
-    if let Some(option) = plain.iter().find(|a| a.starts_with("--")) {
+    // Each command's flags; any other `--word` is refused.
+    let allowed: &[&str] = match command.as_str() {
+        "get" | "pict" => &["--force"],
+        "put" => &["--overwrite"],
+        _ => &[],
+    };
+    let (flags, plain): (Vec<&String>, Vec<&String>) =
+        args.iter().partition(|a| a.starts_with("--"));
+    if let Some(flag) = flags.iter().find(|f| !allowed.contains(&f.as_str())) {
         return Err(Hinted::new(
-            format!(":{command}: unknown option {option}"),
+            format!(":{command}: unknown option {flag}"),
             usage(command),
         ));
     }
-    let takes_force = matches!(command.as_str(), "get" | "pict");
-    if force && !takes_force {
-        return Err(Hinted::new(
-            format!(":{command}: unknown option --force"),
-            usage(command),
-        ));
-    }
+    let force = flags.iter().any(|f| *f == "--force");
+    let overwrite = flags.iter().any(|f| *f == "--overwrite");
     let arity = |min: usize, max: usize| -> std::result::Result<(), Hinted> {
         if plain.len() < min || plain.len() > max {
             Err(Hinted::new(
@@ -178,6 +181,7 @@ pub fn parse_meta(text: &str) -> std::result::Result<Meta, Hinted> {
             Meta::Put {
                 file: file(plain[0])?,
                 name: plain.get(1).map(|s| (*s).clone()),
+                overwrite,
             }
         }
         "rm" => {
@@ -212,7 +216,7 @@ fn usage(command: &str) -> String {
         "ls" => ":ls [PATH]",
         "cd" => ":cd PATH",
         "get" => ":get NAME [FILE] [--force]",
-        "put" => ":put FILE [NAME]",
+        "put" => ":put FILE [NAME] [--overwrite]",
         "rm" => ":rm NAME...",
         "pict" => ":pict [FILE] [--force]",
         "info" => ":info",
@@ -392,34 +396,39 @@ impl Ctx {
             .build();
         let mut editor =
             rustyline::DefaultEditor::with_config(config).context("starting the line editor")?;
-        let history = history_path(Platform::current(), |name| std::env::var_os(name));
-        if let Some(path) = &history {
+        let mut history = History::new(history_path(Platform::current(), |name| {
+            std::env::var_os(name)
+        }));
+        if let Some(path) = &history.path {
             // No history yet is fine.
             let _ = editor.load_history(path);
         }
         // rustyline leaves raw mode before readline returns, also on Ctrl-C
         // and errors, so the terminal is cooked while a command runs.
-        let result = loop {
+        loop {
             match editor.readline("> ") {
                 Ok(line) => {
                     if !line.trim().is_empty() {
                         let _ = editor.add_history_entry(line.as_str());
+                        // Appended before the line runs: Ctrl-C during a
+                        // command kills hptx and must not lose the session.
+                        if let Some(path) = history.path.clone() {
+                            let result = editor.append_history(&path);
+                            if let Some(note) = history.note(result) {
+                                eprintln!("{note}");
+                            }
+                        }
                     }
-                    match self.repl_line(calc, &line) {
-                        Ok(Flow::Continue) => {}
-                        Ok(Flow::Quit) => break Ok(()),
-                        Err(e) => break Err(e),
+                    match self.repl_line(calc, &line)? {
+                        Flow::Continue => {}
+                        Flow::Quit => return Ok(()),
                     }
                 }
                 Err(ReadlineError::Interrupted) => {}
-                Err(ReadlineError::Eof) => break Ok(()),
-                Err(e) => break Err(anyhow::Error::new(e).context("reading the input")),
+                Err(ReadlineError::Eof) => return Ok(()),
+                Err(e) => return Err(anyhow::Error::new(e).context("reading the input")),
             }
-        };
-        if let Some(path) = &history {
-            save_history(&mut editor, path);
         }
-        result
     }
 
     fn repl_plain(&mut self, calc: &mut Calculator) -> Result<()> {
@@ -452,7 +461,7 @@ impl Ctx {
             Ok(()) => Ok(Flow::Continue),
             Err(e) if is_link_failure(&e) => Err(e),
             Err(e) => {
-                eprintln!("{}", describe(&e, &self.link).render(Format::Text));
+                eprintln!("{}", repl_failure(&e, &self.link).render(Format::Text));
                 Ok(Flow::Continue)
             }
         }
@@ -494,13 +503,17 @@ impl Ctx {
                     None => return Ok(()),
                 }
             }
-            Meta::Put { file, name } => {
+            Meta::Put {
+                file,
+                name,
+                overwrite,
+            } => {
                 let args = PutArgs {
                     file,
                     name,
                     ascii: false,
                     binary: false,
-                    overwrite: false,
+                    overwrite,
                     dry_run: false,
                     xmodem: kermit(),
                 };
@@ -560,12 +573,173 @@ fn print_text(text: &str) -> Result<()> {
     output::print_stdout(text).context("writing to stdout")
 }
 
-fn save_history(editor: &mut rustyline::DefaultEditor, path: &Path) {
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+/// The history file and whether its failure was reported.
+struct History {
+    path: Option<PathBuf>,
+    noted: bool,
+}
+
+impl History {
+    /// Creates the file's directory once; a failure shows at the first write.
+    fn new(path: Option<PathBuf>) -> History {
+        if let Some(dir) = path.as_deref().and_then(Path::parent) {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        History { path, noted: false }
     }
-    if let Err(e) = editor.save_history(path) {
-        eprintln!("note: cannot save the history to {}: {e}", path.display());
+
+    /// The note for a failed write, only the first time.
+    fn note<E: std::fmt::Display>(&mut self, result: std::result::Result<(), E>) -> Option<String> {
+        let e = result.err()?;
+        if self.noted {
+            return None;
+        }
+        self.noted = true;
+        let path = self
+            .path
+            .as_deref()
+            .map_or(String::new(), |p| p.display().to_string());
+        Some(format!("note: cannot save the history to {path}: {e}"))
+    }
+}
+
+/// Hint after a too long line inside the REPL.
+const TOO_LONG_HINT: &str = "a line must fit in one Kermit packet (77 encoded bytes; « » → \
+                             count as 3 or 4): split it over several lines (the stack stays \
+                             between lines), or :put a program and run it by name";
+
+/// `err` as the REPL shows it: hints name REPL commands, not `hptx ...`.
+pub fn repl_failure(err: &anyhow::Error, link: &crate::error::LinkInfo) -> Failure {
+    let mut failure = describe(err, link);
+    let core = err.chain().find_map(|c| c.downcast_ref::<Error>());
+    failure.hint = match core {
+        Some(Error::Calculator { .. }) if failure.hint.is_some() => Some(CALC_ERROR_HINT.into()),
+        Some(Error::CommandTooLong { .. }) => Some(TOO_LONG_HINT.into()),
+        _ => failure.hint.map(|h| repl_hint(&h)),
+    };
+    failure
+}
+
+/// Rewrite a CLI hint for the REPL: each `` `hptx ...` `` becomes the REPL
+/// line that does the same (`:ls`, `:put FILE NAME --overwrite`, plain RPL
+/// for `hptx run`); a command the REPL lacks keeps its form, marked "after
+/// :quit". CLI-only phrases (`--as NAME`, `-o FILE`, `--dry-run`) follow.
+pub fn repl_hint(hint: &str) -> String {
+    let mut out = String::new();
+    let mut rest = hint;
+    while let Some(start) = rest.find('`') {
+        let Some(len) = rest[start + 1..].find('`') else {
+            break;
+        };
+        let inner = &rest[start + 1..start + 1 + len];
+        out.push_str(&rest[..start]);
+        match inner.strip_prefix("hptx ") {
+            Some(cmd) => match repl_command(cmd) {
+                Some(line) => {
+                    out.push('`');
+                    out.push_str(&line);
+                    out.push('`');
+                }
+                None => {
+                    out.push('`');
+                    out.push_str(inner);
+                    out.push_str("` (after :quit)");
+                }
+            },
+            None => {
+                out.push('`');
+                out.push_str(inner);
+                out.push('`');
+            }
+        }
+        rest = &rest[start + len + 2..];
+    }
+    out.push_str(rest);
+    out.replace(" (`--dry-run` shows what goes)", "")
+        .replace("with --as NAME", "with :put FILE NAME")
+        .replace("with -o FILE", "as the FILE argument")
+}
+
+/// The REPL line for the CLI command `cmd` (after `hptx `), if any.
+fn repl_command(cmd: &str) -> Option<String> {
+    let words = split_words(cmd).ok()?;
+    let mut words = words.as_slice();
+    // Global options a hint may carry; the REPL already has its link.
+    while let [opt, _, tail @ ..] = words {
+        if matches!(opt.as_str(), "--port" | "-p" | "--dir") {
+            words = tail;
+        } else {
+            break;
+        }
+    }
+    let (command, args) = words.split_first()?;
+    // Option values and positional words.
+    let mut output = None;
+    let mut name = None;
+    let mut flags = Vec::new();
+    let mut plain = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "-o" | "--output" => output = it.next().cloned(),
+            "--as" => name = it.next().cloned(),
+            f if f.starts_with('-')
+                && f.len() > 1
+                && !f[1..].starts_with(|c: char| c.is_ascii_digit()) =>
+            {
+                flags.push(f)
+            }
+            _ => plain.push(a.clone()),
+        }
+    }
+    let mut line: Vec<String> = match command.as_str() {
+        "run" if !args.is_empty() => return Some(args.join(" ")),
+        "ls" | "rm" | "info" => {
+            let mut l = vec![format!(":{command}")];
+            l.extend(plain.iter().map(|w| quote(w)));
+            l
+        }
+        "get" => {
+            let mut l = vec![":get".to_string()];
+            l.extend(plain.iter().map(|w| quote(w)));
+            l.extend(output.iter().map(|w| quote(w)));
+            l
+        }
+        "put" => {
+            let mut l = vec![":put".to_string()];
+            l.extend(plain.iter().map(|w| quote(w)));
+            l.extend(name.iter().map(|w| quote(w)));
+            l
+        }
+        "pict" => {
+            let mut l = vec![":pict".to_string()];
+            l.extend(output.iter().map(|w| quote(w)));
+            l
+        }
+        _ => return None,
+    };
+    let keep: &[&str] = match command.as_str() {
+        "get" | "pict" => &["--force"],
+        "put" => &["--overwrite"],
+        _ => &[],
+    };
+    line.extend(
+        flags
+            .into_iter()
+            .filter(|f| keep.contains(f))
+            .map(str::to_string),
+    );
+    Some(line.join(" "))
+}
+
+/// A word as the REPL's colon commands read it back.
+fn quote(word: &str) -> String {
+    if word.is_empty() || word.contains(char::is_whitespace) || word.contains('"') {
+        format!("'{word}'")
+    } else if word.contains('\'') {
+        format!("\"{word}\"")
+    } else {
+        word.to_string()
     }
 }
 
@@ -619,14 +793,24 @@ mod tests {
             parse_meta("put 'my prg.hp' PRG").unwrap(),
             Meta::Put {
                 file: "my prg.hp".into(),
-                name: Some("PRG".into())
+                name: Some("PRG".into()),
+                overwrite: false
             }
         );
         assert_eq!(
             parse_meta("put prg.hp").unwrap(),
             Meta::Put {
                 file: "prg.hp".into(),
-                name: None
+                name: None,
+                overwrite: false
+            }
+        );
+        assert_eq!(
+            parse_meta("put prg.hp PRG --overwrite").unwrap(),
+            Meta::Put {
+                file: "prg.hp".into(),
+                name: Some("PRG".into()),
+                overwrite: true
             }
         );
         assert_eq!(
@@ -668,6 +852,11 @@ mod tests {
         assert!(parse_meta("get A b c").is_err());
         assert!(parse_meta("info x").is_err());
         assert!(parse_meta("rm X --force").is_err());
+        let e = parse_meta("put a.hp --force").unwrap_err();
+        assert_eq!(e.message, ":put: unknown option --force");
+        assert_eq!(e.hint, "usage: :put FILE [NAME] [--overwrite]");
+        assert!(parse_meta("get X --overwrite").is_err());
+        assert!(parse_meta("pict --overwrite").is_err());
         assert!(parse_meta("ls --json").is_err());
         let e = parse_meta("get X -").unwrap_err();
         assert!(e.message.contains("does not work in the REPL"));
@@ -786,5 +975,150 @@ mod tests {
             history_path(Platform::Windows, env(&[("HOME", "/h")])),
             None
         );
+    }
+
+    #[test]
+    fn hints_name_repl_commands() {
+        // put over an existing name (put_on), with and without --port.
+        assert_eq!(
+            repl_hint(
+                "`hptx put prg.hp --as PRG --overwrite` replaces it, or choose another \
+                 name with --as NAME"
+            ),
+            "`:put prg.hp PRG --overwrite` replaces it, or choose another name with \
+             :put FILE NAME"
+        );
+        assert_eq!(
+            repl_hint("`hptx --port tcp://localhost:4848 put 'my prg.hp' --as PRG --overwrite`"),
+            "`:put 'my prg.hp' PRG --overwrite`"
+        );
+        // rm of a missing name (rm_on), Undefined Name (describe).
+        assert_eq!(
+            repl_hint("nothing was deleted; `hptx ls` lists the names"),
+            "nothing was deleted; `:ls` lists the names"
+        );
+        // An invalid name from :put (put_input).
+        assert_eq!(
+            repl_hint(
+                "choose one with --as NAME, e.g. `hptx put 'a b.hp' --as PRG`; names start \
+                 with a letter"
+            ),
+            "choose one with :put FILE NAME, e.g. `:put 'a b.hp' PRG`; names start with a letter"
+        );
+        // Temporary variables (put_on, reply_hint): get, rm, mv.
+        assert_eq!(
+            repl_hint(
+                "`hptx get HPTXPT` to keep it, then `hptx rm HPTXPT` (or `hptx mv HPTXPT OTHER`)"
+            ),
+            "`:get HPTXPT` to keep it, then `:rm HPTXPT` (or `hptx mv HPTXPT OTHER` (after \
+             :quit))"
+        );
+        assert_eq!(
+            repl_hint("choose another name, or `hptx rm X` first (`--dry-run` shows what goes)"),
+            "choose another name, or `:rm X` first"
+        );
+        // run becomes plain RPL (pict_on).
+        assert_eq!(
+            repl_hint("draw over the link, e.g. `hptx run 'ERASE { # 10d # 10d } PIXON'`"),
+            "draw over the link, e.g. `ERASE { # 10d # 10d } PIXON`"
+        );
+        assert_eq!(
+            repl_hint("`hptx run DROP` removes one level"),
+            "`DROP` removes one level"
+        );
+        // get/pict keep their file and --force; CLI-only flags go.
+        assert_eq!(
+            repl_hint("`hptx get PRG -o prg.hp --ascii --force`"),
+            "`:get PRG prg.hp --force`"
+        );
+        assert_eq!(repl_hint("`hptx pict -o p.png`"), "`:pict p.png`");
+        assert_eq!(repl_hint("`hptx rm A B --dry-run`"), "`:rm A B`");
+        assert_eq!(
+            repl_hint("--force replaces it, or name another file with -o FILE"),
+            "--force replaces it, or name another file as the FILE argument"
+        );
+        // No REPL command: the CLI form stays, marked.
+        assert_eq!(
+            repl_hint("`hptx ports` lists the serial ports"),
+            "`hptx ports` (after :quit) lists the serial ports"
+        );
+        // Text without commands is unchanged; an unpaired backtick too.
+        assert_eq!(repl_hint("check the cable"), "check the cable");
+        assert_eq!(repl_hint("a ` b"), "a ` b");
+    }
+
+    #[test]
+    fn repl_failures_get_repl_hints() {
+        let link = crate::error::LinkInfo::default();
+        let missing = anyhow::Error::new(Hinted::new(
+            "no such variable in the current directory: X",
+            "nothing was deleted; `hptx ls` lists the names",
+        ));
+        assert_eq!(
+            repl_failure(&missing, &link).hint.as_deref(),
+            Some("nothing was deleted; `:ls` lists the names")
+        );
+        let undefined = anyhow::Error::new(Error::Remote("Undefined Name".into())).context("get X");
+        assert_eq!(
+            repl_failure(&undefined, &link).hint.as_deref(),
+            Some("no such variable in the current directory; `:ls` lists them")
+        );
+        let calc = anyhow::Error::new(Error::Calculator {
+            message: "Undefined Name".into(),
+            stack: vec!["'X'".into()],
+        })
+        .context("rm X");
+        assert_eq!(
+            repl_failure(&calc, &link).hint.as_deref(),
+            Some(CALC_ERROR_HINT)
+        );
+        let long = anyhow::Error::new(Error::CommandTooLong {
+            command: String::new(),
+            len: 80,
+            max: 77,
+        });
+        let hint = repl_failure(&long, &link).hint.unwrap();
+        assert!(
+            hint.contains("several lines") && !hint.contains("hptx"),
+            "{hint}"
+        );
+        let name = anyhow::Error::new(Error::Name("1X".into()));
+        let hint = repl_failure(&name, &link).hint.unwrap();
+        assert!(hint.ends_with("choose one with :put FILE NAME"), "{hint}");
+    }
+
+    #[test]
+    fn history_failure_noted_once() {
+        let mut h = History {
+            path: Some(PathBuf::from("/nonexistent/h")),
+            noted: false,
+        };
+        assert_eq!(h.note::<&str>(Ok(())), None);
+        assert_eq!(
+            h.note(Err("denied")).as_deref(),
+            Some("note: cannot save the history to /nonexistent/h: denied")
+        );
+        assert_eq!(h.note(Err("denied")), None);
+        assert_eq!(h.note::<&str>(Ok(())), None);
+    }
+
+    #[test]
+    fn history_appends_each_line() {
+        let dir = std::env::temp_dir().join(format!("hptx-history-test-{}", std::process::id()));
+        let path = dir.join("sub").join("history");
+        let _ = std::fs::remove_dir_all(&dir);
+        let history = History::new(Some(path.clone()));
+        assert!(path.parent().unwrap().is_dir());
+        let mut editor = rustyline::DefaultEditor::new().unwrap();
+        for line in ["42 'X' STO", "X"] {
+            editor.add_history_entry(line).unwrap();
+            editor
+                .append_history(history.path.as_ref().unwrap())
+                .unwrap();
+        }
+        // Each line is on disk before the next one runs; no final save.
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("42 'X' STO\nX\n"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

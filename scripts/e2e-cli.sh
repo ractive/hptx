@@ -442,6 +442,22 @@ if hptx ls --json | jq -e '.results | map(.name) | index("HPTXR")' >/dev/null; t
 fi
 ok
 
+step "repl: :put refuses, --overwrite replaces"
+# IOPAR's list as HPTXR, then the same again: refused with a REPL hint (not
+# an `hptx put` command line, which cannot run while the REPL holds the
+# link), then replaced with --overwrite, then deleted.
+out=$(printf ':put %s HPTXR\n:put %s HPTXR\n:put %s HPTXR --overwrite\n:rm HPTXR\n' \
+    "$work/iopar.hp" "$work/iopar.hp" "$work/iopar.hp" | hptx repl 2>"$work/repl.err") \
+    || fail "repl exit $?: $(cat "$work/repl.err")"
+grep -q 'error: HPTXR exists' "$work/repl.err" || fail "no refusal: $(cat "$work/repl.err")"
+grep -qF ":put $work/iopar.hp HPTXR --overwrite\` replaces it" "$work/repl.err" \
+    || fail "no REPL hint: $(cat "$work/repl.err")"
+if grep -q 'hptx put' "$work/repl.err"; then fail "CLI hint in the REPL: $(cat "$work/repl.err")"; fi
+grep -q 'HPTXR (.*), replaced the old variable' <<<"$out" || fail "--overwrite: $out"
+[[ $(grep -c '^Deleted HPTXR ' <<<"$out") == 1 ]] || fail ":rm: $out"
+if hptx ls --jq '.results[].name' | grep -qx HPTXR; then fail "HPTXR left over"; fi
+ok
+
 step "repl: errors print and the session goes on"
 out=$(printf "'HPTXNOSUCH' RCL\nDROP\n:nosuch\n6 7 *\nDROP\n" | hptx repl 2>"$work/repl.err") \
     || fail "repl exit $?: $(cat "$work/repl.err")"

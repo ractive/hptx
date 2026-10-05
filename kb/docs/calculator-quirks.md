@@ -130,3 +130,7 @@ Each item must be covered by a test. Source: the wiki at `~/devel/hp-literature/
   e2e at once) or after an aborted client, a calculator can stop answering
   with random pixels on the LCD and the busy annunciator lit; seen four
   times on 2026-10-05, never reproduced on demand. Restart the container.
+- A host command whose client died mid-way is still finished by the
+  calculator, and its reply arrives seconds later as the answer to the next
+  client's first command (seen as `bad directory line: "Empty Stack"` after
+  Ctrl-C in the REPL). Not covered; backlog `stale-reply-after-abort`.
