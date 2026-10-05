@@ -559,7 +559,10 @@ step "late reply of an aborted command is skipped"
 # should the script stop midway, by the exit trap.
 hptx run CLEAR >/dev/null   # start from a known stack: DEPTH is checked below
 mkfifo "$work/repl.fifo"
-hptx repl <"$work/repl.fifo" >/dev/null 2>&1 &
+# The binary itself, not the `hptx` function: `$!` of a backgrounded
+# function is a subshell, and killing it left the REPL running (it then
+# resynced and competed with the next command).
+"$HPTX_BIN" repl <"$work/repl.fifo" >/dev/null 2>&1 &
 repl_pid=$!
 {
     echo '1 1000000 START NEXT 4711'
