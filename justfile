@@ -24,6 +24,7 @@ e2e:
 # CLI end-to-end script against a running emulator, e.g. `just e2e-cli tcp://localhost:4852` (the 49G)
 e2e-cli addr=e2e_addr:
     HPTX_E2E_ADDR={{addr}} scripts/e2e-cli.sh
+
 # e2e suite against the in-process saturnus emulator (HP 48SX ROM J path)
 e2e-saturnus rom="../saturnus/roms/sxrom-j":
     HPTX_E2E_ADDR=saturnus://$(cd "$(dirname {{rom}})" && pwd)/$(basename {{rom}}) cargo test -p hptx-core --features saturnus --test e2e -- --nocapture

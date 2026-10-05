@@ -145,6 +145,7 @@ Decisions already made. Do not re-litigate; add a dated entry to change one.
   the server then stops with "Invalid IOPAR" and answers nothing. `Iopar::to_rpl`
   writes `{ 9600. 0. 0. 0. 3. 1. }` (the 48 reads that as reals too); the
   plain form stays for display.
+
 ## 2026-10-05 (iteration 8)
 
 - **saturnus in-process, behind a feature.** `hptx-core` has an optional
