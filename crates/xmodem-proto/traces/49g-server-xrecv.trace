@@ -1,0 +1,15 @@
+# record-xmodem --host 'HPTXX' XRECV --start-timeout 10 --linger 7 send all-49.hp
+# started over Kermit: one C packet to the running server
+> \x010 C'HPTXX' XRECVE\r
+# xmodem start
+< \x01+ S~* @-#Y3$\r
+< \x01+ S~* @-#Y3$\r
+# xmodem end
+< \x01+ S~* @-#Y3$\r
+< \x01+ S~* @-#Y3$\r
+< \x01+ S~* @-#Y3$\r
+< \x01+ S~* @-#Y3$\r
+< \x01+ S~* @-#Y3$\r
+< \x01+ S~* @-#Y3$\r
+< \x01+ S~* @-#Y3$\r
+< \x01+ S~* @-#Y3$\r

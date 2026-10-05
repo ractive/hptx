@@ -5,5 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[dev-dependencies]
+# Only for the text trace format (`kermit_proto::trace`) shared by both
+# protocol crates' recorded traces and replay tests.
+kermit-proto = { path = "../kermit-proto" }
+
 [lints]
 workspace = true
