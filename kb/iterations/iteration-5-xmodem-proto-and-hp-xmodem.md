@@ -24,9 +24,18 @@ Read first: wiki `protocols/xmodem`, `xmodem-hp`, `xserv`,
 - [ ] 128-byte and 1k blocks, checksum and CRC-16 (MSB-first #1021), receiver
   start characters NAK / `C`, fallback to checksum after failed CRC attempts
   (the 48G has no CRC at all).
-- [ ] HP padding: strip trailing bytes with `hptx_core::object::strip_padding`
-  (the object-length walk, iteration 3); the 49G rejects objects with more
-  than ~255 bytes of padding.
+- [ ] HP padding: strip trailing bytes with
+  `hptx_core::object::strip_padding(data, allowance)` (the object-length
+  walk, iteration 3). The allowance bounds how much may be cut: Kermit uses
+  `KERMIT_PADDING_ALLOWANCE` (4 bytes); XModem passes the block size (128
+  or 1024) because the sender pads whole blocks. The 49G rejects objects
+  with more than ~255 bytes of padding.
+- [ ] Walk rules for the 49G aplet (#026D5) and minifont (#026FE) prologs
+  come from the Conn4x table only and are unverified (iteration 3 review).
+  39G/40G transfers carry aplets, but their wire protocol is unverified
+  (Kermit or XModem; wiki `hardware/hp39g-40g`), and so is the prolog a
+  real aplet uses. Verify both on Emu48 or hardware, check the walk against
+  the object, and record the results in the wiki.
 - [ ] Driver: an XModem session in `hptx-core` next to `session::Session`,
   reusing `transport::Transport` (one packet per write, read with timeout,
   `drain`) and `MemoryTransport` for tests. Starting XRECV/XSEND on the
