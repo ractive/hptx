@@ -101,9 +101,30 @@ pub fn render(outcome: &Outcome, format: Format, jq: Option<&str>) -> Result<Str
         Format::Text => {
             let mut text = outcome.text.trim_end_matches('\n').to_string();
             append_hints(&mut text, &outcome.hints);
-            Ok(text)
+            Ok(escape_control(&text))
         }
     }
+}
+
+/// `text` safe for a terminal: every control character but newline and tab
+/// (C0, DEL, C1, a CR not before a LF) becomes `\xHH`, so text from the
+/// calculator or a crafted file (stack levels, names, error texts) cannot
+/// send escape sequences. `\r\n` becomes `\n`. Applied to everything text
+/// mode prints; JSON escapes control characters itself.
+pub fn escape_control(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' if chars.peek() == Some(&'\n') => {}
+            '\n' | '\t' => out.push(c),
+            c if c.is_control() => {
+                let _ = write!(out, "\\x{:02X}", u32::from(c));
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// hyalo's layout: a blank line, then `  -> cmd  # description`.
@@ -158,33 +179,57 @@ impl Failure {
         match format {
             Format::Json => serde_json::to_string_pretty(self)
                 .unwrap_or_else(|_| format!("{{\"error\": {:?}}}", self.error)),
-            Format::Text => {
-                let mut text = format!("error: {}", self.error);
-                if let Some(stack) = &self.stack
-                    && !stack.is_empty()
-                {
-                    text.push_str("\n  stack:");
-                    for (i, level) in stack.iter().enumerate().rev() {
-                        let _ = write!(text, "\n    {}: {}", i + 1, level);
-                    }
-                }
-                if let Some(hint) = &self.hint {
-                    let _ = write!(text, "\n  hint: {hint}");
-                }
-                text
+            Format::Text => escape_control(&self.text()),
+        }
+    }
+
+    /// The text form, before [`escape_control`].
+    fn text(&self) -> String {
+        let mut text = format!("error: {}", self.error);
+        if let Some(stack) = &self.stack
+            && !stack.is_empty()
+        {
+            text.push_str("\n  stack:");
+            for (i, level) in stack.iter().enumerate().rev() {
+                let _ = write!(text, "\n    {}: {}", i + 1, level);
             }
         }
+        if let Some(hint) = &self.hint {
+            let _ = write!(text, "\n  hint: {hint}");
+        }
+        text
     }
 }
 
 type D = data::JustLut<Val>;
 
+/// Most results a `--jq` filter may produce.
+const MAX_JQ_OUTPUTS: usize = 10_000;
+/// Most bytes of `--jq` output.
+const MAX_JQ_BYTES: usize = 64 << 20;
+
+/// jaq-std filters left out of `--jq`: `env` reads every environment
+/// variable (tokens included), `halt` exits, `debug` and `stderr` write to
+/// stderr. jaq-std's `funs()` needs all its default features and the
+/// feature groups are not finer than that (`std` also has `now`), so they
+/// are filtered by name instead; the filter is then undefined.
+const JQ_DENIED: &[&str] = &[
+    "env",
+    "halt",
+    "halt_error",
+    "debug",
+    "debug_empty",
+    "stderr",
+    "stderr_empty",
+];
+
 /// Apply the jq filter `code` to `value`; outputs are joined with newlines,
-/// strings printed raw (as `jq -r`).
+/// strings printed raw (as `jq -r`, control characters escaped as in text
+/// mode). At most [`MAX_JQ_OUTPUTS`] results and [`MAX_JQ_BYTES`] bytes.
 pub fn run_jq(code: &str, value: &serde_json::Value) -> Result<String, String> {
     let program = File { code, path: () };
     let defs = jaq_core::defs()
-        .chain(jaq_std::defs())
+        .chain(jaq_std::defs().filter(|d| !JQ_DENIED.contains(&d.name)))
         .chain(jaq_json::defs());
     let loader = Loader::new(defs);
     let arena = Arena::default();
@@ -192,7 +237,7 @@ pub fn run_jq(code: &str, value: &serde_json::Value) -> Result<String, String> {
         .load(&arena, program)
         .map_err(|_| format!("jq filter {code:?}: syntax error"))?;
     let funs = jaq_core::funs::<D>()
-        .chain(jaq_std::funs::<D>())
+        .chain(jaq_std::funs::<D>().filter(|(name, _, _)| !JQ_DENIED.contains(name)))
         .chain(jaq_json::funs::<D>());
     let filter = Compiler::<_, D>::default()
         .with_funs(funs)
@@ -212,12 +257,22 @@ pub fn run_jq(code: &str, value: &serde_json::Value) -> Result<String, String> {
         .map_err(|e| format!("jq input conversion failed: {e}"))?;
     let ctx = Ctx::<D>::new(&filter.lut, Vars::new([]));
     let mut out = Vec::new();
+    let mut bytes = 0usize;
     for result in filter.id.run((ctx, input)).map(jaq_core::unwrap_valr) {
         let val = result.map_err(|e| format!("jq filter {code:?}: {e}"))?;
-        out.push(match val {
-            Val::TStr(ref s) | Val::BStr(ref s) => String::from_utf8_lossy(s).into_owned(),
+        let text = match val {
+            Val::TStr(ref s) | Val::BStr(ref s) => escape_control(&String::from_utf8_lossy(s)),
             other => other.to_string(),
-        });
+        };
+        bytes = bytes.saturating_add(text.len() + 1);
+        if out.len() == MAX_JQ_OUTPUTS || bytes > MAX_JQ_BYTES {
+            return Err(format!(
+                "jq filter {code:?} produced too much output (more than {MAX_JQ_OUTPUTS} \
+                 results or {} MiB)",
+                MAX_JQ_BYTES >> 20
+            ));
+        }
+        out.push(text);
     }
     Ok(out.join("\n"))
 }
@@ -288,6 +343,89 @@ mod tests {
         );
         assert!(render(&outcome(), Format::Json, Some(".[")).is_err());
         assert!(render(&outcome(), Format::Json, Some("nosuchfn")).is_err());
+    }
+
+    /// Audit PR #18, #10: `--jq` output is capped in results and bytes.
+    #[test]
+    fn jq_output_is_capped() {
+        let err = render(&outcome(), Format::Json, Some("range(0; 1e9)")).unwrap_err();
+        assert!(err.contains("produced too much output"), "{err}");
+        let err = render(
+            &outcome(),
+            Format::Json,
+            Some(r#"range(0; 100) | "x" * 1000000"#),
+        )
+        .unwrap_err();
+        assert!(err.contains("produced too much output"), "{err}");
+        let ok = render(&outcome(), Format::Json, Some("range(0; 10000)")).unwrap();
+        assert_eq!(ok.lines().count(), 10_000);
+    }
+
+    /// security.md "`--jq` reads the environment": `env` and the filters
+    /// that write to stderr or exit are undefined.
+    #[test]
+    fn jq_has_no_env_stderr_or_halt() {
+        for code in [
+            "env",
+            "env.HOME",
+            "debug",
+            "debug(1)",
+            "stderr",
+            "halt",
+            "halt_error",
+        ] {
+            let err = render(&outcome(), Format::Json, Some(code)).unwrap_err();
+            assert!(err.contains("undefined"), "{code}: {err}");
+        }
+        // The rest of the standard library is there.
+        assert_eq!(
+            render(
+                &outcome(),
+                Format::Json,
+                Some("[.results[].name] | join(\",\") | ascii_downcase")
+            )
+            .unwrap(),
+            "a,b"
+        );
+        assert_eq!(
+            render(&outcome(), Format::Json, Some("now | type")).unwrap(),
+            "number"
+        );
+    }
+
+    /// Audit PR #18, #11: control characters from the calculator are
+    /// escaped in text mode; JSON escapes them itself.
+    #[test]
+    fn text_mode_escapes_control_characters() {
+        assert_eq!(
+            escape_control("A\u{1b}[2J\r\nB\tC\rD\u{7f}\u{9b}31m\u{0}Σ"),
+            "A\\x1B[2J\nB\tC\\x0DD\\x7F\\x9B31m\\x00Σ"
+        );
+        let o = Outcome {
+            results: json!([{"name": "X\u{1b}]0;pwned\u{7}"}]),
+            text: "  X\u{1b}]0;pwned\u{7}  Real Number\n".into(),
+            hints: vec![Hint::cmd("Download X\u{1b}[31m", "hptx get 'X\u{1b}'")],
+            ..Outcome::default()
+        };
+        let text = render(&o, Format::Text, None).unwrap();
+        assert!(
+            !text.contains('\u{1b}') && !text.contains('\u{7}'),
+            "{text:?}"
+        );
+        assert!(text.contains("X\\x1B]0;pwned\\x07"), "{text}");
+        // JSON keeps the name as it is (escaped by serde).
+        let json = render(&o, Format::Json, None).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["results"][0]["name"], "X\u{1b}]0;pwned\u{7}");
+        // --jq raw strings and failures too.
+        let raw = render(&o, Format::Json, Some(".results[0].name")).unwrap();
+        assert_eq!(raw, "X\\x1B]0;pwned\\x07");
+        let f = Failure {
+            error: "calculator error: \u{1b}[5m".into(),
+            hint: None,
+            stack: Some(vec!["\"\u{1b}c\"".into()]),
+        };
+        assert!(!f.render(Format::Text).contains('\u{1b}'));
     }
 
     #[test]

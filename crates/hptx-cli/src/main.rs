@@ -7,6 +7,9 @@ mod offline;
 mod output;
 mod port;
 mod repl;
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod testkit;
 mod util;
 mod xmodem;
 mod xserv;
@@ -93,7 +96,8 @@ pub struct Global {
     /// The calculator stays there afterwards.
     #[arg(long, global = true, value_name = "PATH", help_heading = "Connection")]
     pub dir: Option<String>,
-    /// Seconds to wait for each Kermit packet before resending (1-600).
+    /// Seconds to wait for each Kermit packet before resending (1-600); a host
+    /// command (run, rm, mv, ...) is never resent.
     #[arg(
         long,
         global = true,
@@ -103,7 +107,7 @@ pub struct Global {
         help_heading = "Connection"
     )]
     pub timeout: u64,
-    /// Resends per packet before giving up (0-50).
+    /// Resends per packet before giving up (0-50); host commands get none.
     #[arg(
         long,
         global = true,

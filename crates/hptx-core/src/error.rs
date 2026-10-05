@@ -19,6 +19,17 @@ pub enum Error {
     /// size, no `saturnus` feature).
     #[error("emulator: {0}")]
     Emulator(String),
+    /// A host command got no reply in time. A `C` packet is sent only once
+    /// (resent, it would run again), so the command may still be running
+    /// on the calculator or may have run; the next connection resyncs
+    /// ([`Calculator::sync`](crate::Calculator::sync)).
+    #[error(
+        "no reply to host command {command:?}: it may still be running or may have run; the next connection resyncs"
+    )]
+    NoReply {
+        /// The command as given.
+        command: String,
+    },
     /// The calculator sent a Kermit E packet (text translated from the HP
     /// character set), e.g. `Undefined Name` for a GET of a missing variable.
     #[error("calculator: {0}")]

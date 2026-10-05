@@ -2,7 +2,7 @@
 //! `grob to-png`, `completions`.
 
 use std::fmt::Write as _;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -33,6 +33,10 @@ Examples:
         /// Files to inspect.
         #[arg(required = true, value_name = "FILE")]
         files: Vec<PathBuf>,
+        /// Calculator an ASCII file is for: what `5` means (a Real on the 48,
+        /// an exact Integer on the 49G).
+        #[arg(long, value_enum, default_value = "48")]
+        model: ModelArg,
     },
     /// Convert binary <-> ASCII for numbers, strings, binary integers, GROBs, lists.
     #[command(after_help = "\
@@ -53,7 +57,7 @@ any T and F in the header). --model sets the header (HPHP48-R or HPHP49-C)
 and what `5` means: a Real on the 48, an exact Integer on the 49G.
 
 Examples:
-  hptx object convert x.hp --to ascii              # writes x.txt
+  hptx object convert dl/x.hp --to ascii           # writes ./x.txt
   hptx object convert notes.txt --to binary -o notes.hp
   hptx object convert big.txt --to binary --model 49
   hptx object convert x.hp --to ascii -o -         # print it")]
@@ -66,13 +70,14 @@ pub enum GrobCommand {
     /// Decode a GROB file (binary, or ASCII `GROB w h hex`) to a PNG.
     #[command(after_help = "\
 Examples:
-  hptx get PIC -o pic.hp && hptx grob to-png pic.hp     # writes pic.png
+  hptx get PIC -o pic.hp && hptx grob to-png pic.hp     # writes ./pic.png
   hptx grob to-png pic.txt -o picture.png
   hptx grob to-png pic.hp -o - | open -f -a Preview")]
     ToPng {
         /// GROB file from `hptx get` (binary or --ascii).
         file: PathBuf,
-        /// Output file [default: FILE with .png]; - for stdout.
+        /// Output file [default: FILE's name with .png in the current directory; stdout for
+        /// stdin]; - for stdout.
         #[arg(short, long, value_name = "OUT.png")]
         output: Option<PathBuf>,
         /// Replace an existing file.
@@ -90,15 +95,24 @@ pub enum Target {
     Ascii,
 }
 
-/// Calculator family for `object convert --to binary`.
+/// Calculator family for `object convert --to binary` and `object inspect`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ModelArg {
     /// HP 48S/SX/G/GX: header HPHP48-R, `5` is a Real.
-    #[value(name = "48")]
+    #[value(name = "48", aliases = ["48sx", "48gx"])]
     Hp48,
     /// HP 49G: header HPHP49-C, `5` is an exact Integer.
-    #[value(name = "49")]
+    #[value(name = "49", alias = "49g")]
     Hp49,
+}
+
+impl ModelArg {
+    fn family(self) -> Family {
+        match self {
+            ModelArg::Hp48 => Family::Hp48,
+            ModelArg::Hp49 => Family::Hp49,
+        }
+    }
 }
 
 /// `object convert` options.
@@ -109,7 +123,8 @@ pub struct ConvertArgs {
     /// Format to write.
     #[arg(long, value_enum)]
     pub to: Target,
-    /// Output file [default: FILE with .txt for ascii, .hp for binary]; - for stdout.
+    /// Output file [default: FILE's name with .txt for ascii, .hp for binary, in the
+    /// current directory; stdout for stdin]; - for stdout.
     #[arg(short, long, value_name = "OUT")]
     pub output: Option<PathBuf>,
     /// Calculator the binary file is for (--to binary only).
@@ -138,17 +153,6 @@ impl std::fmt::Display for PartialFailure {
 
 impl std::error::Error for PartialFailure {}
 
-fn read_input(file: &Path) -> Result<Vec<u8>> {
-    if file == Path::new("-") {
-        let mut buf = Vec::new();
-        std::io::stdin()
-            .read_to_end(&mut buf)
-            .context("reading stdin")?;
-        return Ok(buf);
-    }
-    std::fs::read(file).with_context(|| format!("cannot read {}", file.display()))
-}
-
 fn family_name(f: Family) -> &'static str {
     match f {
         Family::Hp48 => "HP 48",
@@ -157,9 +161,9 @@ fn family_name(f: Family) -> &'static str {
 }
 
 /// What one file holds, as JSON and text.
-fn inspect_one(file: &Path) -> Result<(Value, String, Vec<Hint>)> {
+fn inspect_one(file: &Path, model: ModelArg) -> Result<(Value, String, Vec<Hint>)> {
     let label = file.display().to_string();
-    let data = read_input(file)?;
+    let data = crate::util::read_input(file)?;
     let q = shell_quote(&label);
     if let Some(header) = BinaryHeader::parse(&data) {
         let header_text = String::from_utf8_lossy(&header.to_bytes()).into_owned();
@@ -234,7 +238,7 @@ fn inspect_one(file: &Path) -> Result<(Value, String, Vec<Hint>)> {
         return Ok((json, text, hints));
     }
     if let Some((header, header_len)) = AsciiHeader::parse(&data) {
-        let ty = convert::parse(&data, Family::Hp48)
+        let ty = convert::parse(&data, model.family())
             .ok()
             .map(|p| p.object_type.name());
         let mut text = String::new();
@@ -289,9 +293,9 @@ fn inspect_one(file: &Path) -> Result<(Value, String, Vec<Hint>)> {
 }
 
 /// `object inspect FILE...`.
-pub fn inspect(files: &[PathBuf]) -> Result<Outcome> {
+pub fn inspect(files: &[PathBuf], model: ModelArg) -> Result<Outcome> {
     if let [file] = files {
-        let (json, text, hints) = inspect_one(file)?;
+        let (json, text, hints) = inspect_one(file, model)?;
         return Ok(Outcome {
             results: Value::from(vec![json]),
             total: Some(1),
@@ -309,7 +313,7 @@ pub fn inspect(files: &[PathBuf]) -> Result<Outcome> {
         if !text.is_empty() {
             text.push('\n');
         }
-        match inspect_one(file) {
+        match inspect_one(file, model) {
             Ok((json, t, h)) => {
                 results.push(json);
                 text.push_str(&t);
@@ -343,11 +347,14 @@ pub fn inspect(files: &[PathBuf]) -> Result<Outcome> {
     }
 }
 
-/// `FILE` with `ext`, or `FILE.ext` when that would be `FILE` itself.
-fn sibling(file: &Path, ext: &str) -> PathBuf {
-    let out = file.with_extension(ext);
-    if out == file {
-        let mut s = file.as_os_str().to_owned();
+/// The default output for `file`: its file name with `ext`, or `NAME.ext`
+/// when that would be the name itself, in the current directory (like every
+/// other default hptx writes), not beside the input.
+fn default_output(file: &Path, ext: &str) -> PathBuf {
+    let name = PathBuf::from(file.file_name().unwrap_or(file.as_os_str()));
+    let out = name.with_extension(ext);
+    if out == name {
+        let mut s = name.into_os_string();
         s.push(".");
         s.push(ext);
         PathBuf::from(s)
@@ -390,7 +397,7 @@ fn target_name(t: Target) -> &'static str {
 /// `object convert`. `Ok(None)` when written to stdout.
 pub fn convert(args: &ConvertArgs) -> Result<Option<Outcome>> {
     let label = args.file.display().to_string();
-    let data = read_input(&args.file)?;
+    let data = crate::util::read_input(&args.file)?;
     let is_binary = BinaryHeader::parse(&data).is_some();
     let (out, ty) = match (args.to, is_binary) {
         (Target::Ascii, true) => {
@@ -399,10 +406,7 @@ pub fn convert(args: &ConvertArgs) -> Result<Option<Outcome>> {
             (out, ty)
         }
         (Target::Binary, false) => {
-            let family = match args.model {
-                ModelArg::Hp48 => Family::Hp48,
-                ModelArg::Hp49 => Family::Hp49,
-            };
+            let family = args.model.family();
             let parsed =
                 convert::parse(&data, family).map_err(|e| convert_error(&label, e, args.to))?;
             (
@@ -443,7 +447,7 @@ pub fn convert(args: &ConvertArgs) -> Result<Option<Outcome>> {
     let file = args
         .output
         .clone()
-        .unwrap_or_else(|| sibling(&args.file, ext));
+        .unwrap_or_else(|| default_output(&args.file, ext));
     write_new(&file, &out, args.force)?;
     let type_name = ty.map(ObjectType::name);
     let file_label = file.display().to_string();
@@ -478,7 +482,7 @@ pub fn convert(args: &ConvertArgs) -> Result<Option<Outcome>> {
 /// `grob to-png`. `Ok(None)` when written to stdout.
 pub fn grob_to_png(file: &Path, output: Option<&Path>, force: bool) -> Result<Option<Outcome>> {
     let label = file.display().to_string();
-    let data = read_input(file)?;
+    let data = crate::util::read_input(file)?;
     let grob = if BinaryHeader::parse(&data).is_some() {
         Grob::from_file(&data).map_err(|e| not_a_grob(&label, &data, &e.to_string()))?
     } else {
@@ -496,11 +500,10 @@ pub fn grob_to_png(file: &Path, output: Option<&Path>, force: bool) -> Result<Op
             .map_err(|e| not_a_grob(&label, &data, &e.to_string()))?
     };
     let png = grob.to_png().context("PNG encoding")?;
-    if output == Some(Path::new("-")) {
+    let Some(out) = png_output(file, output) else {
         write_stdout(&png)?;
         return Ok(None);
-    }
-    let out = output.map_or_else(|| sibling(file, "png"), Path::to_path_buf);
+    };
     write_new(&out, &png, force)?;
     let out_label = out.display().to_string();
     Ok(Some(Outcome {
@@ -521,6 +524,17 @@ pub fn grob_to_png(file: &Path, output: Option<&Path>, force: bool) -> Result<Op
             png.len()
         ),
     }))
+}
+
+/// Where `grob to-png` writes, `None` for stdout: `-o` if given, else
+/// like `object convert`, stdout for stdin and the default name otherwise.
+fn png_output(file: &Path, output: Option<&Path>) -> Option<PathBuf> {
+    match output {
+        Some(o) if o == Path::new("-") => None,
+        Some(o) => Some(o.to_path_buf()),
+        None if file == Path::new("-") => None,
+        None => Some(default_output(file, "png")),
+    }
 }
 
 fn not_a_grob(label: &str, data: &[u8], why: &str) -> anyhow::Error {
@@ -593,7 +607,7 @@ mod tests {
             ] {
                 let path = fixture(&format!("{model}-{kind}"));
                 let len = std::fs::metadata(&path).unwrap().len();
-                let o = inspect(&[path]).unwrap();
+                let o = inspect(&[path], ModelArg::Hp48).unwrap();
                 let r = &o.results[0];
                 assert_eq!(r["type"], ty, "{model}-{kind}");
                 assert_eq!(r["format"], "binary");
@@ -604,7 +618,7 @@ mod tests {
                 assert!(o.text.contains(ty));
             }
         }
-        let g = inspect(&[fixture("48sx-G")]).unwrap();
+        let g = inspect(&[fixture("48sx-G")], ModelArg::Hp48).unwrap();
         assert_eq!(g.results[0]["size_nibbles"], 2196);
         assert!(g.hints.iter().any(|h| h.cmd.contains("grob to-png")));
         assert_eq!(g.results[0]["header"], "HPHP48-J");
@@ -616,7 +630,7 @@ mod tests {
         data.extend([0, 0, 0]);
         let padded = tmp("padded.hp");
         std::fs::write(&padded, &data).unwrap();
-        let o = inspect(std::slice::from_ref(&padded)).unwrap();
+        let o = inspect(std::slice::from_ref(&padded), ModelArg::Hp48).unwrap();
         assert_eq!(o.results[0]["padding_bytes"], 3);
 
         // A list holding an unknown prolog: an error, not a guess.
@@ -628,11 +642,11 @@ mod tests {
         ]));
         let bad_path = tmp("bad.hp");
         std::fs::write(&bad_path, &bad).unwrap();
-        let err = inspect(std::slice::from_ref(&bad_path)).unwrap_err();
+        let err = inspect(std::slice::from_ref(&bad_path), ModelArg::Hp48).unwrap_err();
         assert!(err.to_string().contains("unknown prolog #02700"), "{err}");
 
         // Several files: results for each, the error inline, exit code 1.
-        let err = inspect(&[padded, bad_path]).unwrap_err();
+        let err = inspect(&[padded, bad_path], ModelArg::Hp48).unwrap_err();
         let partial = err.downcast_ref::<PartialFailure>().unwrap();
         assert_eq!(partial.outcome.total, Some(2));
         assert!(
@@ -643,21 +657,47 @@ mod tests {
         );
         let text = tmp("plain.txt");
         std::fs::write(&text, "hello").unwrap();
-        assert!(inspect(&[text]).is_err());
+        assert!(inspect(&[text], ModelArg::Hp48).is_err());
     }
 
     #[test]
     fn inspect_ascii() {
         let path = tmp("x.txt");
         std::fs::write(&path, "%%HP: T(1)A(R)F(.);\r\n{ 1.5 \"x\" }").unwrap();
-        let o = inspect(std::slice::from_ref(&path)).unwrap();
+        let o = inspect(std::slice::from_ref(&path), ModelArg::Hp48).unwrap();
         assert_eq!(o.results[0]["format"], "ascii");
         assert_eq!(o.results[0]["translate"], 1);
         assert_eq!(o.results[0]["type"], "List");
         std::fs::write(&path, "%%HP: T(3)A(D)F(.);\n\\<< 1 + \\>>").unwrap();
-        let o = inspect(&[path]).unwrap();
+        let o = inspect(&[path], ModelArg::Hp48).unwrap();
         assert_eq!(o.results[0]["type"], Value::Null);
         assert!(o.hints[0].cmd.starts_with("hptx put"));
+    }
+
+    /// Audit PR #18, #17: `object inspect` reads ASCII text for the model
+    /// given, like `object convert`: a bare `5` is a Real on the 48 and an
+    /// exact Integer on the 49G.
+    #[test]
+    fn inspect_ascii_per_model() {
+        let path = tmp("five.txt");
+        std::fs::write(&path, "%%HP: T(3)A(D)F(.);\r\n5\r\n").unwrap();
+        let o = inspect(std::slice::from_ref(&path), ModelArg::Hp48).unwrap();
+        assert_eq!(o.results[0]["type"], "Real Number");
+        let o = inspect(std::slice::from_ref(&path), ModelArg::Hp49).unwrap();
+        assert_eq!(o.results[0]["type"], "Integer");
+        let cli = <crate::Cli as clap::Parser>::try_parse_from([
+            "hptx", "object", "inspect", "five.txt", "--model", "49g",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            crate::Command::Object {
+                command: ObjectCommand::Inspect {
+                    model: ModelArg::Hp49,
+                    ..
+                }
+            }
+        ));
     }
 
     #[test]
@@ -671,15 +711,17 @@ mod tests {
             model: ModelArg::Hp48,
             force: false,
         };
-        let o = convert(&args(&src, Target::Ascii, None)).unwrap().unwrap();
-        let txt = sibling(&src, "txt");
+        let txt = tmp("s.txt");
+        let o = convert(&args(&src, Target::Ascii, Some(txt.clone())))
+            .unwrap()
+            .unwrap();
         assert_eq!(o.results["output"], txt.display().to_string());
         assert_eq!(
             std::fs::read(&txt).unwrap(),
             b"%%HP: T(3)A(D)F(.);\r\n\"AB\"\r\n"
         );
         // Existing output is kept unless --force.
-        assert!(convert(&args(&src, Target::Ascii, None)).is_err());
+        assert!(convert(&args(&src, Target::Ascii, Some(txt.clone()))).is_err());
         let back = tmp("s2.hp");
         convert(&args(&txt, Target::Binary, Some(back.clone()))).unwrap();
         assert_eq!(
@@ -713,11 +755,9 @@ mod tests {
         assert!(std::fs::read(&png).unwrap().starts_with(b"\x89PNG"));
         let txt = tmp("g.txt");
         std::fs::write(&txt, "%%HP: T(3)A(D)F(.);\r\nGROB 3 2 5020\r\n").unwrap();
-        let o = grob_to_png(&txt, None, false).unwrap().unwrap();
-        assert_eq!(
-            o.results["output"],
-            sibling(&txt, "png").display().to_string()
-        );
+        let g_png = tmp("g.png");
+        let o = grob_to_png(&txt, Some(&g_png), false).unwrap().unwrap();
+        assert_eq!(o.results["output"], g_png.display().to_string());
         let err = grob_to_png(&fixture("48sx-R"), Some(&tmp("r.png")), false).unwrap_err();
         assert!(
             err.to_string().contains("holds a Real Number, not a GROB"),
@@ -725,10 +765,30 @@ mod tests {
         );
     }
 
+    /// security.md "Offline converters write next to the input file": the
+    /// default output is the input's file name in the current directory.
     #[test]
-    fn sibling_names() {
-        assert_eq!(sibling(Path::new("a/x.hp"), "txt"), Path::new("a/x.txt"));
-        assert_eq!(sibling(Path::new("PRG"), "hp"), Path::new("PRG.hp"));
-        assert_eq!(sibling(Path::new("x.hp"), "hp"), Path::new("x.hp.hp"));
+    fn default_outputs_go_to_the_current_directory() {
+        let d = default_output;
+        assert_eq!(d(Path::new("a/x.hp"), "txt"), Path::new("x.txt"));
+        assert_eq!(d(Path::new("/tmp/dl/pic.hp"), "png"), Path::new("pic.png"));
+        assert_eq!(d(Path::new("../PRG"), "hp"), Path::new("PRG.hp"));
+        assert_eq!(d(Path::new("x.hp"), "hp"), Path::new("x.hp.hp"));
+    }
+
+    /// Audit PR #18, #14: `grob to-png -` without `-o` writes to stdout,
+    /// not to `./-.png`.
+    #[test]
+    fn grob_from_stdin_goes_to_stdout() {
+        assert_eq!(png_output(Path::new("-"), None), None);
+        assert_eq!(png_output(Path::new("x.hp"), Some(Path::new("-"))), None);
+        assert_eq!(
+            png_output(Path::new("-"), Some(Path::new("o.png"))),
+            Some(PathBuf::from("o.png"))
+        );
+        assert_eq!(
+            png_output(Path::new("d/x.hp"), None),
+            Some(PathBuf::from("x.png"))
+        );
     }
 }

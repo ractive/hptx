@@ -15,7 +15,8 @@ use kermit_proto::{Command, OutgoingFile};
 
 use crate::charset::{decode, encode, encode_command};
 use crate::grob::Grob;
-use crate::object::{KERMIT_PADDING_ALLOWANCE, ObjectType, inspect, strip_padding};
+use crate::object::{HEADER_LEN, KERMIT_PADDING_ALLOWANCE, ObjectType, inspect};
+use crate::object::{object_size, strip_padding, unpack};
 use crate::reply::{Iopar, Listing, StackReply, parse_list, parse_listing, parse_real};
 use crate::reply::{parse_name, parse_stack, parse_string};
 use crate::session::Session;
@@ -29,7 +30,8 @@ const PICT_VAR: &str = "HPTXTMP";
 const BACKUP_VAR: &str = "HPTXBK";
 /// Temporary variable and port-0 object for [`Calculator::restore`].
 const RESTORE_VAR: &str = "HPTXRS";
-/// Reply timeout for the final `RESTORE`, which never gets a reply.
+/// Reply timeout for the final `RESTORE`, which never gets a reply (the
+/// session's timeout when that is shorter).
 const RESTORE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Calculator model, as far as the ROM version text tells.
@@ -134,9 +136,10 @@ impl Calculator {
     /// the marker is ours: the marker is dropped (every copy of it on top
     /// of the stack, in case an earlier attempt was not eaten after all).
     /// Any other reply was a late one and our command was eaten: the marker
-    /// command is sent once more. Nothing but the marker is ever dropped,
-    /// nothing else is ever resent, and an odd reply is never an error;
-    /// link errors are returned.
+    /// command is sent once more. Nothing but the marker is ever dropped
+    /// and nothing else is ever resent. Link errors are returned; a second
+    /// odd reply is [`Error::Reply`]: hptx and the calculator are not in
+    /// step, and nothing is run on a stack it cannot vouch for.
     pub fn sync(&mut self) -> Result<()> {
         self.sync_with(&sync_marker())
     }
@@ -144,19 +147,14 @@ impl Calculator {
     fn sync_with(&mut self, marker: &str) -> Result<()> {
         let command = format!("\"{marker}\"");
         for attempt in 0..2 {
-            // The first attempt gets one timeout period and no retries, so
-            // a stalled exchange costs one `timeout` (20 s by default), not
-            // the whole retry budget; the second has the normal budget.
+            // The first attempt is sent once and gets one timeout period
+            // (20 s by default), not the whole retry budget; the second has
+            // the normal budget: the marker is the one command that may
+            // safely run twice, only markers are ever dropped.
             let result = if attempt == 0 {
-                let normal = self.session.config().clone();
-                let mut once = normal.clone();
-                once.retries = 0;
-                self.session.set_config(once);
-                let result = self.host(&command);
-                self.session.set_config(normal);
-                result
-            } else {
                 self.host(&command)
+            } else {
+                self.host_retrying(&command)
             };
             let reply = match result {
                 // The calculator aborted a transfer left over from the dead
@@ -167,7 +165,7 @@ impl Calculator {
                 // stalled (seen on the emulated 49G under load: the marker
                 // ran, its reply never came). Once more: the second reply
                 // shows both markers and both are dropped.
-                Err(Error::Kermit(kermit_proto::Error::Timeout)) if attempt == 0 => continue,
+                Err(Error::NoReply { .. }) if attempt == 0 => continue,
                 reply => reply?,
             };
             let ours = reply
@@ -185,7 +183,9 @@ impl Calculator {
                 return Ok(());
             }
         }
-        Ok(())
+        Err(Error::Reply(format!(
+            "not in step with the calculator: neither reply showed the sync marker {marker}"
+        )))
     }
 
     /// The underlying session. Forgets the cached transfer mode, since the
@@ -198,13 +198,46 @@ impl Calculator {
     /// Run a host command (Unicode or ASCII trigraphs such as `\->`) and
     /// return the stack. An `Error:` reply is `Ok` with `error` set. Forgets
     /// the cached transfer mode, since the command may change flag -35.
+    /// The command is sent once: no reply in time is [`Error::NoReply`],
+    /// never a second run.
     pub fn run(&mut self, command: &str) -> Result<StackReply> {
         self.mode = None;
         self.host(command)
     }
 
-    /// Send `command` as a `C` packet and parse the stack reply.
+    /// Send `command` as a `C` packet exactly once and parse the stack
+    /// reply. A `C` resent after a lost or late ACK runs again on the
+    /// calculator, which cannot tell it from a new command, so the packet
+    /// is never retransmitted: no retries, and a NAK (usually a stale one
+    /// from the idle server) does not shorten the wait. No reply within the
+    /// timeout is [`Error::NoReply`].
     fn host(&mut self, command: &str) -> Result<StackReply> {
+        let timeout = self.session.config().timeout;
+        self.host_once(command, timeout)
+    }
+
+    /// [`host`](Calculator::host) with a reply timeout of `timeout`.
+    fn host_once(&mut self, command: &str, timeout: Duration) -> Result<StackReply> {
+        let normal = self.session.config().clone();
+        let mut once = normal.clone();
+        once.timeout = timeout;
+        once.retries = 0;
+        once.nak_grace = timeout;
+        self.session.set_config(once);
+        let result = self.host_retrying(command);
+        self.session.set_config(normal);
+        match result {
+            Err(Error::Kermit(kermit_proto::Error::Timeout)) => Err(Error::NoReply {
+                command: command.to_string(),
+            }),
+            other => other,
+        }
+    }
+
+    /// Send `command` as a `C` packet with the session's retries and parse
+    /// the stack reply. Only for a command that may run twice (the sync
+    /// marker).
+    fn host_retrying(&mut self, command: &str) -> Result<StackReply> {
         let bytes = encode_command(command)?;
         let transcript = self.session.transact(Command::Host(bytes))?;
         Ok(parse_stack(&decode(&transcript.text)))
@@ -512,15 +545,10 @@ impl Calculator {
     /// binary PUT as `HPTXRS`, copy to port 0, `RESTORE` from there. The
     /// calculator warm-starts and leaves server mode; restart `SERVER` on
     /// it, then call [`Calculator::purge_restore_leftover`] to delete
-    /// `:0:HPTXRS`.
+    /// `:0:HPTXRS`. `data` must be a Directory whose object walk succeeds
+    /// (a truncated file never reaches `RESTORE`).
     pub fn restore(&mut self, data: &[u8]) -> Result<()> {
-        let info = inspect(data).map_err(|e| Error::Object(format!("not a backup: {e}")))?;
-        if info.object_type != Some(ObjectType::Directory) {
-            return Err(Error::Object(format!(
-                "not a backup: prolog {:05X} is not a directory",
-                info.prolog
-            )));
-        }
+        check_backup(data)?;
         self.refuse_existing(RESTORE_VAR)?;
         let stored = self.put(RESTORE_VAR, data, TransferMode::Binary)?;
         if stored != RESTORE_VAR {
@@ -537,22 +565,47 @@ impl Calculator {
             let _ = self.exec(&[format!("'{RESTORE_VAR}' PGDIR")]);
             return Err(e);
         }
-        // The warm start ends server mode: no reply ever comes.
-        let previous = self.session.config().clone();
-        let mut restore = previous.clone();
-        restore.timeout = RESTORE_TIMEOUT;
-        restore.retries = 0;
-        self.session.set_config(restore);
-        let result = self.host(&format!(":0:{RESTORE_VAR} RESTORE"));
-        self.session.set_config(previous);
+        self.restore_from_port()
+    }
+
+    /// `RESTORE` from `:0:HPTXRS`. The warm start ends server mode, so no
+    /// reply ever comes; but no reply is also what a lost `C` gives. A
+    /// probe tells the two apart: the calculator still answering means
+    /// `RESTORE` did not run ([`Error::Reply`], `:0:HPTXRS` stays).
+    fn restore_from_port(&mut self) -> Result<()> {
         self.mode = None;
-        match result {
-            Err(Error::Kermit(kermit_proto::Error::Timeout)) => Ok(()),
+        let timeout = self.session.config().timeout;
+        let restore = format!(":0:{RESTORE_VAR} RESTORE");
+        match self.host_once(&restore, RESTORE_TIMEOUT.min(timeout)) {
+            Err(Error::NoReply { .. }) => {}
+            Err(e) => return Err(e),
+            Ok(reply) => {
+                checked(reply)?;
+                return Err(Error::Reply("calculator did not restart".into()));
+            }
+        }
+        let marker = sync_marker();
+        let probe = self.host_once(&format!("\"{marker}\""), timeout);
+        let still_running = || {
+            Error::Reply(format!(
+                "RESTORE did not run: the calculator still answers in server mode; HOME is \
+                 unchanged and the backup stays in :0:{RESTORE_VAR}"
+            ))
+        };
+        match probe {
+            Err(Error::NoReply { .. }) => Ok(()),
+            Err(Error::Remote(_)) => Err(still_running()),
             Err(e) => Err(e),
-            Ok(reply) => match checked(reply) {
-                Err(e) => Err(e),
-                Ok(_) => Err(Error::Reply("calculator did not restart".into())),
-            },
+            Ok(reply) => {
+                if reply.error.is_none()
+                    && reply.level(1).and_then(parse_string).as_deref() == Some(marker.as_str())
+                {
+                    // Best effort: the probe's own marker; the error matters
+                    // more.
+                    let _ = self.drop_levels(1);
+                }
+                Err(still_running())
+            }
         }
     }
 
@@ -699,6 +752,21 @@ pub fn sync_marker() -> String {
     format!("HPTX-{:06x}", hasher.finish() & 0xFF_FFFF)
 }
 
+/// Check that `data` is a backup [`Calculator::restore`] can upload: a
+/// binary Directory object whose size walk succeeds.
+fn check_backup(data: &[u8]) -> Result<()> {
+    let info = inspect(data).map_err(|e| Error::Object(format!("not a backup: {e}")))?;
+    if info.object_type != Some(ObjectType::Directory) {
+        return Err(Error::Object(format!(
+            "not a backup: prolog {:05X} is not a directory",
+            info.prolog
+        )));
+    }
+    let nibbles = unpack(data.get(HEADER_LEN..).unwrap_or_default());
+    object_size(&nibbles, 0).map_err(|e| Error::Object(format!("not a backup: {e}")))?;
+    Ok(())
+}
+
 /// Turn a reply with an error into [`Error::Calculator`].
 fn checked(reply: StackReply) -> Result<StackReply> {
     match reply.error {
@@ -717,8 +785,12 @@ fn quote(name: &str) -> Result<String> {
 }
 
 /// Check that `name` is a plain global variable name: 1 to 127 characters,
-/// not starting with a digit or `.`, no whitespace, control characters or
-/// RPL delimiters and operators, encodable in the HP character set.
+/// not starting with a digit or `.`, no whitespace, control characters,
+/// backslash or RPL delimiters and operators, encodable in the HP character
+/// set. The names Windows reserves for devices (`CON`, `NUL`, `COM1`, ...,
+/// also with an extension such as `NUL.X`, any case) are refused on every
+/// platform: a name is the default file name of a download, and the
+/// calculator has commands of most of these names anyway.
 pub fn validate_name(name: &str) -> Result<()> {
     let bad = || Error::Name(name.to_string());
     let count = name.chars().count();
@@ -732,6 +804,7 @@ pub fn validate_name(name: &str) -> Result<()> {
             || matches!(
                 c,
                 '\'' | '"'
+                    | '\\'
                     | '«'
                     | '»'
                     | '{'
@@ -754,11 +827,26 @@ pub fn validate_name(name: &str) -> Result<()> {
                     | '>'
             )
     };
-    if name.chars().any(forbidden) {
+    if name.chars().any(forbidden) || is_windows_device(name) {
         return Err(bad());
     }
     encode(name).map_err(|_| bad())?;
     Ok(())
+}
+
+/// `CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9` or `LPT1`-`LPT9`, in any case,
+/// alone or before a `.`.
+fn is_windows_device(name: &str) -> bool {
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    match stem.as_bytes() {
+        b"CON" | b"PRN" | b"AUX" | b"NUL" => true,
+        [b'C', b'O', b'M', d] | [b'L', b'P', b'T', d] => (b'1'..=b'9').contains(d),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -896,14 +984,28 @@ mod tests {
     /// command are `replies` in order (then an empty stack); the log of
     /// what was sent.
     fn sync_against(replies: Vec<&'static str>) -> Vec<String> {
+        let (result, log) = try_sync_against(replies);
+        result.unwrap();
+        log
+    }
+
+    /// [`sync_against`] without the unwrap.
+    fn try_sync_against(replies: Vec<&'static str>) -> (Result<()>, Vec<String>) {
         let mut replies = replies.into_iter();
         let (mut c, log) = calc(move |cmd| match cmd {
             MARKER_CMD => replies.next().unwrap_or(EMPTY).into(),
             "DROP" | "DROP2" => EMPTY.into(),
             _ => panic!("unexpected {cmd}"),
         });
-        c.sync_with(MARKER).unwrap();
-        sent(&log)
+        let result = c.sync_with(MARKER);
+        (result, sent(&log))
+    }
+
+    fn assert_not_in_step(result: Result<()>) {
+        assert!(
+            matches!(&result, Err(Error::Reply(m)) if m.contains("not in step")),
+            "{result:?}"
+        );
     }
 
     #[test]
@@ -988,10 +1090,9 @@ mod tests {
             sync_against(vec!["E:Transfer Failed", ours]),
             [MARKER_CMD, MARKER_CMD, "DROP"]
         );
-        assert_eq!(
-            sync_against(vec!["E:Transfer Failed", "E:Transfer Failed"]),
-            [MARKER_CMD, MARKER_CMD]
-        );
+        let (result, log) = try_sync_against(vec!["E:Transfer Failed", "E:Transfer Failed"]);
+        assert_eq!(log, [MARKER_CMD, MARKER_CMD]);
+        assert_not_in_step(result);
     }
 
     /// The first marker command ran but its reply never came (timeout): the
@@ -1033,16 +1134,120 @@ mod tests {
         assert!(log.iter().all(|c| c == MARKER_CMD), "{log:?}");
     }
 
+    /// Audit PR #18, #2: two odd replies in a row are an error (they used
+    /// to be accepted as success). Nothing is dropped and there is no third
+    /// attempt: a marker below level 1 or another marker is not ours to
+    /// drop.
     #[test]
     fn sync_never_drops_what_it_did_not_push() {
-        // A late error reply, then an empty stack: accepted, nothing
-        // dropped, no error, no third attempt. A marker below level 1 or
-        // another marker is not ours to drop either.
         let error = "Error: Bad Argument Type\r\n1:                  1\r\n";
-        assert_eq!(sync_against(vec![error, EMPTY]), [MARKER_CMD, MARKER_CMD]);
+        let (result, log) = try_sync_against(vec![error, EMPTY]);
+        assert_eq!(log, [MARKER_CMD, MARKER_CMD]);
+        assert_not_in_step(result);
         let below = "2:      \"HPTX-0a1b2c\"\r\n1:                  1\r\n";
         let other = "1:      \"HPTX-ffffff\"\r\n";
-        assert_eq!(sync_against(vec![below, other]), [MARKER_CMD, MARKER_CMD]);
+        let (result, log) = try_sync_against(vec![below, other]);
+        assert_eq!(log, [MARKER_CMD, MARKER_CMD]);
+        assert_not_in_step(result);
+    }
+
+    /// Audit PR #18, #1: a host command goes out once. Its reply is late
+    /// (never comes here) and the server's NAK crosses it: no `C` is
+    /// resent, neither after the NAK nor after the timeout, and the error
+    /// says the command may have run.
+    #[test]
+    fn host_command_is_never_resent() {
+        let log: Log = Arc::default();
+        let mut server = fake_server(Arc::clone(&log), |_| "SILENT".into());
+        let check = BlockCheck::Type1;
+        let mut deframer = Deframer::new();
+        let transport = MemoryTransport::new(move |bytes: &[u8]| {
+            let mut out = server(bytes);
+            // A NAK right after each C: a stale one from the idle server,
+            // or the server asking for the C again.
+            deframer.push(bytes);
+            while let Some(frame) = deframer.next_frame() {
+                if parse_frame(&frame, check).unwrap().kind == b'C' {
+                    let nak = Packet::new(0, b'N', Vec::new());
+                    out.push(nak.encode(check, &Framing::default()).unwrap());
+                }
+            }
+            out
+        });
+        let mut kermit = Options::default().kermit;
+        kermit.timeout = Duration::from_millis(300);
+        let options = Options {
+            kermit,
+            drain: Duration::ZERO,
+            turnaround: Duration::ZERO,
+        };
+        let mut c = Calculator::new(Session::new(Box::new(transport), options).unwrap());
+        let start = std::time::Instant::now();
+        let err = c.run("1 'X' STO+").unwrap_err();
+        assert!(
+            matches!(&err, Error::NoReply { command } if command == "1 'X' STO+"),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("may have run"), "{err}");
+        assert_eq!(sent(&log), ["1 'X' STO+"]);
+        // The NAK did not cut the wait short (the old grace was 1 s, here
+        // longer than the timeout; the deadline is the full timeout).
+        assert!(start.elapsed() >= Duration::from_millis(300));
+        // The session's own budget is back for the next transaction.
+        assert_eq!(
+            c.session().config().retries,
+            Options::default().kermit.retries
+        );
+    }
+
+    /// Audit PR #18, #3: a backup whose directory walk fails (here cut in
+    /// half) is refused before anything is sent; it used to pass on its
+    /// Directory prolog alone and reach RESTORE.
+    #[test]
+    fn restore_refuses_a_truncated_backup() {
+        let path = format!("{}/fixtures/48sx-D1.hp", env!("CARGO_MANIFEST_DIR"));
+        let full = std::fs::read(path).unwrap();
+        let cut = &full[..full.len() / 2];
+        assert_eq!(
+            inspect(cut).unwrap().object_type,
+            Some(ObjectType::Directory)
+        );
+        let (mut c, log) = calc(|cmd| panic!("unexpected {cmd}"));
+        let err = c.restore(cut).unwrap_err();
+        assert!(
+            matches!(&err, Error::Object(m) if m.starts_with("not a backup")),
+            "{err:?}"
+        );
+        assert!(sent(&log).is_empty());
+    }
+
+    /// Audit PR #18, #9: no reply to RESTORE is success only when the probe
+    /// after it gets no reply either (the warm start ended server mode).
+    #[test]
+    fn restore_probe_after_the_silent_restore() {
+        const RESTORE: &str = ":0:HPTXRS RESTORE";
+        // RESTORE ran: the calculator is gone, the probe times out.
+        let (mut c, log) = calc(|_| "SILENT".into());
+        c.restore_from_port().unwrap();
+        let log = sent(&log);
+        assert_eq!(log.len(), 2, "{log:?}");
+        assert_eq!(log[0], RESTORE);
+        assert!(log[1].starts_with("\"HPTX-"), "{log:?}");
+
+        // The RESTORE command was lost: the server still answers the probe.
+        let (mut c, log) = calc(|cmd| match cmd {
+            RESTORE => "SILENT".into(),
+            "DROP" => EMPTY.into(),
+            probe => format!("1: {probe}\r\n"),
+        });
+        let err = c.restore_from_port().unwrap_err();
+        assert!(
+            matches!(&err, Error::Reply(m) if m.starts_with("RESTORE did not run")),
+            "{err:?}"
+        );
+        let log = sent(&log);
+        assert_eq!(log.len(), 3, "{log:?}");
+        assert_eq!(log[2], "DROP", "the probe's marker is dropped");
     }
 
     #[test]
@@ -1379,6 +1584,11 @@ mod tests {
             "x\u{0304}",
             "Σ1",
             "a.b",
+            "CONS",
+            "COM0",
+            "COM10",
+            "LPT",
+            "XNUL",
             &"N".repeat(127),
         ] {
             assert!(validate_name(ok).is_ok(), "{ok:?}");
@@ -1409,6 +1619,16 @@ mod tests {
             "A>B",
             "A\u{1}",
             "A\u{263A}",
+            // security.md "Windows file names": backslash and device names.
+            "A\\B",
+            "CON",
+            "nul",
+            "Aux",
+            "PRN",
+            "COM1",
+            "lpt9",
+            "NUL.X",
+            "con.txt",
             &"N".repeat(128),
         ] {
             assert!(matches!(validate_name(bad), Err(Error::Name(_))), "{bad:?}");

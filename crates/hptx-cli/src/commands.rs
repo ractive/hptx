@@ -1,7 +1,7 @@
 //! The commands: connect, act, build an [`Outcome`].
 
 use std::fmt::Write as _;
-use std::io::{IsTerminal, Read, Write};
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -283,8 +283,8 @@ impl Ctx {
             Command::Finish => self.finish()?,
             Command::Xserv { command } => return self.xserv(command),
             Command::Object {
-                command: ObjectCommand::Inspect { files },
-            } => offline::inspect(&files)?,
+                command: ObjectCommand::Inspect { files, model },
+            } => offline::inspect(&files, model)?,
             Command::Object {
                 command: ObjectCommand::Convert(args),
             } => return offline::convert(&args),
@@ -318,8 +318,9 @@ impl Ctx {
     /// Open the link, finish a pending restore cleanup, change to `--dir`.
     pub(crate) fn connect(&mut self) -> Result<Calculator> {
         let mut calc = self.open()?;
-        let marker = self.restore_marker();
-        if marker.exists() {
+        if let Some(marker) = self.restore_marker()
+            && marker_pending(&marker)
+        {
             if purge_leftover(&mut calc).context("deleting :0:HPTXRS left by restore")? {
                 eprintln!("note: deleted {RESTORE_LEFTOVER}, left in port 0 by hptx restore");
             }
@@ -346,15 +347,19 @@ impl Ctx {
         Ok(calc)
     }
 
-    /// A file in the temp directory that says a restore on this port still
-    /// needs its cleanup.
-    fn restore_marker(&self) -> PathBuf {
+    /// A file in hptx's per-user data directory (beside the REPL history)
+    /// that says a restore on this port still needs its cleanup; `None`
+    /// without a data directory.
+    fn restore_marker(&self) -> Option<PathBuf> {
         let addr = self.link.addr.as_deref().unwrap_or_default();
         let safe: String = addr
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
             .collect();
-        std::env::temp_dir().join(format!("hptx-restore-pending-{safe}"))
+        let dir = crate::repl::data_dir(crate::repl::Platform::current(), |name| {
+            std::env::var_os(name)
+        })?;
+        Some(dir.join(format!("restore-pending-{safe}")))
     }
 
     fn ports(&self) -> Result<Outcome> {
@@ -707,16 +712,7 @@ impl Ctx {
             }
             (None, false) => util::name_from_file(&args.file).unwrap_or_default(),
         };
-        let data = if from_stdin {
-            let mut buf = Vec::new();
-            std::io::stdin()
-                .read_to_end(&mut buf)
-                .context("reading stdin")?;
-            buf
-        } else {
-            std::fs::read(&args.file)
-                .with_context(|| format!("cannot read {}", args.file.display()))?
-        };
+        let data = util::read_input(&args.file)?;
         if validate_name(&name).is_err() {
             return Err(Hinted::new(
                 format!("{name:?} is not a valid calculator name"),
@@ -885,7 +881,8 @@ impl Ctx {
 
     /// Replace the existing variable `name`: send `data` as [`PUT_TEMP`],
     /// then delete `name` and rename the temporary to it. A failed transfer
-    /// leaves the old variable untouched. Returns the final name.
+    /// leaves the old variable untouched, and so does a temporary stored
+    /// under any other name than [`PUT_TEMP`]. Returns the final name.
     fn put_replacing(
         &self,
         calc: &mut Calculator,
@@ -893,6 +890,7 @@ impl Ctx {
         data: &[u8],
         mode: TransferMode,
     ) -> Result<String> {
+        let q_name = shell_quote(name);
         let temp = match calc.put(PUT_TEMP, data, mode) {
             Ok(stored) => stored,
             Err(e) => {
@@ -908,13 +906,34 @@ impl Ctx {
                 )));
             }
         };
+        // The calculator says where it stored the object; nothing is purged
+        // on its word unless that is the temporary we asked for.
+        if temp != PUT_TEMP {
+            let hint = if validate_name(&temp).is_ok() {
+                format!(
+                    "check `{}`, then delete the new copy with `{}`",
+                    self.cmd("ls"),
+                    self.cmd(&format!("rm {}", shell_quote(&temp)))
+                )
+            } else {
+                format!("check `{}` and delete the new copy by hand", self.cmd("ls"))
+            };
+            return Err(Hinted::new(
+                format!(
+                    "put {name}: the calculator stored the new object as {temp}, not \
+                     {PUT_TEMP}; the old {name} is unchanged"
+                ),
+                hint,
+            )
+            .into());
+        }
         if let Err(e) = calc.remove(name) {
             return Err(anyhow::Error::new(e).context(Hinted::new(
                 format!("deleting the old {name} failed; the new one is stored as {temp}"),
                 format!(
                     "`{}` then `{}`",
-                    self.cmd(&format!("rm {name}")),
-                    self.cmd(&format!("mv {temp} {name}"))
+                    self.cmd(&format!("rm {q_name}")),
+                    self.cmd(&format!("mv {temp} {q_name}"))
                 ),
             )));
         }
@@ -923,7 +942,7 @@ impl Ctx {
                 format!("the old {name} is deleted but renaming {temp} to {name} failed"),
                 format!(
                     "the new object is in {temp}: `{}`",
-                    self.cmd(&format!("mv {temp} {name}"))
+                    self.cmd(&format!("mv {temp} {q_name}"))
                 ),
             )));
         }
@@ -1104,26 +1123,8 @@ impl Ctx {
             bail!("restore needs a FILE or --cleanup");
         };
         let label = file.display().to_string();
-        let data = std::fs::read(file).with_context(|| format!("cannot read {label}"))?;
-        let info = object::inspect(&data).map_err(|e| {
-            Hinted::new(
-                format!("{label} is not a backup: {e}"),
-                "restore takes a file written by `hptx backup`",
-            )
-        })?;
-        if info.object_type != Some(ObjectType::Directory) {
-            return Err(Hinted::new(
-                format!(
-                    "{label} is not a backup: it holds a {}, not a Directory",
-                    info.object_type.map_or("unknown object", ObjectType::name)
-                ),
-                format!(
-                    "to upload a single object use `{}`",
-                    self.cmd(&format!("put {}", shell_quote(&label)))
-                ),
-            )
-            .into());
-        }
+        let data = util::read_input(file)?;
+        self.check_backup(&label, &data)?;
         if args.dry_run {
             let mut calc = self.connect()?;
             let path = calc.path().context("PATH")?;
@@ -1164,8 +1165,10 @@ impl Ctx {
         // The restore runs in HOME's backup; --dir does not matter.
         self.status("Uploading the backup at 9600 baud (about 1 KB/s)...");
         calc.restore(&data).context("restore")?;
-        let marker = self.restore_marker();
-        let _ = std::fs::write(&marker, b"hptx restore cleanup pending\n");
+        if let Some(marker) = self.restore_marker() {
+            // Best effort: without it, `restore --cleanup` still works.
+            let _ = write_marker(&marker);
+        }
         Ok(Outcome {
             results: json!({
                 "file": label,
@@ -1191,6 +1194,43 @@ impl Ctx {
         })
     }
 
+    /// `data` (read from `label`) is a backup `restore` can upload: a
+    /// Directory whose object walk succeeds, so a truncated file fails
+    /// here and in `--dry-run`, not on the calculator.
+    fn check_backup(&self, label: &str, data: &[u8]) -> Result<()> {
+        let info = object::inspect(data).map_err(|e| {
+            Hinted::new(
+                format!("{label} is not a backup: {e}"),
+                "restore takes a file written by `hptx backup`",
+            )
+        })?;
+        if info.object_type != Some(ObjectType::Directory) {
+            return Err(Hinted::new(
+                format!(
+                    "{label} is not a backup: it holds a {}, not a Directory",
+                    info.object_type.map_or("unknown object", ObjectType::name)
+                ),
+                format!(
+                    "to upload a single object use `{}`",
+                    self.cmd(&format!("put {}", shell_quote(label)))
+                ),
+            )
+            .into());
+        }
+        if info.size_nibbles.is_none() {
+            return Err(Hinted::new(
+                format!("{label} is not a complete backup: its directory cannot be walked"),
+                format!(
+                    "the file is truncated or damaged; `hptx object inspect {}` shows where \
+                     the walk fails",
+                    shell_quote(label)
+                ),
+            )
+            .into());
+        }
+        Ok(())
+    }
+
     fn restore_cleanup(&mut self, dry_run: bool) -> Result<Outcome> {
         let mut calc = self.open()?;
         let marker = self.restore_marker();
@@ -1204,7 +1244,9 @@ impl Ctx {
             });
         }
         let deleted = purge_leftover(&mut calc).context("restore --cleanup")?;
-        let _ = std::fs::remove_file(&marker);
+        if let Some(marker) = marker {
+            let _ = std::fs::remove_file(marker);
+        }
         Ok(Outcome {
             results: json!({"leftover": RESTORE_LEFTOVER, "deleted": deleted}),
             total: None,
@@ -1400,6 +1442,28 @@ fn purge_leftover(calc: &mut Calculator) -> Result<bool> {
     }
 }
 
+/// Write the restore marker `path`: never through a symbolic link or over
+/// another file (`create_new`); an existing marker is fine.
+fn write_marker(path: &Path) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(mut f) => f.write_all(b"hptx restore cleanup pending\n"),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && marker_pending(path) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Only a regular file is a restore marker (a symbolic link is not).
+fn marker_pending(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file())
+}
+
 /// Ask on the terminal; fail without one.
 fn confirm(question: &str) -> Result<()> {
     if !std::io::stdin().is_terminal() {
@@ -1535,6 +1599,147 @@ mod tests {
         assert_eq!(ctx(global.clone(), false).cmd("ls"), "hptx ls");
         global.port = None;
         assert_eq!(ctx(global, true).cmd("ls"), "hptx ls");
+    }
+
+    fn text_ctx() -> Ctx {
+        Ctx {
+            global: Global {
+                port: None,
+                dir: None,
+                timeout: 20,
+                retries: 5,
+                format: None,
+                json: false,
+                jq: None,
+            },
+            format: Format::Text,
+            link: LinkInfo::default(),
+            port_on_command_line: false,
+        }
+    }
+
+    fn put_args(name: &str) -> PutArgs {
+        PutArgs {
+            file: PathBuf::from("x.hp"),
+            name: Some(name.into()),
+            ascii: false,
+            binary: false,
+            overwrite: true,
+            dry_run: false,
+            xmodem: XmodemArgs {
+                protocol: Protocol::Kermit,
+                start_timeout: None,
+            },
+        }
+    }
+
+    /// Audit PR #18, #12: the restore marker is created new, never through
+    /// a symbolic link, and only a regular file counts as one.
+    #[cfg(unix)]
+    #[test]
+    fn restore_marker_never_follows_a_symlink() {
+        let dir = std::env::temp_dir().join(format!("hptx-marker-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Another test's rustyline narrows the process umask for a moment.
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        let victim = dir.join("victim");
+        std::fs::write(&victim, b"precious\n").unwrap();
+        let link = dir.join("restore-pending-link");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        assert!(!marker_pending(&link));
+        assert!(write_marker(&link).is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious\n");
+        let marker = dir.join("restore-pending-x");
+        write_marker(&marker).unwrap();
+        assert!(marker_pending(&marker));
+        write_marker(&marker).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Audit PR #18, #3: a truncated backup fails the CLI check that
+    /// `restore --dry-run` also runs.
+    #[test]
+    fn restore_checks_the_whole_backup() {
+        let path = format!(
+            "{}/../hptx-core/fixtures/49g-D1.hp",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let full = std::fs::read(path).unwrap();
+        let ctx = text_ctx();
+        ctx.check_backup("d1.hp", &full).unwrap();
+        let err = ctx
+            .check_backup("d1.hp", &full[..full.len() - 10])
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("d1.hp is not a complete backup"),
+            "{err}"
+        );
+    }
+
+    /// Audit PR #18, #6: `put --overwrite` checks the name the calculator
+    /// stored the temporary under before it deletes anything; a wrong name
+    /// leaves the old variable alone.
+    #[test]
+    fn put_overwrite_checks_the_stored_name_first() {
+        let (mut calc, log) = crate::testkit::calc(|cmd| match cmd {
+            "G D" => "X 10.5 Real Number 1234\r\n".into(),
+            "SEND HPTXPT" => "HPTXPT.1".into(),
+            "-35 SF" => "Empty Stack\r\n".into(),
+            _ => panic!("unexpected {cmd}"),
+        });
+        let ctx = text_ctx();
+        let args = put_args("X");
+        let err = ctx
+            .put_on(&mut calc, &args, "X", b"data", "x.hp", TransferMode::Binary)
+            .unwrap_err();
+        let failure = describe(&err, &LinkInfo::default());
+        assert!(
+            failure.error.contains("stored the new object as HPTXPT.1")
+                && failure.error.contains("the old X is unchanged"),
+            "{failure:?}"
+        );
+        assert_eq!(crate::testkit::sent(&log), ["G D", "-35 SF", "SEND HPTXPT"]);
+    }
+
+    /// Audit PR #18, #13: every name in a hint command is shell-quoted,
+    /// the user's and the calculator's alike.
+    #[test]
+    fn hint_names_are_shell_quoted() {
+        // Delete of the old variable fails: the hint names it twice.
+        let name = "a b;rm";
+        let (mut calc, _) = crate::testkit::calc(move |cmd| match cmd {
+            "G D" => "Empty Stack\r\n".into(),
+            "SEND HPTXPT" => "HPTXPT".into(),
+            _ => "Empty Stack\r\n".into(),
+        });
+        let ctx = text_ctx();
+        let err = ctx
+            .put_replacing(&mut calc, name, b"data", TransferMode::Binary)
+            .unwrap_err();
+        let hint = describe(&err, &LinkInfo::default()).hint.unwrap();
+        assert!(
+            hint.contains("`hptx rm 'a b;rm'`") && hint.contains("`hptx mv HPTXPT 'a b;rm'`"),
+            "{hint}"
+        );
+        // A temporary stored under a name with a space and a semicolon.
+        let (mut calc, _) = crate::testkit::calc(|cmd| match cmd {
+            "SEND HPTXPT" => "X;Y Z".into(),
+            _ => "Empty Stack\r\n".into(),
+        });
+        let err = ctx
+            .put_replacing(&mut calc, "X", b"data", TransferMode::Binary)
+            .unwrap_err();
+        let hint = describe(&err, &LinkInfo::default()).hint.unwrap();
+        assert!(!hint.contains("rm X;Y Z"), "{hint}");
+        // reply_hint: names from hptx-core's messages.
+        let f = describe(
+            &anyhow::Error::new(Error::Reply("it's: already exists".into())),
+            &LinkInfo::default(),
+        );
+        assert!(f.hint.unwrap().contains(r"`hptx rm 'it'\''s'`"));
     }
 
     #[test]

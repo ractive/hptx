@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use hptx_core::Error;
 
-use crate::output::Failure;
+use crate::output::{Failure, shell_quote};
 
 /// An error that already knows what the user should do.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,14 +50,16 @@ const TEMP_VARS: &[&str] = &["HPTXTMP", "HPTXBK", "HPTXRS", "HPTXPT"];
 /// Describe `err` (with its context chain) for the user.
 pub fn describe(err: &anyhow::Error, link: &LinkInfo) -> Failure {
     let message = chain_text(err);
+    // anyhow's own downcast also finds a `Hinted` given as context, which
+    // the chain's causes do not show as one.
+    if let Some(h) = err.downcast_ref::<Hinted>() {
+        return Failure {
+            error: message,
+            hint: Some(h.hint.clone()),
+            stack: None,
+        };
+    }
     for cause in err.chain() {
-        if let Some(h) = cause.downcast_ref::<Hinted>() {
-            return Failure {
-                error: message,
-                hint: Some(h.hint.clone()),
-                stack: None,
-            };
-        }
         if let Some(e) = cause.downcast_ref::<Error>() {
             return core_failure(message, e, link);
         }
@@ -108,6 +110,12 @@ fn core_failure(message: String, err: &Error, link: &LinkInfo) -> Failure {
                 stack: None,
             };
         }
+        Error::NoReply { .. } => Some(
+            "check on the calculator whether the command ran before running it again (hptx \
+             never sends a command twice); if it is still busy, wait or press ON (ATTN) to \
+             stop it. If it shows \"Awaiting Server Cmd.\", check the cable"
+                .into(),
+        ),
         Error::Kermit(_) => Some(
             "the transfer broke off; run the command again. If it keeps failing, check the \
              cable and that the calculator runs SERVER at 9600 baud"
@@ -139,7 +147,8 @@ fn core_failure(message: String, err: &Error, link: &LinkInfo) -> Failure {
         )),
         Error::Name(_) => Some(
             "calculator names start with a letter and have no spaces, quotes, brackets, \
-             # : , ; or + - * / ^ = < >; choose one with --as NAME"
+             # : , ; \\ or + - * / ^ = < >, and are not a Windows device name (CON, NUL, \
+             COM1, ...); choose one with --as NAME"
                 .into(),
         ),
         Error::Charset(_) => {
@@ -187,13 +196,15 @@ fn core_failure(message: String, err: &Error, link: &LinkInfo) -> Failure {
     }
 }
 
-/// Hints for the checks hptx-core makes before acting.
+/// Hints for the checks hptx-core makes before acting. Names in commands
+/// are shell-quoted: they come from the calculator or the user.
 fn reply_hint(text: &str) -> Option<String> {
     let name = text.split([' ', ':']).next().unwrap_or_default();
+    let q = shell_quote(name);
     if text.contains("exists in the current directory") && TEMP_VARS.contains(&name) {
         return Some(format!(
             "{name} is hptx's temporary variable, probably left by an interrupted run: \
-             `hptx get {name}` to keep it, then `hptx rm {name}` (or `hptx mv {name} OTHER`)"
+             `hptx get {q}` to keep it, then `hptx rm {q}` (or `hptx mv {q} OTHER`)"
         ));
     }
     if text.ends_with("no such variable") || text.ends_with("no such directory") {
@@ -201,8 +212,22 @@ fn reply_hint(text: &str) -> Option<String> {
     }
     if text.ends_with("already exists") {
         return Some(format!(
-            "choose another name, or `hptx rm {name}` first (`--dry-run` shows what goes)"
+            "choose another name, or `hptx rm {q}` first (`--dry-run` shows what goes)"
         ));
+    }
+    if text.starts_with("not in step with the calculator") {
+        return Some(
+            "another program or an aborted command may still be talking to the calculator: \
+             press ON (ATTN) on it if it is busy, check that it shows \"Awaiting Server Cmd.\", \
+             and run the command again"
+                .into(),
+        );
+    }
+    if text.starts_with("RESTORE did not run") {
+        return Some(
+            "`hptx restore --cleanup` deletes the copy in port 0; then run the restore again"
+                .into(),
+        );
     }
     None
 }

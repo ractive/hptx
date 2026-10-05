@@ -9,7 +9,7 @@
 //! command packet, reply packets) has been seen on a real calculator yet.
 
 use std::fmt::Write as _;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -293,6 +293,21 @@ fn dry_run_outcome(command: &XservCommand, what: String) -> Result<Outcome> {
     })
 }
 
+/// The RPL that changes to `dir` from HOME, e.g. `HOME A B`. Each component
+/// is evaluated by the calculator, so it must be a plain name
+/// ([`validate_name`]), as for `Calculator::cd`.
+fn dir_command(dir: &str) -> Result<String> {
+    let components = util::parse_dir(dir);
+    for name in &components {
+        validate_name(name)
+            .with_context(|| format!("xserv: cd {}", util::dir_string(&components)))?;
+    }
+    Ok(std::iter::once("HOME")
+        .chain(components.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" "))
+}
+
 impl Ctx {
     /// Open the link to a calculator running XSERV and change to `--dir`.
     fn xserv_open(&mut self) -> Result<XservClient> {
@@ -301,10 +316,7 @@ impl Ctx {
         let link = transport::open(&addr).with_context(|| format!("cannot open {addr}"))?;
         let mut client = XservClient::new(link, self.link.timeout);
         if let Some(dir) = self.global.dir.clone() {
-            let path = std::iter::once("HOME".to_string())
-                .chain(util::parse_dir(&dir))
-                .collect::<Vec<_>>()
-                .join(" ");
+            let path = dir_command(&dir)?;
             client
                 .send(&XservCommand::Execute(path.clone()))
                 .with_context(|| format!("xserv: cd {path}"))?;
@@ -438,15 +450,7 @@ impl Ctx {
             (None, false) => util::name_from_file(file).unwrap_or_default(),
         };
         validate_name(&name).with_context(|| format!("xserv put {name}"))?;
-        let data = if from_stdin {
-            let mut buf = Vec::new();
-            std::io::stdin()
-                .read_to_end(&mut buf)
-                .context("reading stdin")?;
-            buf
-        } else {
-            std::fs::read(file).with_context(|| format!("cannot read {}", file.display()))?
-        };
+        let data = util::read_input(file)?;
         let label = file.display().to_string();
         let cmd = XservCommand::Put(name.clone());
         if dry_run {
@@ -492,6 +496,24 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     type Log = Arc<Mutex<Vec<Vec<u8>>>>;
+
+    /// Audit PR #18, #15: `--dir` components are checked like
+    /// `Calculator::cd` before the calculator evaluates them.
+    #[test]
+    fn dir_components_are_names() {
+        assert_eq!(dir_command("HOME/A/B").unwrap(), "HOME A B");
+        assert_eq!(dir_command("/").unwrap(), "HOME");
+        for bad in ["A/1 PURGE", "A/'X'", "{ HOME \u{ab}X\u{bb} }", "A/CLEAR;X"] {
+            let err = dir_command(bad).unwrap_err();
+            assert!(
+                err.chain().any(|c| matches!(
+                    c.downcast_ref::<hptx_core::Error>(),
+                    Some(hptx_core::Error::Name(_))
+                )),
+                "{bad}: {err:?}"
+            );
+        }
+    }
 
     /// A calculator that logs every write and answers with `reply`.
     fn client(mut reply: impl FnMut(&[u8]) -> Vec<Vec<u8>> + Send + 'static) -> (XservClient, Log) {

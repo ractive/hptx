@@ -552,17 +552,13 @@ impl TextParser<'_> {
             return invalid("C$ count not followed by a space");
         }
         self.pos = digits_end + 1;
-        let mut bytes = Vec::with_capacity(count);
-        while bytes.len() < count {
-            if self.pos >= self.s.len() {
-                return invalid(format!(
-                    "C$ {count}: text ends after {} characters",
-                    bytes.len()
-                ));
-            }
-            bytes.push(self.s[self.pos]);
-            self.pos += 1;
+        // Checked before anything is allocated: the count is untrusted.
+        let rest = self.s.len() - self.pos;
+        if count > rest {
+            return invalid(format!("C$ {count}: text ends after {rest} characters"));
         }
+        let bytes = self.s[self.pos..self.pos + count].to_vec();
+        self.pos += count;
         string_object(out, &bytes)
     }
 
@@ -1043,6 +1039,21 @@ mod tests {
         // A CR LF the calculator wrote for CR LF in a string is ambiguous:
         // it reads back as one LF, and the count of `C$ 4` runs past it.
         assert!(parse(b"%%HP: T(1)A(D)F(.);\r\nC$ 4 a\r\nb", Family::Hp48).is_err());
+    }
+
+    /// Audit PR #18, #4: a huge `C$` count is refused before anything is
+    /// allocated (it used to reserve the declared count first).
+    #[test]
+    fn counted_string_count_beyond_the_input() {
+        let err = parse(
+            b"%%HP: T(3)A(D)F(.);\r\nC$ 18446744073709551615 ab",
+            Family::Hp48,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, ConvertError::Invalid(m) if m.contains("text ends after 2 characters")),
+            "{err:?}"
+        );
     }
 
     #[test]
