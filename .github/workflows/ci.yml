@@ -2,9 +2,7 @@ name: CI
 
 on:
   push:
-    # TEMPORARY (iter-11a): iter-11a/** so the matrix runs before the PR
-    # exists; removed in the branch's last commit.
-    branches: [main, 'iter-11a/**']
+    branches: [main]
   pull_request:
 
 concurrency:
