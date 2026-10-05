@@ -2,7 +2,7 @@
 title: "Iteration 5: xmodem-proto and HP XModem"
 type: iteration
 date: 2026-10-04
-status: planned
+status: in-progress
 branch: iter-5/xmodem-proto-and-hp-xmodem
 tags:
   - iteration
