@@ -30,7 +30,7 @@ set -euo pipefail
 addr=${HPTX_E2E_ADDR:?set HPTX_E2E_ADDR, e.g. tcp://localhost:4848}
 root=$(cd "$(dirname "$0")/.." && pwd)
 if [[ -z ${HPTX_BIN:-} ]]; then
-    cargo build -q -p hptx-cli --manifest-path "$root/Cargo.toml"
+    cargo build -q --locked -p hptx-cli --manifest-path "$root/Cargo.toml"
     HPTX_BIN=$root/target/debug/hptx
 fi
 command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }

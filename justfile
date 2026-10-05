@@ -8,10 +8,11 @@ default:
 test:
     cargo test --workspace -q
 
-# Check formatting and run clippy
+# Check formatting, run clippy and audit the dependencies (cargo-deny, see deny.toml)
 lint:
     cargo fmt --all -- --check
     cargo clippy --workspace --all-targets -- -D warnings
+    cargo deny --locked check
 
 # Format all code
 fmt:

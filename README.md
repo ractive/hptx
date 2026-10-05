@@ -105,7 +105,7 @@ Developing hptx itself:
 
 ```sh
 just test          # fast test suite
-just lint          # rustfmt check and clippy
+just lint          # rustfmt check, clippy and cargo-deny (cargo install cargo-deny --locked)
 just emulator-up   # build and start the emulated HP 48SX on tcp://localhost:4848
 just e2e           # end-to-end tests against the emulator
 just record-trace host "6 7 *"   # record a Kermit trace from the emulator
