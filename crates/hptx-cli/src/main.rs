@@ -6,6 +6,7 @@ mod error;
 mod offline;
 mod output;
 mod port;
+mod repl;
 mod util;
 mod xmodem;
 mod xserv;
@@ -18,14 +19,15 @@ use clap::{Args, Parser, Subcommand};
 use crate::output::Format;
 
 const ABOUT: &str =
-    "Talk to an HP 48/49 in Kermit server mode: list, get, put, run, screenshot, backup";
+    "Talk to an HP 48/49 in Kermit server mode: list, get, put, run, repl, pict, backup";
 
 const LONG_ABOUT: &str = "\
 Talk to an HP 48SX/GX or 49G over a serial cable (or to an emulator over TCP).
 
 Start the Kermit server on the calculator first: run SERVER (the display
 shows \"Awaiting Server Cmd.\"). hptx then lists, copies, renames and deletes
-variables, runs RPL commands, grabs the screen and backs up HOME. All
+variables, runs RPL commands, fetches the graphics screen PICT and backs up
+HOME. All
 transfers run at 9600 baud. `object`, `grob` and `completions` work on files
 on this computer and need no calculator.
 
@@ -44,7 +46,8 @@ Examples:
   hptx put prg.hp --as PRG2           # upload a file as PRG2
   hptx put prg.hp --protocol xmodem   # XRECV typed on a 48G/GX or 49G
   hptx run '6 7 *'                    # evaluate RPL, print the stack
-  hptx screenshot -o screen.png       # the display as PNG
+  hptx repl                           # RPL line by line on one link; :help
+  hptx pict -o plot.png               # the graphics screen PICT as PNG
   hptx backup -o home.hp              # archive HOME to a file
   hptx --port tcp://localhost:4848 ls # an emulator
   hptx ls --json | jq '.results[].name'
@@ -243,17 +246,28 @@ Examples:
         #[arg(required = true, value_name = "RPL", allow_negative_numbers = true)]
         words: Vec<String>,
     },
-    /// Save the display as a PNG (via LCD→ and a temporary HPTXTMP).
+    /// Type RPL line by line on one link and see the stack; :help for commands.
+    #[command(after_help = repl::AFTER_HELP)]
+    Repl,
+    /// Save the graphics screen PICT (plots, drawings) as a PNG.
     #[command(after_help = "\
-The calculator stores the display in HPTXTMP, sends it and deletes it. If a
-variable HPTXTMP already exists, screenshot stops and changes nothing.
+PICT is the calculator's graphics screen: what PLOT, DRAW, PIXON or LINE
+drew. It persists while the calculator serves, so a plot made before SERVER
+can be fetched. hptx recalls PICT into HPTXTMP, sends it and deletes it; if
+a variable HPTXTMP already exists, pict stops and changes nothing. A PICT
+nothing was ever drawn into is empty (0x0) and gives an error.
+
+The display itself cannot be captured over the link: in server mode it only
+shows the server's banner. Capture it by hand: type LCD\u{2192} 'S' STO on the
+calculator before SERVER, then `hptx get S` and `hptx grob to-png S`.
 
 Examples:
-  hptx screenshot                       # hptx-screen-<UTC time>.png
-  hptx screenshot -o screen.png --force
-  hptx screenshot -o - > screen.png")]
-    Screenshot {
-        /// Output file [default: hptx-screen-<UTC time>.png]; - for stdout.
+  hptx pict                       # hptx-pict-<UTC time>.png
+  hptx pict -o plot.png --force
+  hptx pict -o - > plot.png
+  hptx run 'ERASE { # 10d # 10d } PIXON' && hptx pict -o dot.png")]
+    Pict {
+        /// Output file [default: hptx-pict-<UTC time>.png]; - for stdout.
         #[arg(short, long, value_name = "FILE")]
         output: Option<PathBuf>,
         /// Replace an existing file.
@@ -457,6 +471,15 @@ mod tests {
         assert!(Cli::try_parse_from(["hptx", "xserv", "get", "X", "-o", "x.hp"]).is_ok());
         assert!(Cli::try_parse_from(["hptx", "xserv", "put", "x.hp", "--as", "X"]).is_ok());
         assert!(Cli::try_parse_from(["hptx", "xserv", "mem"]).is_ok());
+    }
+
+    #[test]
+    fn repl_parses_with_global_options() {
+        let cli =
+            Cli::try_parse_from(["hptx", "repl", "--port", "tcp://h:1", "--timeout", "3"]).unwrap();
+        assert!(matches!(cli.command, Command::Repl));
+        assert_eq!(cli.global.timeout, 3);
+        assert!(Cli::try_parse_from(["hptx", "repl", "extra"]).is_err());
     }
 
     #[test]

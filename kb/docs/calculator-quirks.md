@@ -118,3 +118,15 @@ Each item must be covered by a test. Source: the wiki at `~/devel/hp-literature/
 - 49G in RPN mode: typing SERVER leaves a tagged `SERVER` and `NOVAL` on
   the stack (ALG mode and the 48GX leave nothing). Covered: e2e-cli runs
   CLEAR after the XModem steps.
+- In server mode `LCD→` returns the "Awaiting Server Cmd. / Processing
+  Command" banner, never the stack: there is no screenshot of the display
+  over the link. Covered: `pict` replaces `screenshot` (iteration 9).
+- PICT: a fresh PICT is `Graphic 0 × 0` (the 49G shows `# 83h # 40h` after
+  ERASE); `ERASE` makes it 131x64 and `# 0d # 0d BLANK PICT STO` does not
+  shrink it back. `ERASE { # 10d # 10d } PIXON` works over the link on all
+  three models; `PVIEW` over the link is "Bad Argument Type". Covered: e2e
+  `pict`.
+- Emulator only (saturnng): under parallel load (three containers running
+  e2e at once) or after an aborted client, a calculator can stop answering
+  with random pixels on the LCD and the busy annunciator lit; seen four
+  times on 2026-10-05, never reproduced on demand. Restart the container.

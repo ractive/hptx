@@ -213,3 +213,25 @@ Decisions already made. Do not re-litigate; add a dated entry to change one.
   `hptx_core::xserv`, marked UNVERIFIED ON HARDWARE in every help page.
 - **Model detection lives in hptx-core** (`Model::from_version`); the CLI's
   own copy was removed in iteration 5.
+
+## 2026-10-05 (iteration 9)
+
+- **`hptx repl`.** One `Calculator` per session; every non-colon line goes
+  through the `run` path (77-byte split, same error mapping) and the reply
+  is printed as the calculator displays it, deepest level first, verbatim;
+  an empty stack prints nothing; a calculator error prints its message and
+  the stack it left, and the session continues. Only link failures end the
+  session (exit 1). Plain `> ` prompt, no header or softkey mimicry.
+- **Colon meta-commands** (`:ls`, `:cd`, `:get`, `:put`, `:rm`, `:pict`,
+  `:info`, `:help`, `:quit`) reuse the CLI command code on the open link;
+  `::` sends a line that starts with a colon verbatim. `--json`/`--jq` are
+  refused in the REPL. Piped stdin runs without prompt or editing and exits
+  at EOF, so scripts and agents can drive it.
+- **`rustyline` without default features** (`with-file-history` only) for
+  editing and history; history under the platform data dir
+  (`$XDG_DATA_HOME/hptx/history`, `~/Library/Application Support/hptx/history`,
+  `%APPDATA%\hptx\history.txt`).
+- **`screenshot` is replaced by `pict`.** Through the Kermit server `LCD→`
+  can only ever capture the server banner; `pict` fetches the graphics
+  screen with `PICT RCL` (via `HPTXTMP`). The display itself is captured by
+  hand (`LCD→ 'S' STO` before SERVER, then `get` and `grob to-png`).
