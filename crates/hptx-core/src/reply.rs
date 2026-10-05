@@ -144,7 +144,11 @@ pub fn parse_listing(text: &str) -> Result<Listing> {
         }
         if std::mem::take(&mut first) && line.starts_with('{') {
             let bad = || Error::Reply(format!("bad directory header: {line:?}"));
-            let end = line.find('}').ok_or_else(bad)?;
+            // The 49G cuts a long header at the display width, closing
+            // brace and free memory included: path and free stay unknown.
+            let Some(end) = line.find('}') else {
+                continue;
+            };
             let (list, rest) = line.split_at(end + 1);
             listing.path = Some(parse_list(list).ok_or_else(bad)?);
             if !rest.trim().is_empty() {
@@ -684,7 +688,15 @@ mod tests {
             parse_listing("X 16 Real Number 12.5"),
             Err(Error::Reply(_))
         ));
-        assert!(matches!(parse_listing("{ HOME 12"), Err(Error::Reply(_))));
+        // A header cut at the 49G's display width (seen in HOME/HPTXAAAA/
+        // HPTXBBBB, 2026-10-05): path and free unknown, entries still read.
+        let l = parse_listing("{ HOME HPTXAAAA\r\nX 10.5 Real Number 1234\r\n").unwrap();
+        assert_eq!((l.path, l.free, l.entries.len()), (None, None, 1));
+        // A complete header with garbage after it is still an error.
+        assert!(matches!(
+            parse_listing("{ HOME } lots"),
+            Err(Error::Reply(_))
+        ));
         let l = parse_listing("{ HOME }\r\n").unwrap();
         assert_eq!((l.path.unwrap().len(), l.free), (1, None));
     }

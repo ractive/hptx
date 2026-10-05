@@ -144,7 +144,13 @@ impl Calculator {
     fn sync_with(&mut self, marker: &str) -> Result<()> {
         let command = format!("\"{marker}\"");
         for _ in 0..2 {
-            let reply = self.host(&command)?;
+            let reply = match self.host(&command) {
+                // The calculator aborted a transfer left over from the dead
+                // client (seen: "Transfer Failed" on the 48SX): an odd
+                // reply like any other, our command did not run.
+                Err(Error::Remote(_)) => continue,
+                reply => reply?,
+            };
             let ours = reply
                 .levels
                 .iter()
@@ -779,7 +785,14 @@ mod tests {
                             decode(&data)
                         };
                         log.lock().unwrap().push(command.clone());
-                        let text = encode(&reply(&command)).unwrap();
+                        let reply = reply(&command);
+                        // `E:message` plays an E packet instead of a reply.
+                        if let Some(message) = reply.strip_prefix("E:") {
+                            queue.clear();
+                            out.push(wire(&Packet::new(0, b'E', message.as_bytes().to_vec())));
+                            continue;
+                        }
+                        let text = encode(&reply).unwrap();
                         queue = vec![Packet::new(1, b'X', Vec::new())];
                         let mut rest = text.as_slice();
                         while !rest.is_empty() {
@@ -937,6 +950,21 @@ mod tests {
         assert_eq!(
             sync_against(vec![stale, ours]),
             [MARKER_CMD, MARKER_CMD, "DROP2"]
+        );
+    }
+
+    /// An E packet (the calculator aborting a leftover transfer) is an odd
+    /// reply, not an error: the marker goes again.
+    #[test]
+    fn sync_survives_an_error_packet() {
+        let ours = "1:      \"HPTX-0a1b2c\"\r\n";
+        assert_eq!(
+            sync_against(vec!["E:Transfer Failed", ours]),
+            [MARKER_CMD, MARKER_CMD, "DROP"]
+        );
+        assert_eq!(
+            sync_against(vec!["E:Transfer Failed", "E:Transfer Failed"]),
+            [MARKER_CMD, MARKER_CMD]
         );
     }
 
