@@ -45,7 +45,24 @@ Read first: wiki `protocols/xmodem`, `xmodem-hp`, `xserv`,
 - [ ] XSERV (49g+/50g) framing: 2-byte big-endian length, data, 1-byte sum;
   commands P, G, E, M, L. Facts came from HP-written Conn4x code under a
   non-commercial license: implement from the wiki description only.
-- [ ] CLI: `hptx get/put --protocol xmodem`, `hptx xserv ...`.
+- [ ] Server interplay, verify first on the emulated 49G and record it in the
+  wiki: when the Kermit server runs `C "'NAME' XRECV"` (or `XSEND`), does
+  the ACK arrive before or after the XModem transfer, does the calculator
+  stay in server mode afterwards, and what is left on the stack? Design the
+  driver from the answer (e.g. send the `C` packet, hand the same transport
+  to the XModem state machine until Done, then resume Kermit or tell the
+  user to run SERVER again, as `restore` does).
+- [ ] RPL that hptx builds for the 49G writes numbers as reals with a
+  trailing dot (decision 2026-10-05, iteration 4: exact integers broke
+  IOPAR). Names and strings go through `hptx_core::charset` as in
+  iteration 3.
+- [ ] CLI: `hptx get/put --protocol xmodem`, `hptx xserv ...`, following the
+  iteration 4 conventions (`{results,total,hints}` envelope, `{error,hint}`
+  on stderr, `--dry-run` where destructive, bounded `--timeout`/`--retries`,
+  never overwrite without `--force`/`--overwrite`). `scripts/e2e-cli.sh`
+  gets XModem scenarios that run only when `HPTX_E2E_MODEL=49g` (the 48SX
+  has no XModem, so neither the 48SX container nor the in-process saturnus
+  transport of iteration 8 can cover them); CI already boots the 49G.
 
 ## Acceptance criteria
 
