@@ -2,39 +2,61 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # TEMPORARY (iter-11a): iter-11a/** so the matrix runs before the PR
+    # exists; removed in the branch's last commit.
+    branches: [main, 'iter-11a/**']
   pull_request:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
+# Actions are pinned to commit SHAs (the version in the comment), the same
+# SHAs as ~/devel/hyalo's ci.yml. Every cargo invocation is --locked: CI
+# never resolves a dependency the lockfile does not name.
 jobs:
   check:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace -q
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # Formatting and the dependency audit are platform-independent: once.
+      - if: runner.os == 'Linux'
+        run: cargo fmt --all -- --check
+      # A Docker action, so Linux only. deny.toml checks the graph with every
+      # feature on (the saturnus git dependency included).
+      - name: Check dependency advisories, licences, bans and sources
+        if: runner.os == 'Linux'
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+          arguments: --all-features --locked
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace -q
       # The in-process saturnus transport (git dependency on the public
       # saturnus repo); its e2e run needs a ROM and stays local.
-      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - run: cargo test -p hptx-core --features saturnus -q
+      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --locked -p hptx-core --features saturnus -q
 
   e2e:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # Deliberately not cached or pushed: the image contains HP ROMs.
       - name: Build emulator image
         run: docker build -t hp49g-emu emulator
@@ -49,12 +71,12 @@ jobs:
         env:
           HPTX_E2E_ADDR: tcp://localhost:4848
           HPTX_E2E_CONTAINER: calc
-        run: cargo test -p hptx-core --test e2e -- --nocapture
+        run: cargo test --locked -p hptx-core --test e2e -- --nocapture
       - name: hptx-core end-to-end tests, 49G
         env:
           HPTX_E2E_ADDR: tcp://localhost:4850
           HPTX_E2E_CONTAINER: calc49
-        run: cargo test -p hptx-core --test e2e -- --nocapture
+        run: cargo test --locked -p hptx-core --test e2e -- --nocapture
       - name: CLI end-to-end script, 48SX
         env:
           HPTX_E2E_ADDR: tcp://localhost:4848
