@@ -87,20 +87,22 @@ pub struct Global {
     /// The calculator stays there afterwards.
     #[arg(long, global = true, value_name = "PATH", help_heading = "Connection")]
     pub dir: Option<String>,
-    /// Seconds to wait for each Kermit packet before resending.
+    /// Seconds to wait for each Kermit packet before resending (1-600).
     #[arg(
         long,
         global = true,
         default_value_t = 20,
+        value_parser = clap::value_parser!(u64).range(1..=600),
         value_name = "SECS",
         help_heading = "Connection"
     )]
     pub timeout: u64,
-    /// Resends per packet before giving up.
+    /// Resends per packet before giving up (0-50).
     #[arg(
         long,
         global = true,
         default_value_t = 5,
+        value_parser = clap::value_parser!(u32).range(0..=50),
         value_name = "N",
         help_heading = "Connection"
     )]
@@ -158,8 +160,9 @@ Examples:
 The name defaults to the file name without extension. A file without an
 HPHP48/HPHP49 header is stored as a String in binary mode. A %%HP: text file
 goes in ASCII mode unless --binary. If the name exists, put refuses unless
---overwrite (which deletes the old variable first); --dry-run shows what
-would happen.
+--overwrite, which sends the file as HPTXPT first and only then replaces the
+old variable (a failed transfer leaves it alone); --dry-run shows what would
+happen.
 
 Examples:
   hptx put prg.hp              # stores PRG
@@ -335,6 +338,27 @@ mod tests {
             panic!("not run")
         };
         assert_eq!(words, ["-1", "--x"]);
+    }
+
+    #[test]
+    fn timeout_and_retries_are_bounded() {
+        for t in ["0", "601", "18446744073709551615"] {
+            assert!(
+                Cli::try_parse_from(["hptx", "ls", "--timeout", t]).is_err(),
+                "--timeout {t}"
+            );
+        }
+        for r in ["51", "4294967295"] {
+            assert!(
+                Cli::try_parse_from(["hptx", "ls", "--retries", r]).is_err(),
+                "--retries {r}"
+            );
+        }
+        let cli =
+            Cli::try_parse_from(["hptx", "ls", "--timeout", "600", "--retries", "0"]).unwrap();
+        assert_eq!((cli.global.timeout, cli.global.retries), (600, 0));
+        let cli = Cli::try_parse_from(["hptx", "ls", "--timeout", "1", "--retries", "50"]).unwrap();
+        assert_eq!((cli.global.timeout, cli.global.retries), (1, 50));
     }
 
     #[test]

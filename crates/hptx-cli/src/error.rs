@@ -45,7 +45,7 @@ pub struct LinkInfo {
 }
 
 /// The temporary variables hptx creates on the calculator.
-const TEMP_VARS: &[&str] = &["HPTXTMP", "HPTXBK", "HPTXRS"];
+const TEMP_VARS: &[&str] = &["HPTXTMP", "HPTXBK", "HPTXRS", "HPTXPT"];
 
 /// Describe `err` (with its context chain) for the user.
 pub fn describe(err: &anyhow::Error, link: &LinkInfo) -> Failure {

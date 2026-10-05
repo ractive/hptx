@@ -24,6 +24,10 @@ use crate::{Cli, Command, Global};
 /// The temporary variable `restore` leaves in port 0.
 const RESTORE_LEFTOVER: &str = ":0:HPTXRS";
 
+/// The temporary name `put --overwrite` sends under before it replaces the
+/// old variable, so a failed transfer leaves the old one in place.
+const PUT_TEMP: &str = "HPTXPT";
+
 /// `get` options.
 #[derive(Args, Debug)]
 pub struct GetArgs {
@@ -54,7 +58,7 @@ pub struct PutArgs {
     /// Transfer in binary even for a %%HP: text file.
     #[arg(long)]
     pub binary: bool,
-    /// Replace an existing variable (deletes it first).
+    /// Replace an existing variable (sends as HPTXPT, then swaps it in).
     #[arg(long)]
     pub overwrite: bool,
     /// Show what would happen, send nothing.
@@ -510,7 +514,7 @@ impl Ctx {
         Ok(Some(Outcome {
             results: json!({
                 "name": args.name,
-                "file": file,
+                "file": file.display().to_string(),
                 "bytes": data.len(),
                 "mode": mode_name(mode),
                 "type": kind,
@@ -593,6 +597,18 @@ impl Ctx {
                 .into());
             }
         }
+        if existing.is_some() && listing.entries.iter().any(|e| e.name == PUT_TEMP) {
+            return Err(Hinted::new(
+                format!("{PUT_TEMP} exists in the current directory"),
+                format!(
+                    "it is hptx's temporary variable for put --overwrite, probably left by an \
+                     interrupted run: `{}` to keep it, then `{}`",
+                    self.cmd(&format!("get {PUT_TEMP}")),
+                    self.cmd(&format!("rm {PUT_TEMP}"))
+                ),
+            )
+            .into());
+        }
         let replaces = existing
             .as_ref()
             .map(|e| json!({"type": e.kind, "size": util::number(e.size)}));
@@ -605,7 +621,8 @@ impl Ctx {
             if let Some(e) = &existing {
                 let _ = write!(
                     text,
-                    ", deleting the existing {name} ({}, {} bytes) first",
+                    ", sending it as {PUT_TEMP} first and then replacing the existing {name} \
+                     ({}, {} bytes)",
                     e.kind,
                     util::number_text(e.size)
                 );
@@ -640,13 +657,12 @@ impl Ctx {
                 text,
             });
         }
-        if existing.is_some() {
-            calc.remove(&name)
-                .with_context(|| format!("deleting the old {name}"))?;
-        }
-        let stored = calc
-            .put(&name, &data, mode)
-            .with_context(|| format!("put {name}"))?;
+        let stored = if existing.is_some() {
+            self.put_replacing(&mut calc, &name, &data, mode)?
+        } else {
+            calc.put(&name, &data, mode)
+                .with_context(|| format!("put {name}"))?
+        };
         let mut text = format!(
             "{file_label} -> {stored} ({} bytes, {})",
             data.len(),
@@ -674,6 +690,53 @@ impl Ctx {
             hints: vec![Hint::cmd("List the directory", self.cmd("ls"))],
             text,
         })
+    }
+
+    /// Replace the existing variable `name`: send `data` as [`PUT_TEMP`],
+    /// then delete `name` and rename the temporary to it. A failed transfer
+    /// leaves the old variable untouched. Returns the final name.
+    fn put_replacing(
+        &self,
+        calc: &mut Calculator,
+        name: &str,
+        data: &[u8],
+        mode: TransferMode,
+    ) -> Result<String> {
+        let temp = match calc.put(PUT_TEMP, data, mode) {
+            Ok(stored) => stored,
+            Err(e) => {
+                // Best effort: a partial transfer may have left the
+                // temporary; the transfer error matters more.
+                let _ = calc.remove(PUT_TEMP);
+                return Err(anyhow::Error::new(e).context(Hinted::new(
+                    format!("put {name} failed; the old {name} is unchanged"),
+                    format!(
+                        "check the link and try again; if {PUT_TEMP} is left over, `{}`",
+                        self.cmd(&format!("rm {PUT_TEMP}"))
+                    ),
+                )));
+            }
+        };
+        if let Err(e) = calc.remove(name) {
+            return Err(anyhow::Error::new(e).context(Hinted::new(
+                format!("deleting the old {name} failed; the new one is stored as {temp}"),
+                format!(
+                    "`{}` then `{}`",
+                    self.cmd(&format!("rm {name}")),
+                    self.cmd(&format!("mv {temp} {name}"))
+                ),
+            )));
+        }
+        if let Err(e) = calc.rename(&temp, name) {
+            return Err(anyhow::Error::new(e).context(Hinted::new(
+                format!("the old {name} is deleted but renaming {temp} to {name} failed"),
+                format!(
+                    "the new object is in {temp}: `{}`",
+                    self.cmd(&format!("mv {temp} {name}"))
+                ),
+            )));
+        }
+        Ok(name.to_string())
     }
 
     fn rm(&mut self, names: &[String], dry_run: bool) -> Result<Outcome> {
@@ -818,7 +881,7 @@ impl Ctx {
         write_file(&file, &png, force)?;
         Ok(Some(Outcome {
             results: json!({
-                "file": file,
+                "file": file.display().to_string(),
                 "width": grob.width,
                 "height": grob.height,
                 "bytes": png.len(),
@@ -846,7 +909,7 @@ impl Ctx {
         write_file(&file, &data, force)?;
         let label = file.display().to_string();
         Ok(Outcome {
-            results: json!({"file": file, "bytes": data.len()}),
+            results: json!({"file": label, "bytes": data.len()}),
             total: None,
             dir: None,
             hints: vec![Hint::cmd(

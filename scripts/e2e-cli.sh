@@ -82,7 +82,7 @@ cleanup() {
     # Best effort: remove what this script may have created.
     local names
     names=$(hptx --dir HOME ls --jq '.results[].name' 2>/dev/null || true)
-    for n in HPTXCLI HPTXSM HPTXCD HPTXCE HPTXGR HPTXG2 HPTXCV HPTXCW HPTXCX; do
+    for n in HPTXCLI HPTXPT HPTXSM HPTXCD HPTXCE HPTXGR HPTXG2 HPTXCV HPTXCW HPTXCX; do
         if grep -qx "$n" <<<"$names"; then
             echo "cleanup: removing $n" >&2
             hptx rm "$n" >/dev/null 2>&1 || true
@@ -152,6 +152,20 @@ ok
 step "put --overwrite --dry-run"
 dry=$(hptx put "$work/all.hp" --as HPTXCLI --overwrite --dry-run --json)
 jq -e '.results.dry_run and .results.replaces.type == "String"' <<<"$dry" >/dev/null || fail "$dry"
+grep -q HPTXPT <<<"$(hptx put "$work/all.hp" --as HPTXCLI --overwrite --dry-run --format text)" \
+    || fail "dry-run text does not name HPTXPT"
+ok
+
+step "put --overwrite replaces via HPTXPT"
+# Different content (IOPAR's list) so the replacement is visible.
+replaced=$(hptx put "$work/iopar.hp" --as HPTXCLI --overwrite --json)
+jq -e '.results.name == "HPTXCLI" and .results.replaced.type == "String"' <<<"$replaced" \
+    >/dev/null || fail "$replaced"
+names=$(hptx ls --jq '.results[].name')
+[[ $(grep -cx HPTXCLI <<<"$names") == 1 ]] || fail "not exactly one HPTXCLI: $names"
+if grep -qx HPTXPT <<<"$names"; then fail "HPTXPT left over"; fi
+hptx get HPTXCLI -o "$work/replaced.hp" --json >/dev/null
+cmp <(body "$work/iopar.hp") <(body "$work/replaced.hp") || fail "replaced content differs"
 ok
 
 step "get of a missing name fails with a hint"

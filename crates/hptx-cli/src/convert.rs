@@ -635,14 +635,17 @@ impl TextParser<'_> {
             self.pos += 1;
         }
         let tok = self.number_token(&[]);
-        let Some((digits, base)) = tok.len().checked_sub(1).map(|i| tok.split_at(i)) else {
+        let Some(base) = tok.chars().last() else {
             return invalid("`#` without a number");
         };
+        // `base` may be multi-byte (any non-ASCII byte reads as U+FFFD), so
+        // slice by its UTF-8 length, never by one byte.
+        let digits = &tok[..tok.len() - base.len_utf8()];
         let radix = match base {
-            "h" | "H" => 16,
-            "d" | "D" => 10,
-            "o" | "O" => 8,
-            "b" | "B" => 2,
+            'h' | 'H' => 16,
+            'd' | 'D' => 10,
+            'o' | 'O' => 8,
+            'b' | 'B' => 2,
             _ => {
                 return invalid(format!(
                     "binary integer `# {tok}` needs a base suffix h, d, o or b"
@@ -768,16 +771,25 @@ fn parse_number(tok: &str, decimal: u8) -> Option<Number> {
             i += 1;
         }
         exp10 = sign * tok.get(start..i)?.parse::<i64>().ok()?;
+        // Far outside the calculator's range (-499..499) whatever the
+        // mantissa; bounding it keeps the arithmetic below from overflowing.
+        if exp10.abs() > 10_000 {
+            return None;
+        }
     }
     if i != b.len() {
         return None;
     }
-    let int_len = point.unwrap_or(digits.len()) as i64;
+    let int_len = i64::try_from(point.unwrap_or(digits.len())).ok()?;
     let lead = digits.iter().take_while(|&&d| d == 0).count();
     let sig: Vec<u8> = digits[lead..].to_vec();
+    let exp = int_len
+        .checked_sub(i64::try_from(lead).ok()?)?
+        .checked_sub(1)?
+        .checked_add(exp10)?;
     Some(Number {
         negative,
-        exp: int_len - lead as i64 - 1 + exp10,
+        exp,
         digits: sig,
         exact: point.is_none() && !has_exp,
     })
@@ -794,7 +806,7 @@ fn real_nibbles(n: &Number) -> Result<Vec<u8>> {
             if i == 0 {
                 digits.insert(0, 1);
                 digits.truncate(12);
-                exp += 1;
+                exp = exp.saturating_add(1);
                 break;
             }
             i -= 1;
@@ -1100,12 +1112,28 @@ mod tests {
             ("C$ 5 ab", false),
             ("", false),
             ("%%HP: T(9);\n1", false),
+            ("10E9223372036854775807", true),
+            ("1E-9223372036854775808", true),
+            ("1E10001", true),
         ] {
             let err = parse(input.as_bytes(), Family::Hp48).unwrap_err();
             assert_eq!(
                 matches!(err, ConvertError::Unsupported(_)),
                 unsupported,
                 "{input}: {err:?}"
+            );
+        }
+        // Non-ASCII base suffixes: a clean error, not a char-boundary panic.
+        for input in [
+            &b"# 12\xff"[..],
+            "# 12\u{e9}".as_bytes(),
+            b"%%HP: T(3)A(D)F(.);\n# 12\\160",
+        ] {
+            let err = parse(input, Family::Hp48).unwrap_err();
+            assert!(
+                matches!(err, ConvertError::Invalid(_)),
+                "{:?}: {err:?}",
+                String::from_utf8_lossy(input)
             );
         }
         assert!(to_ascii(b"no header").is_err());
