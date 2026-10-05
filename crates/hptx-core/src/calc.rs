@@ -598,9 +598,8 @@ impl Calculator {
         let probe = self.host_once(&format!("\"{marker}\""), timeout);
         let still_running = || {
             Error::Reply(format!(
-                "RESTORE's result is unknown: the calculator answers again, so it may not \
-                 have run, or it ran before the server was restarted; the backup stays in \
-                 :0:{RESTORE_VAR}"
+                "the calculator answers again, so RESTORE's result is unknown: it may have \
+                 run before the server was restarted; the backup stays in :0:{RESTORE_VAR}"
             ))
         };
         match probe {
@@ -1337,7 +1336,7 @@ mod tests {
         });
         let err = c.restore_from_port().unwrap_err();
         assert!(
-            matches!(&err, Error::Reply(m) if m.starts_with("RESTORE's result is unknown")),
+            matches!(&err, Error::Reply(m) if m.contains("RESTORE's result is unknown")),
             "{err:?}"
         );
         let log = sent(&log);
