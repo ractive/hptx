@@ -52,17 +52,20 @@ Read first: wiki `protocols/xmodem`, `xmodem-hp`, `xserv`,
   driver from the answer (e.g. send the `C` packet, hand the same transport
   to the XModem state machine until Done, then resume Kermit or tell the
   user to run SERVER again, as `restore` does).
-- [ ] RPL that hptx builds for the 49G writes numbers as reals with a
-  trailing dot (decision 2026-10-05, iteration 4: exact integers broke
-  IOPAR). Names and strings go through `hptx_core::charset` as in
+- [ ] RPL that hptx builds writes numbers as reals with a trailing dot on
+  every model (decision 2026-10-05, iteration 4: exact integers broke IOPAR
+  on the 49G). Names and strings go through `hptx_core::charset` as in
   iteration 3.
 - [ ] CLI: `hptx get/put --protocol xmodem`, `hptx xserv ...`, following the
   iteration 4 conventions (`{results,total,hints}` envelope, `{error,hint}`
   on stderr, `--dry-run` where destructive, bounded `--timeout`/`--retries`,
   never overwrite without `--force`/`--overwrite`). `scripts/e2e-cli.sh`
-  gets XModem scenarios that run only when `HPTX_E2E_MODEL=49g` (the 48SX
-  has no XModem, so neither the 48SX container nor the in-process saturnus
-  transport of iteration 8 can cover them); CI already boots the 49G.
+  gets XModem scenarios gated on the detected model (`$model` is HP 49G or
+  HP 48G/GX, as the existing 49G-only scenarios do), not on
+  `HPTX_E2E_MODEL`. The 48S/SX has no XModem, so neither the 48SX CI
+  container nor the in-process saturnus transport (iteration 8, 48SX only)
+  covers them. CI already boots the 49G; the 48GX, the only target for the
+  checksum-only fallback, runs locally (`just emulator-up 48gx 4849 calcgx`).
 
 ## Acceptance criteria
 
