@@ -15,5 +15,10 @@ categories = ["network-programming", "hardware-support"]
 # protocol crates' recorded traces and replay tests.
 kermit-proto = { path = "../kermit-proto", version = "0.1.0" }
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# The caller's clock on wasm32 (`std::time::Instant::now()` panics on
+# wasm32-unknown-unknown); see "Time and WebAssembly" in the crate docs.
+web-time = "1.1.0"
+
 [lints]
 workspace = true

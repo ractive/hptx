@@ -11,7 +11,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::time::Instant;
+use crate::time::Instant;
 
 use kermit_proto::trace::{self, Direction};
 
