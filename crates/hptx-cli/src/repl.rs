@@ -351,8 +351,11 @@ pub fn history_path(platform: Platform, var: impl Fn(&str) -> Option<OsString>) 
                 .join("history"),
         ),
         Platform::Linux => {
+            // `has_root`, not `is_absolute`: the same on Linux, but the
+            // rule is the XDG one ("/..."), whatever host evaluates it (on
+            // Windows, `/data` is rooted yet not absolute).
             let data = set("XDG_DATA_HOME")
-                .filter(|p| p.is_absolute())
+                .filter(|p| p.has_root())
                 .or_else(|| set("HOME").map(|h| h.join(".local").join("share")))?;
             Some(data.join("hptx").join("history"))
         }
