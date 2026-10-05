@@ -246,19 +246,34 @@ Decisions already made. Do not re-litigate; add a dated entry to change one.
   hardware and for emulators treated as hardware. Agents drive a real
   calculator through the CLI's JSON mode; there is no hptx MCP server.
 - **Two repositories, not a monorepo.** Different products, cadences and
-  knowledge bases. The crate graph is acyclic today: saturnus-mcp depends
-  on hptx-core (with hptx-core's `saturnus` feature off), hptx-core's
-  optional in-process transport depends on the saturnus core crate; the
-  mutual git pins are a coordination cost, not a build cycle.
-- **Open (two plan reviews on 2026-10-05):** whether saturnus-mcp stays as
-  the agent's emulator session (depending on hptx-core, the Kermit layer
-  being needed for execution and error text) or is dropped in favour of
-  `saturnus run` plus the hptx CLI; and whether hptx-core's `object.rs`
-  adopts the new `saturnus-objects` decoder (it covers the body decoder,
-  not the file headers, padding, charset and reply parsers). Until decided:
-  no adapter crate, no `hptx-transport` crate, no `:lcd`; the in-process
-  transport stays in hptx-core and should use saturnus-drive's autostart
-  so it boots the 48SX, 48GX and 49G.
+  knowledge bases. Crate graph: hptx-core's optional in-process transport
+  depends on the saturnus core and saturnus-drive crates by git pin; once
+  saturnus-mcp is retired, nothing in saturnus depends on hptx.
+- **No MCP anywhere; saturnus gets a control API and `saturnus ctl`**
+  (user, after two plan reviews on 2026-10-05). saturnus-mcp is dropped:
+  the agent's emulator session is a foreground `saturnus run` (serial on
+  TCP plus an HTTP+JSON control API on loopback with a per-user token file)
+  driven by `saturnus ctl` or by calling the API directly; calculator
+  operations against it go through the hptx CLI exactly as against hardware
+  or the Docker image. No daemon, no instance files, no `ls`/`kill`/
+  `doctor`: `run` prints its endpoints and refuses a busy port naming the
+  listener, Ctrl-C ends it, fixed default ports with `--control` /
+  `SATURNUS_CONTROL` for a second instance. Reasons: the two reviews showed a
+  "self-contained" MCP would re-implement hptx-core's Kermit layer, and the
+  user prefers CLIs for local agents. saturnus-mcp's hptx-core pin goes away
+  with the crate. On the saturnus side this is recorded as
+  `backlog/control-api-replaces-mcp.md`, "relayed, unconfirmed", until the
+  owner confirms it in that repository; its open points are where the web
+  explorer's writes come from and where saturnus-mcp's Kermit e2e coverage
+  goes.
+- **Still open:** whether hptx-core's `object.rs` adopts `saturnus-objects`
+  (it covers the body decoder, not the file headers, padding allowance,
+  charset or reply parsers; a shared fixture corpus is the cheaper option).
+  Not needed for anything queued.
+- **hptx's in-process saturnus transport** stays in hptx-core behind its
+  feature as the fast test path and a REPL convenience; it should use
+  saturnus-drive's autostart so it boots the 48SX, 48GX and 49G. No adapter
+  crate, no `hptx-transport` crate, no `:lcd`.
 - **Whole-crate audits at milestones** (user): before publishing a crate,
   before the hardware iteration and before a release, a review-only vehicle
   PR branched from the iteration 1 merge with the current sources copied on
