@@ -19,11 +19,11 @@ on wasm32.
 
 ## Tasks
 
-- [ ] Both crates: a public `time` module re-exporting `Duration` and `Instant` from `std::time` (not wasm32) or `web_time` (wasm32), used throughout; `web-time = "1.1.0"` as a wasm32-only target dependency
-- [ ] CI: ubuntu leg of the check job installs `wasm32-unknown-unknown` and runs `cargo check -p kermit-proto -p xmodem-proto --target wasm32-unknown-unknown --locked`; actions stay SHA-pinned; `cargo deny --locked check` clean
-- [ ] Docs: "Time and WebAssembly" in both READMEs and `lib.rs` docs; `RUSTDOCFLAGS=-Dwarnings cargo doc -p kermit-proto -p xmodem-proto --no-deps` clean
-- [ ] `cargo publish --dry-run -p kermit-proto -p xmodem-proto` passes
-- [ ] Gates: fmt, clippy, tests (all trace replays), wasm32 check, deny, doc build, `hyalo lint`
+- [x] Both crates: a public `time` module re-exporting `Duration` and `Instant` from `std::time` (not wasm32) or `web_time` (wasm32), used throughout; `web-time = "1.1.0"` as a wasm32-only target dependency
+- [x] CI: ubuntu leg of the check job installs `wasm32-unknown-unknown` and runs `cargo check -p kermit-proto -p xmodem-proto --target wasm32-unknown-unknown --locked`; actions stay SHA-pinned; `cargo deny --locked check` clean
+- [x] Docs: "Time and WebAssembly" in both READMEs and `lib.rs` docs; `RUSTDOCFLAGS=-Dwarnings cargo doc -p kermit-proto -p xmodem-proto --no-deps` clean
+- [x] `cargo publish --dry-run -p kermit-proto -p xmodem-proto` passes
+- [x] Gates: fmt, clippy, tests (all trace replays), wasm32 check, deny, doc build, `hyalo lint`
 
 ## Acceptance
 
