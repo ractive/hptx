@@ -66,3 +66,21 @@ Each item must be covered by a test. Source: the wiki at `~/devel/hp-literature/
   5-nibble ROM pointer (the real 5). Covered: `object` fixture tests.
 - 48G XModem checksum-only; 48S/SX no XModem at all.
 - On the SX, SERVER typed within 2 s after FINISH loses keys (harness only).
+- The 49G's `VERSION` string says `HP48-C ... Copyright HP 2009`; only the
+  year tells it from a 48G. Covered: hptx-cli model-detection tests.
+- Storing IOPAR back with the same values grows the 48SX variable from 29.5
+  to 37.5 bytes. Covered: `settings` only stores on a change.
+- ASCII transfer of strings has two layers: T(2)/T(3) translation doubles
+  backslashes and applies trigraphs on top of the string syntax; the 49G
+  syntax escapes `\"` and `\\`, so a 49G backslash becomes four in T(3)
+  text; the 48 has no escapes and uses `C$ n` for strings holding a quote.
+  Covered: e2e-cli `object convert` round trips on both models.
+- `PURGE` of a missing `:0:` port object raises no error; use `VTYPE` (-1)
+  to test existence. Covered: hptx-cli restore cleanup.
+- 49G: an IOPAR of exact integers is invalid. The server stores it, answers
+  nothing to that command and leaves server mode with "Invalid IOPAR"; the
+  state persists until IOPAR is fixed. Build numbers for the 49G as reals
+  with a trailing dot. Changing the checksum type with valid reals does not
+  disturb the running session; it takes effect at the next SERVER. Covered:
+  `calc::tests::set_iopar_stores_reals`; verified on the emulated 49G and
+  48SX (2026-10-05).

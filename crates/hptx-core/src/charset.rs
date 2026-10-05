@@ -131,7 +131,7 @@ pub fn encode_command(text: &str) -> Result<Vec<u8>> {
 
 /// The byte and length of the trigraph at the start of `s` (which starts
 /// with a backslash), if any.
-fn trigraph_at(s: &str) -> Option<(u8, usize)> {
+pub fn trigraph_at(s: &str) -> Option<(u8, usize)> {
     // Mnemonics are a backslash and two characters; numeric codes `\nnn`.
     if let Some(head) = s.get(..3) {
         if let Some(i) = HIGH.iter().position(|(_, t)| *t == head) {
