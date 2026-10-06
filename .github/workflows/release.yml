@@ -8,12 +8,11 @@ name: Release
 # iteration 6 is done; promote it by hand on GitHub). Nothing is published
 # to crates.io here: `cargo publish` of the proto crates is a manual step.
 #
-# Triggers: a pull request or an iteration-branch push that changes this
-# file (workflow_dispatch only works once the workflow is on the default
-# branch, so this is how a change to it gets its dry run), by hand with
-# `gh workflow run release.yml --ref <branch>` after the merge, and a pushed
-# `v*` tag (path filters do not apply to tag pushes). Only the tag creates a
-# release; the other triggers stop after the artifacts.
+# Triggers: a pull request that changes this file (the dry run;
+# workflow_dispatch only works once the workflow is on the default branch),
+# by hand with `gh workflow run release.yml --ref <branch>` after the merge,
+# and a pushed `v*` tag (path filters do not apply to tag pushes). Only the
+# tag creates a release; the other triggers stop after the artifacts.
 
 on:
   push:
@@ -69,6 +68,12 @@ jobs:
         run: |
           version=$(cargo metadata --no-deps --format-version 1 --locked \
             | jq -r '.packages[] | select(.name == "hptx-cli") | .version')
+          # A tag must name the version it ships; every matrix leg fails on
+          # a mismatch, so `needs: build` skips the release job.
+          if [[ "$GITHUB_REF" == refs/tags/* && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match hptx-cli version $version"
+            exit 1
+          fi
           name="hptx-${version}-${{ matrix.target }}"
           mkdir -p "dist/$name"
           cp README.md LICENSE AI_NOTICE "dist/$name/"
@@ -118,5 +123,11 @@ jobs:
             echo
             echo "Install: unpack the archive for your platform and put \`hptx\` on your PATH, or \`cargo install --git https://github.com/ractive/hptx hptx-cli\`. Verify an archive against SHA256SUMS."
           } > notes.md
-          gh release create "$tag" dist/hptx-* dist/SHA256SUMS \
-            --repo "$GITHUB_REPOSITORY" --title "hptx $tag" --prerelease --verify-tag --notes-file notes.md
+          # Re-runnable: a release left half-uploaded by a failed run gets
+          # its assets completed instead of "already exists".
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$tag" dist/hptx-* dist/SHA256SUMS --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$tag" dist/hptx-* dist/SHA256SUMS \
+              --repo "$GITHUB_REPOSITORY" --title "hptx $tag" --prerelease --verify-tag --notes-file notes.md
+          fi
