@@ -458,3 +458,25 @@ Decisions already made. Do not re-litigate; add a dated entry to change one.
   marker moved from `$TMPDIR` to hptx's per-user data directory beside the
   REPL history, written with `create_new`; neither file is used through a
   symbolic link.
+
+## 2026-10-06: crates are published from CI
+
+**Context:** iteration 10 said the proto crates are published from the
+laptop (`cargo publish --dry-run`, then the user publishes). The user asked
+for publishing through CI instead, so that no crates.io token lives on a
+machine.
+
+**Decision:** `.github/workflows/publish.yml` publishes `kermit-proto` and
+`xmodem-proto`: a dry run on every pull request that changes the file and
+on a plain dispatch, a real publish only on a dispatch from `main` with
+`dry_run=false`. The token is the repository secret `CARGO_REGISTRY_TOKEN`
+(scopes publish-new and publish-update, limited to the two crate names).
+A crate whose version is already on the index is skipped, so a run that
+got only the first crate out can be dispatched again. Once both crates
+exist on crates.io, trusted publishing replaces the token
+(`backlog/crates-trusted-publishing.md`). hptx-core and hptx-cli stay
+unpublished; `release.yml` ships the binaries.
+
+**Consequence:** publishing is a reviewed, repeatable workflow run; the
+first publish of each crate still needs the token, because crates.io can
+only trust a publisher for a crate that exists.
