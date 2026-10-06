@@ -1,0 +1,51 @@
+name: Publish crates
+
+# Publishes the two protocol crates, kermit-proto and xmodem-proto, to
+# crates.io (decision log 2026-10-05: they are the only published crates;
+# hptx-core and hptx-cli ship as GitHub release binaries, release.yml).
+# Started by hand only; the default is a dry run. cargo orders the two
+# crates itself (xmodem-proto's dev-dependency on kermit-proto) and waits
+# for the index between them.
+#
+#   gh workflow run publish.yml                     # dry run
+#   gh workflow run publish.yml -f dry_run=false    # publish
+#
+# Needs the repository secret CARGO_REGISTRY_TOKEN: a crates.io API token
+# with the publish-new and publish-update scopes. Once both crates exist on
+# crates.io, switch to trusted publishing (rust-lang/crates-io-auth-action)
+# and drop the token.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Package and verify only, upload nothing
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Versions
+        run: cargo metadata --no-deps --format-version 1 --locked
+          | jq -r '.packages[] | select(.name == "kermit-proto" or .name == "xmodem-proto") | "\(.name) \(.version)"'
+      - name: Publish kermit-proto and xmodem-proto
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [[ "${{ inputs.dry_run }}" == "true" ]]; then
+            cargo publish -p kermit-proto -p xmodem-proto --locked --dry-run
+          else
+            cargo publish -p kermit-proto -p xmodem-proto --locked
+          fi
