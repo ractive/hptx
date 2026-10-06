@@ -31,6 +31,9 @@ env:
 
 jobs:
   publish:
+    # Only from main: a dispatch against another ref would hand the token
+    # to whatever that branch's copy of this file does.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:

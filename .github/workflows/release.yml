@@ -6,7 +6,8 @@ name: Release
 # then creates a GitHub pre-release with those archives and their SHA-256
 # sums (every release is a pre-release until the real-hardware round of
 # iteration 6 is done; promote it by hand on GitHub). Nothing is published
-# to crates.io here: `cargo publish` of the proto crates is a manual step.
+# to crates.io here: the proto crates go through publish.yml
+# (`gh workflow run publish.yml -f dry_run=false`).
 #
 # Triggers: a pull request that changes this file (the dry run;
 # workflow_dispatch only works once the workflow is on the default branch),
