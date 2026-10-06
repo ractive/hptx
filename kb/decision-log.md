@@ -458,3 +458,35 @@ Decisions already made. Do not re-litigate; add a dated entry to change one.
   marker moved from `$TMPDIR` to hptx's per-user data directory beside the
   REPL history, written with `create_new`; neither file is used through a
   symbolic link.
+
+## 2026-10-06: releases and crates go through ractive/release-workflows
+
+**Context:** iteration 11a built a release dry run of its own, and the
+first attempt at publishing the proto crates was a hand-written
+`publish.yml` with a crates.io token. The user asked for publishing
+through CI and set the same secrets hyalo, hoppy and ff-rdp use
+(`CARGO_TOKEN`, `HOMEBREW_TAP_TOKEN`, `SCOOP_BUCKET_TOKEN`, `WINGET_TOKEN`,
+`CLOUDSMITH_API_KEY`); the shared pipeline
+`ractive/release-workflows` already does everything those repositories
+need.
+
+**Decision:** `.github/workflows/release.yml` is a thin caller of
+`ractive/release-workflows/.github/workflows/release.yml@v0.2.1`: on a
+published GitHub release it checks the tag against `hptx-cli`'s version,
+builds eight targets, packages archives with shell completions, deb/rpm,
+SBOM and provenance, uploads the assets, publishes `kermit-proto` and
+`xmodem-proto` to crates.io, and updates the Homebrew tap, the Scoop
+bucket, winget (`ractive.hptx`, once the first manifest has been
+submitted to microsoft/winget-pkgs by hand) and Cloudsmith
+(`ractive/hptx`, once that repository exists; `cloudsmith-republish.yml`
+backfills an earlier release). A `workflow_dispatch` is a dry run. The
+deb/rpm package is named `hptx`, like the binary and the archives. `publish-crates.yml` is the recovery
+path for the crates alone. Releasing is `gh release create vX.Y.Z
+--prerelease --generate-notes` after the version bump is on `main`; every
+release stays a pre-release until the real-hardware round (iteration 6).
+hptx-core and hptx-cli stay unpublished on crates.io.
+
+**Consequence:** no release logic of our own to maintain; the pipeline's
+conventions (asset names `hptx-vX.Y.Z-<target>`, secrets, permissions)
+are fixed by the shared repository. Trusted publishing for crates.io is a
+change there, not here (`backlog/crates-trusted-publishing.md`).

@@ -1,133 +1,81 @@
 name: Release
 
-# Builds hptx for the four release targets, runs the fast tests on each,
-# packages the binary with README, LICENSE and AI_NOTICE, and uploads the
-# archives as workflow artifacts. On a pushed `v*` tag the `release` job
-# then creates a GitHub pre-release with those archives and their SHA-256
-# sums (every release is a pre-release until the real-hardware round of
-# iteration 6 is done; promote it by hand on GitHub). Nothing is published
-# to crates.io here: `cargo publish` of the proto crates is a manual step.
+# Thin caller of ractive/release-workflows (the pipeline hyalo, hoppy and
+# ff-rdp use): version check against the tag, builds for the targets
+# below, archives with shell completions, deb/rpm, SBOM and provenance,
+# the GitHub release assets, then crates.io (the two proto crates),
+# Homebrew tap, Scoop bucket, winget, Cloudsmith. A dispatch is a dry run:
+# everything is built and uploaded as workflow artifacts, nothing is
+# published.
 #
-# Triggers: a pull request that changes this file (the dry run;
-# workflow_dispatch only works once the workflow is on the default branch),
-# by hand with `gh workflow run release.yml --ref <branch>` after the merge,
-# and a pushed `v*` tag (path filters do not apply to tag pushes). Only the
-# tag creates a release; the other triggers stop after the artifacts.
+# Releasing: bump `[workspace.package] version`, merge, then
+# `gh release create vX.Y.Z --prerelease --generate-notes` (every release
+# stays a pre-release until the real-hardware round, iteration 6).
+# hptx-core and hptx-cli are not published to crates.io (decision log
+# 2026-10-05). Secrets: CARGO_TOKEN, HOMEBREW_TAP_TOKEN,
+# SCOOP_BUCKET_TOKEN, WINGET_TOKEN, CLOUDSMITH_API_KEY (repository
+# secrets, `secrets: inherit`).
+#
+# Two one-time bootstraps, both non-blocking until done: the Cloudsmith
+# repository ractive/hptx must exist (create it on cloudsmith.io; a
+# release made before that is backfilled with cloudsmith-republish.yml),
+# and winget can only update an existing package, so the first
+# ractive.hptx manifest is submitted to microsoft/winget-pkgs by hand
+# (wingetcreate, as for hoppy); the winget job fails harmlessly before.
 
 on:
-  push:
-    tags: ['v*']
-  pull_request:
-    paths: ['.github/workflows/release.yml']
+  release:
+    types: [published]
   workflow_dispatch:
 
 permissions:
-  contents: read
-
-env:
-  CARGO_TERM_COLOR: always
+  contents: write
+  id-token: write
+  attestations: write
 
 jobs:
-  build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: aarch64-apple-darwin
-            os: macos-latest
-          - target: x86_64-apple-darwin
-            # Native Intel runner, so the x86_64 tests run on x86_64.
-            os: macos-15-intel
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-    runs-on: ${{ matrix.os }}
-    # The Intel macOS runner is the slow one (about 6 min on a cold cache).
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
-        with:
-          targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          key: ${{ matrix.target }}
-      - name: Fast tests
-        run: cargo test --locked --workspace -q --target ${{ matrix.target }}
-      - name: Build hptx
-        run: cargo build --locked --release -p hptx-cli --target ${{ matrix.target }}
-      - name: Smoke test
-        shell: bash
-        run: target/${{ matrix.target }}/release/hptx --version
-      # One archive per target, named like cargo-dist does:
-      # hptx-<version>-<target>.tar.gz (zip on Windows).
-      - name: Package
-        id: package
-        shell: bash
-        run: |
-          version=$(cargo metadata --no-deps --format-version 1 --locked \
-            | jq -r '.packages[] | select(.name == "hptx-cli") | .version')
-          # A tag must name the version it ships; every matrix leg fails on
-          # a mismatch, so `needs: build` skips the release job.
-          if [[ "$GITHUB_REF" == refs/tags/* && "$GITHUB_REF_NAME" != "v$version" ]]; then
-            echo "::error::tag $GITHUB_REF_NAME does not match hptx-cli version $version"
-            exit 1
-          fi
-          name="hptx-${version}-${{ matrix.target }}"
-          mkdir -p "dist/$name"
-          cp README.md LICENSE AI_NOTICE "dist/$name/"
-          if [[ "$RUNNER_OS" == "Windows" ]]; then
-            cp "target/${{ matrix.target }}/release/hptx.exe" "dist/$name/"
-            (cd dist && 7z a -bd "$name.zip" "$name" > /dev/null)
-            archive="dist/$name.zip"
-          else
-            cp "target/${{ matrix.target }}/release/hptx" "dist/$name/"
-            tar -C dist -czf "dist/$name.tar.gz" "$name"
-            archive="dist/$name.tar.gz"
-          fi
-          echo "archive=$archive" >> "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: hptx-${{ matrix.target }}
-          path: ${{ steps.package.outputs.archive }}
-          if-no-files-found: error
-          retention-days: 7
-
   release:
-    # Only a pushed tag reaches this job; it is the one job allowed to write.
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: build
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          path: dist
-          merge-multiple: true
-      - name: Checksums
-        run: |
-          cd dist
-          ls -l
-          sha256sum hptx-* > SHA256SUMS
-          cat SHA256SUMS
-      - name: Create the pre-release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          tag="$GITHUB_REF_NAME"
-          {
-            echo "hptx $tag is a pre-release: tested against the emulated HP 48SX, 48GX and HP 49G only, not yet on real hardware (iteration 6). Kermit (SERVER mode) and XModem."
-            echo
-            echo "Install: unpack the archive for your platform and put \`hptx\` on your PATH, or \`cargo install --git https://github.com/ractive/hptx hptx-cli\`. Verify an archive against SHA256SUMS."
-          } > notes.md
-          # Re-runnable: a release left half-uploaded by a failed run gets
-          # its assets completed instead of "already exists".
-          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
-            gh release upload "$tag" dist/hptx-* dist/SHA256SUMS --clobber --repo "$GITHUB_REPOSITORY"
-          else
-            gh release create "$tag" dist/hptx-* dist/SHA256SUMS \
-              --repo "$GITHUB_REPOSITORY" --title "hptx $tag" --prerelease --verify-tag --notes-file notes.md
-          fi
+    uses: ractive/release-workflows/.github/workflows/release.yml@v0.2.1
+    secrets: inherit
+    with:
+      bin-name: hptx
+      version-package: hptx-cli
+      publish-crates: kermit-proto,xmodem-proto
+      winget-identifier: ractive.hptx
+      enable-linux-packages: true
+      linux-package-crate: hptx-cli
+      # Hosted apt/yum repos (non-blocking; needs CLOUDSMITH_API_KEY).
+      cloudsmith-repo: ractive/hptx
+      # Shell completions in the archives and the deb/rpm. Copied into
+      # crates/hptx-cli/ because cargo-deb and cargo-generate-rpm resolve
+      # asset paths relative to the crate directory.
+      pre-package-command: |
+        mkdir -p completions
+        if [ "$CROSS" = "true" ] || [ "$TARGET" = "aarch64-pc-windows-msvc" ]; then
+          # The target binary is not host-runnable: generate with a host build.
+          cargo run --release -p hptx-cli --bin hptx -- completions bash > completions/hptx.bash
+          cargo run --release -p hptx-cli --bin hptx -- completions zsh  > completions/_hptx
+          cargo run --release -p hptx-cli --bin hptx -- completions fish > completions/hptx.fish
+        else
+          "$BIN_PATH" completions bash > completions/hptx.bash
+          "$BIN_PATH" completions zsh  > completions/_hptx
+          "$BIN_PATH" completions fish > completions/hptx.fish
+        fi
+        mkdir -p crates/hptx-cli/completions
+        cp completions/* crates/hptx-cli/completions/
+      extra-archive-paths: completions
+      dry-run: ${{ github.event_name == 'workflow_dispatch' }}
+      # hyalo's seven targets plus the native Intel macOS runner (an
+      # hptx release platform since v0.1.0); the QEMU-emulated aarch64
+      # Linux targets build only, native tests gate every PR already.
+      targets: >-
+        [
+          {"target": "x86_64-unknown-linux-gnu", "os": "ubuntu-latest", "cross": false, "run_tests": true},
+          {"target": "x86_64-unknown-linux-musl", "os": "ubuntu-latest", "cross": true, "run_tests": true},
+          {"target": "aarch64-unknown-linux-gnu", "os": "ubuntu-latest", "cross": true, "run_tests": false},
+          {"target": "aarch64-unknown-linux-musl", "os": "ubuntu-latest", "cross": true, "run_tests": false},
+          {"target": "aarch64-apple-darwin", "os": "macos-latest", "cross": false, "run_tests": true},
+          {"target": "x86_64-apple-darwin", "os": "macos-15-intel", "cross": false, "run_tests": true},
+          {"target": "x86_64-pc-windows-msvc", "os": "windows-latest", "cross": false, "run_tests": true},
+          {"target": "aarch64-pc-windows-msvc", "os": "windows-latest", "cross": false, "run_tests": false}
+        ]

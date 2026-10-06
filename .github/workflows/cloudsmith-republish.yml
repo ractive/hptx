@@ -1,0 +1,18 @@
+# (Re)publishes a release's .deb/.rpm to Cloudsmith, e.g. for a release
+# made before the ractive/hptx Cloudsmith repository existed.
+name: Cloudsmith republish
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag whose .deb/.rpm to (re)publish, e.g. v0.1.0"
+        required: true
+permissions:
+  contents: read
+jobs:
+  republish:
+    uses: ractive/release-workflows/.github/workflows/cloudsmith-republish.yml@v0.2.1
+    secrets: inherit
+    with:
+      tag: ${{ inputs.tag }}
+      cloudsmith-repo: ractive/hptx
