@@ -15,6 +15,13 @@ name: Release
 # 2026-10-05). Secrets: CARGO_TOKEN, HOMEBREW_TAP_TOKEN,
 # SCOOP_BUCKET_TOKEN, WINGET_TOKEN, CLOUDSMITH_API_KEY (repository
 # secrets, `secrets: inherit`).
+#
+# Two one-time bootstraps, both non-blocking until done: the Cloudsmith
+# repository ractive/hptx must exist (create it on cloudsmith.io; a
+# release made before that is backfilled with cloudsmith-republish.yml),
+# and winget can only update an existing package, so the first
+# ractive.hptx manifest is submitted to microsoft/winget-pkgs by hand
+# (wingetcreate, as for hoppy); the winget job fails harmlessly before.
 
 on:
   release:
@@ -28,7 +35,7 @@ permissions:
 
 jobs:
   release:
-    uses: ractive/release-workflows/.github/workflows/release.yml@v0.2.0
+    uses: ractive/release-workflows/.github/workflows/release.yml@v0.2.1
     secrets: inherit
     with:
       bin-name: hptx

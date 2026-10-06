@@ -476,8 +476,11 @@ published GitHub release it checks the tag against `hptx-cli`'s version,
 builds eight targets, packages archives with shell completions, deb/rpm,
 SBOM and provenance, uploads the assets, publishes `kermit-proto` and
 `xmodem-proto` to crates.io, and updates the Homebrew tap, the Scoop
-bucket, winget (`ractive.hptx`) and Cloudsmith (`ractive/hptx`). A
-`workflow_dispatch` is a dry run. `publish-crates.yml` is the recovery
+bucket, winget (`ractive.hptx`, once the first manifest has been
+submitted to microsoft/winget-pkgs by hand) and Cloudsmith
+(`ractive/hptx`, once that repository exists; `cloudsmith-republish.yml`
+backfills an earlier release). A `workflow_dispatch` is a dry run. The
+deb/rpm package is named `hptx`, like the binary and the archives. `publish-crates.yml` is the recovery
 path for the crates alone. Releasing is `gh release create vX.Y.Z
 --prerelease --generate-notes` after the version bump is on `main`; every
 release stays a pre-release until the real-hardware round (iteration 6).
