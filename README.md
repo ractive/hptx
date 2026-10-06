@@ -7,6 +7,10 @@ for people and for AI agents, and a GUI later.
 
 ![hptx against the emulated HP 48SX: ls, get, object inspect, run and a REPL session](docs/hptx-demo.gif)
 
+<sub>Recorded with `HPTX_PORT=tcp://localhost:4848` against the emulated 48SX
+(`just emulator-up`); with a cable, `--port` or `HPTX_PORT` names the serial
+device.</sub>
+
 Status: early. The sans-IO Kermit client (`crates/kermit-proto`) and the
 HP layer (`crates/hptx-core`: serial/TCP transports, directory listing,
 get/put in binary or ASCII, host commands, the graphics screen PICT, backup
