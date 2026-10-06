@@ -27,6 +27,14 @@ pub struct Config {
     pub timeout: Duration,
     /// Retransmissions per packet before giving up (default 5).
     pub retries: u32,
+    /// Retransmissions of the packet that starts a server transaction (the
+    /// `C`, `R`, `G` or `I`) while no reply to it has arrived; `None`
+    /// (default) means [`Config::retries`]. Once the server answers (its
+    /// `S`), [`Config::retries`] applies to the rest of the transaction.
+    /// `Some(0)` sends a host command exactly once: a server cannot tell a
+    /// resent `C` from a new one and runs it again, while a damaged reply
+    /// packet is still re-requested.
+    pub first_packet_retries: Option<u32>,
     /// Delay before each packet we send in reply to input (default 0).
     pub packet_pause: Duration,
     /// How long a NAK received while waiting for the reply to the first packet
@@ -56,6 +64,7 @@ impl Default for Config {
             repeat: true,
             timeout: Duration::from_secs(20),
             retries: 5,
+            first_packet_retries: None,
             packet_pause: Duration::ZERO,
             nak_grace: Duration::from_secs(1),
             linger: Duration::from_secs(1),
@@ -512,7 +521,11 @@ impl Client {
     /// `due`, or give up.
     fn retry_with(&mut self, now: Instant, due: Instant, bytes: Vec<u8>) {
         self.retries += 1;
-        if self.retries > self.config.retries {
+        let limit = match (&self.phase, self.config.first_packet_retries) {
+            (Phase::Await(_), Some(first)) => first,
+            _ => self.config.retries,
+        };
+        if self.retries > limit {
             self.fail(now, Error::Timeout, Some(b"Too many retries"));
         } else {
             self.deadline = None;
@@ -1580,6 +1593,58 @@ mod tests {
         c.handle_input(now, &wire(0, b'S', b"~* @-#Y3", T1));
         assert_eq!(c.poll_output(now), Some(wire(0, b'Y', OURS, T1)));
         (c, now)
+    }
+
+    /// `first_packet_retries = Some(0)` (hptx's host commands, audit PR #18
+    /// #1): the `C` is never resent, neither after a timeout nor after a
+    /// NAK; once the server's `S` is in, a damaged reply packet is still
+    /// NAKed and re-requested with the normal retries.
+    #[test]
+    fn first_packet_retries_only_cover_the_command() {
+        let config = Config {
+            first_packet_retries: Some(0),
+            nak_grace: Duration::from_secs(20),
+            ..cfg()
+        };
+        let timeout = config.timeout;
+        let now = Instant::now();
+        let mut c = Client::new(config.clone());
+        c.start(now, Command::Host(b"X".to_vec())).unwrap();
+        assert_eq!(c.poll_output(now), Some(wire(0, b'C', b"X", T1)));
+        c.handle_input(now, &wire(0, b'N', b"", T1));
+        c.handle_timeout(now + timeout);
+        assert_eq!(
+            c.poll_output(now + timeout),
+            Some(wire(0, b'E', b"Too many retries", T1))
+        );
+        assert_eq!(c.poll_output(now + timeout), None);
+        assert_eq!(c.poll_event(), Some(Event::Error(Error::Timeout)));
+
+        // The same command answered: S, X, then a damaged D is NAKed twice
+        // and the good copy accepted.
+        let mut c = Client::new(config);
+        c.start(now, Command::Host(b"X".to_vec())).unwrap();
+        c.poll_output(now).unwrap();
+        c.handle_input(now, &wire(0, b'S', b"~* @-#Y3", T1));
+        assert_eq!(c.poll_output(now), Some(wire(0, b'Y', OURS, T1)));
+        c.handle_input(now, &wire(1, b'X', b"", T3));
+        assert_eq!(c.poll_output(now), Some(wire(1, b'Y', b"", T3)));
+        let mut bad = wire(2, b'D', b"42", T3);
+        bad[5] ^= 1;
+        for _ in 0..2 {
+            c.handle_input(now, &bad);
+            assert_eq!(c.poll_output(now), Some(wire(2, b'N', b"", T3)));
+        }
+        // A lost packet: the timeout NAKs it too.
+        c.handle_timeout(now + timeout);
+        assert_eq!(c.poll_output(now + timeout), Some(wire(2, b'N', b"", T3)));
+        c.handle_input(now + timeout, &wire(2, b'D', b"42", T3));
+        assert_eq!(c.poll_output(now + timeout), Some(wire(2, b'Y', b"", T3)));
+        assert!(
+            !all_events(&mut c)
+                .iter()
+                .any(|e| matches!(e, Event::Error(_)))
+        );
     }
 
     #[test]

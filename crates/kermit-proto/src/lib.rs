@@ -46,6 +46,12 @@
 //! also tolerates a stale NAK that slips through (it waits
 //! [`Config::nak_grace`] before resending).
 //!
+//! A server runs a host command (`C`) when it receives it and cannot tell a
+//! retransmission from a new command. [`Config::first_packet_retries`]
+//! limits the resends of the packet that starts a transaction separately:
+//! `Some(0)` sends a `C` once, while the reply packets after the server's
+//! `S` keep [`Config::retries`].
+//!
 //! # Time and WebAssembly
 //!
 //! The state machine never reads a clock: every call that needs the time

@@ -326,14 +326,25 @@ pub fn calculator_failure(message: String, stack: Vec<String>) -> Failure {
     failure
 }
 
-/// True if `err` means the link is gone: the session cannot go on.
+/// True if `err` means the link is gone: the session cannot go on. A dead
+/// link (I/O, serial, a Kermit timeout); a refused or broken-off transfer
+/// (`TooLarge`, `Protocol`, `Cancelled`) ends with an E packet and leaves
+/// the server ready for the next line, and a host command without a reply
+/// is followed by a resync ([`is_no_reply`]).
 pub fn is_link_failure(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         matches!(
             cause.downcast_ref::<Error>(),
-            Some(Error::Io(_) | Error::Serial(_) | Error::Kermit(_))
+            Some(Error::Io(_) | Error::Serial(_) | Error::Kermit(kermit_proto::Error::Timeout))
         )
     })
+}
+
+/// True if `err` is a host command without a reply: it may still run, and
+/// its late reply would land on the next line unless the session resyncs.
+pub fn is_no_reply(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| matches!(cause.downcast_ref::<Error>(), Some(Error::NoReply { .. })))
 }
 
 /// Which operating system's data directory to use.
@@ -345,7 +356,7 @@ pub enum Platform {
 }
 
 impl Platform {
-    fn current() -> Platform {
+    pub(crate) fn current() -> Platform {
         if cfg!(windows) {
             Platform::Windows
         } else if cfg!(target_os = "macos") {
@@ -356,29 +367,31 @@ impl Platform {
     }
 }
 
+/// hptx's directory under the user's data directory (history, restore
+/// marker); `None` without HOME (or APPDATA on Windows).
+pub fn data_dir(platform: Platform, var: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    let set = |name: &str| var(name).filter(|v| !v.is_empty()).map(PathBuf::from);
+    let base = match platform {
+        Platform::Windows => set("APPDATA")?,
+        Platform::MacOs => set("HOME")?.join("Library").join("Application Support"),
+        // `has_root`, not `is_absolute`: the same on Linux, but the rule is
+        // the XDG one ("/..."), whatever host evaluates it (on Windows,
+        // `/data` is rooted yet not absolute).
+        Platform::Linux => set("XDG_DATA_HOME")
+            .filter(|p| p.has_root())
+            .or_else(|| set("HOME").map(|h| h.join(".local").join("share")))?,
+    };
+    Some(base.join("hptx"))
+}
+
 /// The history file under the user's data directory; `None` without HOME
 /// (or APPDATA on Windows).
 pub fn history_path(platform: Platform, var: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
-    let set = |name: &str| var(name).filter(|v| !v.is_empty()).map(PathBuf::from);
-    match platform {
-        Platform::Windows => Some(set("APPDATA")?.join("hptx").join("history.txt")),
-        Platform::MacOs => Some(
-            set("HOME")?
-                .join("Library")
-                .join("Application Support")
-                .join("hptx")
-                .join("history"),
-        ),
-        Platform::Linux => {
-            // `has_root`, not `is_absolute`: the same on Linux, but the
-            // rule is the XDG one ("/..."), whatever host evaluates it (on
-            // Windows, `/data` is rooted yet not absolute).
-            let data = set("XDG_DATA_HOME")
-                .filter(|p| p.has_root())
-                .or_else(|| set("HOME").map(|h| h.join(".local").join("share")))?;
-            Some(data.join("hptx").join("history"))
-        }
-    }
+    let name = match platform {
+        Platform::Windows => "history.txt",
+        Platform::MacOs | Platform::Linux => "history",
+    };
+    Some(data_dir(platform, var)?.join(name))
 }
 
 /// After a line: go on or leave.
@@ -516,7 +529,7 @@ impl Ctx {
         let mut history = History::new(history_path(Platform::current(), |name| {
             std::env::var_os(name)
         }));
-        if let Some(path) = &history.path {
+        if let Some(path) = history.usable() {
             // No history yet is fine.
             let _ = editor.load_history(path);
         }
@@ -529,11 +542,8 @@ impl Ctx {
                         let _ = editor.add_history_entry(line.as_str());
                         // Appended before the line runs: Ctrl-C during a
                         // command kills hptx and must not lose the session.
-                        if let Some(path) = history.path.clone() {
-                            let result = editor.append_history(&path);
-                            if let Some(note) = history.note(result) {
-                                eprintln!("{note}");
-                            }
+                        if let Some(note) = history.append(&mut editor) {
+                            eprintln!("{note}");
                         }
                     }
                     match self.repl_line(calc, &line, Output::Text)? {
@@ -552,12 +562,21 @@ impl Ctx {
         let mut input = std::io::stdin().lock();
         let mut buf = Vec::new();
         loop {
-            buf.clear();
-            if input.read_until(b'\n', &mut buf).context("reading stdin")? == 0 {
-                return Ok(());
-            }
-            let line = String::from_utf8_lossy(&buf);
-            if let Flow::Quit = self.repl_line(calc, &line, output)? {
+            let flow = match read_line(&mut input, &mut buf, MAX_LINE).context("reading stdin")? {
+                LineRead::Eof => return Ok(()),
+                LineRead::Line => {
+                    let line = String::from_utf8_lossy(&buf).into_owned();
+                    self.repl_line(calc, &line, output)?
+                }
+                LineRead::TooLong => {
+                    let err = Hinted::new(
+                        format!("line longer than {MAX_LINE} bytes, skipped"),
+                        TOO_LONG_HINT,
+                    );
+                    self.show(Err(err.into()), output)?
+                }
+            };
+            if flow == Flow::Quit {
                 return Ok(());
             }
         }
@@ -565,8 +584,29 @@ impl Ctx {
 
     /// Run one line and show the result. `Err` only for a link failure; in
     /// JSON-lines mode it is written as the line's object first.
+    /// After a line without a reply the session resyncs
+    /// ([`Calculator::sync`]: the late reply, or a calculator still busy)
+    /// and goes on; a failed resync ends it.
     fn repl_line(&mut self, calc: &mut Calculator, line: &str, output: Output) -> Result<Flow> {
-        match (self.repl_eval(calc, line), output) {
+        let shown = self.repl_eval(calc, line);
+        let no_reply = matches!(&shown, Err(e) if is_no_reply(e));
+        let flow = self.show(shown, output)?;
+        if no_reply && let Err(e) = calc.sync() {
+            let err = anyhow::Error::new(e).context("resyncing after a line without a reply");
+            return match output {
+                Output::Text => Err(err),
+                Output::JsonLines => {
+                    print_json(&failure_json(&repl_failure(&err, &self.link)))?;
+                    Err(err.context(Reported))
+                }
+            };
+        }
+        Ok(flow)
+    }
+
+    /// Show what a line produced, see [`Ctx::repl_line`].
+    fn show(&self, shown: Result<Shown>, output: Output) -> Result<Flow> {
+        match (shown, output) {
             (Ok(shown), Output::Text) => {
                 show_text(&shown)?;
                 Ok(flow(&shown))
@@ -713,7 +753,7 @@ fn print_json(value: &serde_json::Value) -> Result<Flow> {
 /// `:quit`.
 fn write_json_line(out: &mut impl std::io::Write, value: &serde_json::Value) -> Result<Flow> {
     let result = out
-        .write_all(value.to_string().as_bytes())
+        .write_all(output::escape_json(&value.to_string()).as_bytes())
         .and_then(|()| out.write_all(b"\n"))
         .and_then(|()| out.flush());
     match result {
@@ -750,13 +790,70 @@ fn refuse_existing(file: &Path, force: bool, other: &str) -> Result<()> {
     Ok(())
 }
 
-/// Print `text` and a newline, nothing for empty text.
+/// Print `text` and a newline, nothing for empty text; control characters
+/// escaped ([`output::escape_control`]).
 fn print_text(text: &str) -> Result<()> {
     let text = text.trim_end_matches('\n');
     if text.is_empty() {
         return Ok(());
     }
-    output::print_stdout(text).context("writing to stdout")
+    output::print_stdout(&output::escape_control(text)).context("writing to stdout")
+}
+
+/// `path` is a symbolic link (not followed).
+pub(crate) fn is_symlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+}
+
+/// Longest piped line read: a host command fits in one Kermit packet (77
+/// encoded bytes) and a colon command names a file; anything longer is
+/// skipped without being buffered.
+const MAX_LINE: usize = 8192;
+
+/// What [`read_line`] found.
+#[derive(Debug, PartialEq, Eq)]
+enum LineRead {
+    /// End of input.
+    Eof,
+    /// A line, in the buffer.
+    Line,
+    /// A line longer than the limit; it was read past and dropped.
+    TooLong,
+}
+
+/// Read one line into `buf` (cleared first), at most `limit` bytes plus the
+/// newline. A longer line is consumed up to its newline without storing
+/// more than that.
+fn read_line(
+    input: &mut impl BufRead,
+    buf: &mut Vec<u8>,
+    limit: usize,
+) -> std::io::Result<LineRead> {
+    buf.clear();
+    let max = u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1);
+    if std::io::Read::take(&mut *input, max).read_until(b'\n', buf)? == 0 {
+        return Ok(LineRead::Eof);
+    }
+    if buf.len() <= limit || buf.ends_with(b"\n") {
+        return Ok(LineRead::Line);
+    }
+    buf.clear();
+    loop {
+        let chunk = input.fill_buf()?;
+        if chunk.is_empty() {
+            return Ok(LineRead::TooLong);
+        }
+        match chunk.iter().position(|&b| b == b'\n') {
+            Some(i) => {
+                input.consume(i + 1);
+                return Ok(LineRead::TooLong);
+            }
+            None => {
+                let n = chunk.len();
+                input.consume(n);
+            }
+        }
+    }
 }
 
 /// The history file and whether its failure was reported.
@@ -772,6 +869,23 @@ impl History {
             let _ = std::fs::create_dir_all(dir);
         }
         History { path, noted: false }
+    }
+
+    /// The path, unless it is a symbolic link: rustyline opens it with a
+    /// plain open, which would follow a link planted there.
+    fn usable(&self) -> Option<&Path> {
+        self.path.as_deref().filter(|p| !is_symlink(p))
+    }
+
+    /// Append the editor's new entries; a note for the first failure.
+    fn append(&mut self, editor: &mut rustyline::DefaultEditor) -> Option<String> {
+        let path = self.path.clone()?;
+        let result = if is_symlink(&path) {
+            Err("it is a symbolic link; not followed".to_string())
+        } else {
+            editor.append_history(&path).map_err(|e| e.to_string())
+        };
+        self.note(result)
     }
 
     /// The note for a failed write, only the first time.
@@ -1222,6 +1336,65 @@ mod tests {
         assert_eq!(either(Flow::Continue, Flow::Continue), Flow::Continue);
     }
 
+    /// Audit PR #18, #5: a 10 MiB piped line is skipped without being
+    /// buffered, and the next line is read as usual.
+    #[test]
+    fn overlong_piped_line_is_skipped() {
+        let mut data = vec![b'1'; 10 << 20];
+        data.extend_from_slice(b"\n6 7 *\n");
+        let mut input = std::io::BufReader::new(data.as_slice());
+        let mut buf = Vec::new();
+        assert_eq!(
+            read_line(&mut input, &mut buf, MAX_LINE).unwrap(),
+            LineRead::TooLong
+        );
+        assert!(buf.capacity() <= 2 * (MAX_LINE + 1), "{}", buf.capacity());
+        assert_eq!(
+            read_line(&mut input, &mut buf, MAX_LINE).unwrap(),
+            LineRead::Line
+        );
+        assert_eq!(buf, b"6 7 *\n");
+        assert_eq!(
+            read_line(&mut input, &mut buf, MAX_LINE).unwrap(),
+            LineRead::Eof
+        );
+        // Exactly the limit, with or without the newline, is a line.
+        let mut input = std::io::BufReader::new(&b"abc\nabc"[..]);
+        assert_eq!(read_line(&mut input, &mut buf, 3).unwrap(), LineRead::Line);
+        assert_eq!(read_line(&mut input, &mut buf, 3).unwrap(), LineRead::Line);
+        assert_eq!(buf, b"abc");
+    }
+
+    /// PR #20 review: a line without a reply is a per-line error; the
+    /// session resyncs and the next line works.
+    #[test]
+    fn line_without_reply_resyncs_and_goes_on() {
+        let (mut calc, log) = crate::testkit::calc(|cmd| match cmd {
+            "SLOW" => "SILENT".into(),
+            "6 7 *" => "1:                 42\r\n".into(),
+            "DROP" => "Empty Stack\r\n".into(),
+            marker => format!("1: {marker}\r\n"),
+        });
+        let mut ctx = crate::testkit::ctx();
+        assert_eq!(
+            ctx.repl_line(&mut calc, "SLOW", Output::Text).unwrap(),
+            Flow::Continue
+        );
+        assert_eq!(
+            ctx.repl_line(&mut calc, "6 7 *", Output::Text).unwrap(),
+            Flow::Continue
+        );
+        let log = crate::testkit::sent(&log);
+        assert_eq!(log.len(), 4, "{log:?}");
+        assert_eq!(log[0], "SLOW");
+        assert!(log[1].starts_with("\"HPTX-"), "{log:?}");
+        assert_eq!(log[2..], ["DROP", "6 7 *"]);
+
+        // A resync that fails (the calculator stays silent) ends the session.
+        let (mut calc, _) = crate::testkit::calc(|_| "SILENT".into());
+        assert!(ctx.repl_line(&mut calc, "SLOW", Output::Text).is_err());
+    }
+
     #[test]
     fn mode_choice() {
         assert_eq!(input_mode(true), InputMode::Editor);
@@ -1245,6 +1418,20 @@ mod tests {
             max: 77,
         });
         assert!(!is_link_failure(&too_long));
+        // Audit PR #18, #16: a transfer refused or broken off with an E
+        // packet is a per-line error; a host command without a reply is not.
+        for per_line in [
+            kermit_proto::Error::TooLarge { limit: 4 << 20 },
+            kermit_proto::Error::Protocol("bad packet".into()),
+            kermit_proto::Error::Cancelled,
+        ] {
+            let err = anyhow::Error::new(Error::Kermit(per_line)).context("get X");
+            assert!(!is_link_failure(&err), "{err:?}");
+        }
+        let no_reply = anyhow::Error::new(Error::NoReply {
+            command: "1 2 +".into(),
+        });
+        assert!(!is_link_failure(&no_reply) && is_no_reply(&no_reply));
         // A local file error is not the link.
         let file = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound))
             .context("cannot read x.hp");
@@ -1429,6 +1616,31 @@ mod tests {
         );
         assert_eq!(h.note(Err("denied")), None);
         assert_eq!(h.note::<&str>(Ok(())), None);
+    }
+
+    /// security.md "REPL history symlink": a symbolic link at the history
+    /// path is neither read nor written through.
+    #[cfg(unix)]
+    #[test]
+    fn history_refuses_a_symlink() {
+        let dir = std::env::temp_dir().join(format!("hptx-history-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Another test's rustyline narrows the process umask for a moment.
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        let target = dir.join("victim");
+        std::fs::write(&target, b"precious\n").unwrap();
+        let path = dir.join("history");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        let mut history = History::new(Some(path.clone()));
+        assert_eq!(history.usable(), None);
+        let mut editor = rustyline::DefaultEditor::new().unwrap();
+        editor.add_history_entry("42 'X' STO").unwrap();
+        let note = history.append(&mut editor).unwrap();
+        assert!(note.contains("symbolic link"), "{note}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"precious\n");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

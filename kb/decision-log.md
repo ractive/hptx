@@ -395,3 +395,66 @@ Decisions already made. Do not re-litigate; add a dated entry to change one.
   a clock, but a browser cannot construct `std::time::Instant`, and the
   saturnus web UI will use kermit-proto as a wasm dependency. CI checks
   both crates for `wasm32-unknown-unknown` on the Linux leg.
+
+## 2026-10-06 (iteration 12)
+
+- **Host commands are single-shot.** `Calculator::host` sends every `C`
+  packet once (`first_packet_retries = Some(0)`, `nak_grace = timeout`); no
+  answer in time is `Error::NoReply` ("may still be running or may have run; the next
+  connection resyncs"). Why: the calculator executes a `C` packet when it
+  receives it, and a retransmission after a lost or late ACK (or 1 s after
+  a NAK, which may be a stale one from the idle server) is indistinguishable
+  from a new command, so `run`, REPL lines, `rm`, `mv`, `mkdir`,
+  `put --overwrite`, `settings` and the internal `DROP`s ran twice (audit
+  PR #18, #1; seen once as `4711` twice on the 49G). Kermit sequence numbers
+  restart at zero for every command, so nothing on the wire tells the two
+  apart; never resending is the only fix without a protocol change. Cost: a
+  lost `C` or a lost first answer surfaces as `NoReply`, which the user
+  checks and retries by hand; the REPL prints it, resyncs
+  (`Calculator::sync` absorbs the late reply) and goes on, ending only if
+  the resync fails. `G D`, GET and SEND keep their retries, and so does the
+  second sync marker attempt, the only command that may run twice.
+  Supersedes the 11b sentence "an odd reply is never an error": two odd
+  replies in a row now fail the connect (`Error::Reply`, "not in step"),
+  since nothing is run on a stack hptx cannot vouch for.
+- **First-packet retry budget.** kermit-proto `Config` gained
+  `first_packet_retries: Option<u32>` (`None` = `retries`), counted only
+  while the client awaits the answer to the packet that starts the
+  transaction. Once the server's `S` is in, the normal `retries` cover the
+  reply, so a damaged or lost X/D/Z/B is still NAKed and re-requested; a
+  timeout after the `S` is the ordinary Kermit timeout (the command ran),
+  not `NoReply` (`Session::answered`). First design (PR #20 review): plain
+  `retries = 0` aborted the whole reply on one bad packet and misreported
+  it as `NoReply`. kermit-proto is unpublished, so the field is additive.
+- **Restore probe.** A `RESTORE` that gets no reply is done only if a probe
+  after it (a fresh sync marker, sent once, normal timeout) gets no reply
+  either: the warm start ended server mode. A reply to the probe leaves the
+  result unknown: the `RESTORE` command may have been lost, or it ran and
+  `SERVER` was restarted on the calculator within the probe's timeout
+  (PR #20 review; the first wording called it "did not run"). Error,
+  `:0:HPTXRS` stays, the hint says to check HOME with `hptx ls` before
+  running the restore again. Costs one `--timeout` (20 s) on every
+  successful restore. `restore` also requires a complete directory walk
+  (any attached library id) before the upload and in `--dry-run`.
+- **Converter output rule.** `object convert` and `grob to-png` without
+  `-o` write the input's file name with the new extension in the current
+  directory (`./x.txt` for `dl/x.hp`), like every other default output,
+  and stdout for stdin input; `-o` as before. Changed from writing beside
+  the input (security.md invariant 1).
+- **`--jq` without `env`.** jaq-std's `funs()` and `extra_funs()` exist only
+  with all default features, and the `std` feature also carries `now`, so
+  the features cannot drop `env` alone. hptx filters `env`, `halt`,
+  `halt_error`, `debug`, `debug_empty`, `stderr` and `stderr_empty` out of
+  jaq-std's definitions and native filters by name; they are undefined.
+  Output is capped at 10 000 results and 64 MiB.
+- **Windows names everywhere.** `validate_name` refuses `\` and the Windows
+  device names (`CON`, `NUL`, `COM1`, ... any case, also before a `.`) on
+  every platform, so a name that works on one system works on all; the
+  calculator has commands of most of these names anyway.
+- **Terminal escapes.** One helper, `output::escape_control`, at the text
+  rendering boundary (`render`, `Failure::render`, REPL output, `--jq` raw
+  strings) shows control characters as `\xHH`; JSON stays as is.
+- **Restore marker and history in the data directory.** The restore
+  marker moved from `$TMPDIR` to hptx's per-user data directory beside the
+  REPL history, written with `create_new`; neither file is used through a
+  symbolic link.

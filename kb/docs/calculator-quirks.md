@@ -26,6 +26,15 @@ Each item must be covered by a test. Source: the wiki at `~/devel/hp-literature/
   6 s) NAKs it. `Session` waits 200 ms between transactions (100 ms was
   enough on the emulator). Covered: `session` test
   `turnaround_pause_between_transactions`; e2e runtime (425 s -> 63 s).
+- A `C` packet resent after a lost or late ACK (or after a NAK) runs
+  again: the server executes a command when it receives it and cannot tell
+  a retransmission from a new command (sequence numbers restart at zero for
+  every command). Seen once on the emulated 49G under load (`4711` twice,
+  2026-10-05). hptx sends every `C` once (`first_packet_retries =
+  Some(0)`, NAK grace = timeout) and reports a missing answer as
+  `NoReply`; the reply packets after the `S` keep their retries. Covered:
+  `calc` tests `host_command_is_never_resent`,
+  `host_reply_packets_keep_their_retries`.
 - Server command packets (I, S, R, C, G) must use block check 1 even after
   an I exchange agreed on 3; a type-3 C packet is NAKed. The HP sends no
   REPT field, so repeat prefixing is never used with it. Covered:

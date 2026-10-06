@@ -37,7 +37,17 @@ hptx run '6 7 *'                        # run RPL, print the stack
 hptx pict -o plot.png                   # the graphics screen PICT (plots)
 hptx backup -o home.hp
 hptx object inspect prg.hp              # offline: type and size of a file
+hptx object convert dl/x.hp --to ascii  # offline: writes ./x.txt
 ```
+
+Files are written only where you say (`-o FILE`) or under a name hptx picks
+in the current directory: the variable's name for `get`, a timestamped name
+for `backup` and `pict`, and the input's file name with a new extension for
+`object convert` and `grob to-png` (not beside the input). An existing file
+is never replaced without `--force`. A host command (`run`, a REPL line,
+`rm`, `mv`, ...) is sent once and never resent: if its reply does not come
+in time, hptx says so and you check on the calculator before running it
+again.
 
 With exactly one USB serial port, `--port` can be left out. Output is text
 on a terminal and JSON when piped, in one envelope

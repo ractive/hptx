@@ -9,7 +9,7 @@
 //! command packet, reply packets) has been seen on a real calculator yet.
 
 use std::fmt::Write as _;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -293,6 +293,46 @@ fn dry_run_outcome(command: &XservCommand, what: String) -> Result<Outcome> {
     })
 }
 
+/// The components of `dir` below HOME. Each is evaluated by the
+/// calculator, so it must be a plain name ([`validate_name`]), as for
+/// `Calculator::cd`.
+fn dir_components(dir: &str) -> Result<Vec<String>> {
+    let components = util::parse_dir(dir);
+    for name in &components {
+        validate_name(name)
+            .with_context(|| format!("xserv: cd {}", util::dir_string(&components)))?;
+    }
+    Ok(components)
+}
+
+/// Change to `dir` from HOME like `Calculator::cd`: `HOME`, then per
+/// component a listing that must show it as a directory before it is
+/// evaluated (evaluating a variable would run it or push its value and
+/// leave the directory unchanged).
+fn xserv_cd(client: &mut XservClient, dir: &str) -> Result<()> {
+    let components = dir_components(dir)?;
+    let label = format!("xserv: cd {}", util::dir_string(&components));
+    client
+        .send(&XservCommand::Execute("HOME".into()))
+        .with_context(|| label.clone())?;
+    for name in &components {
+        client
+            .send(&XservCommand::List)
+            .with_context(|| label.clone())?;
+        let data = client.reply().with_context(|| label.clone())?;
+        let records = parse_dir_list(&data)
+            .map_err(|e| Error::Reply(e.to_string()))
+            .with_context(|| label.clone())?;
+        if !records.iter().any(|r| r.name == *name && r.is_directory()) {
+            return Err(Error::Reply(format!("{name}: no such directory"))).context(label);
+        }
+        client
+            .send(&XservCommand::Execute(name.clone()))
+            .with_context(|| label.clone())?;
+    }
+    Ok(())
+}
+
 impl Ctx {
     /// Open the link to a calculator running XSERV and change to `--dir`.
     fn xserv_open(&mut self) -> Result<XservClient> {
@@ -301,13 +341,7 @@ impl Ctx {
         let link = transport::open(&addr).with_context(|| format!("cannot open {addr}"))?;
         let mut client = XservClient::new(link, self.link.timeout);
         if let Some(dir) = self.global.dir.clone() {
-            let path = std::iter::once("HOME".to_string())
-                .chain(util::parse_dir(&dir))
-                .collect::<Vec<_>>()
-                .join(" ");
-            client
-                .send(&XservCommand::Execute(path.clone()))
-                .with_context(|| format!("xserv: cd {path}"))?;
+            xserv_cd(&mut client, &dir)?;
         }
         Ok(client)
     }
@@ -438,15 +472,7 @@ impl Ctx {
             (None, false) => util::name_from_file(file).unwrap_or_default(),
         };
         validate_name(&name).with_context(|| format!("xserv put {name}"))?;
-        let data = if from_stdin {
-            let mut buf = Vec::new();
-            std::io::stdin()
-                .read_to_end(&mut buf)
-                .context("reading stdin")?;
-            buf
-        } else {
-            std::fs::read(file).with_context(|| format!("cannot read {}", file.display()))?
-        };
+        let data = util::read_input(file)?;
         let label = file.display().to_string();
         let cmd = XservCommand::Put(name.clone());
         if dry_run {
@@ -492,6 +518,24 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     type Log = Arc<Mutex<Vec<Vec<u8>>>>;
+
+    /// Audit PR #18, #15: `--dir` components are checked like
+    /// `Calculator::cd` before the calculator evaluates them.
+    #[test]
+    fn dir_components_are_names() {
+        assert_eq!(dir_components("HOME/A/B").unwrap(), ["A", "B"]);
+        assert!(dir_components("/").unwrap().is_empty());
+        for bad in ["A/1 PURGE", "A/'X'", "{ HOME \u{ab}X\u{bb} }", "A/CLEAR;X"] {
+            let err = dir_components(bad).unwrap_err();
+            assert!(
+                err.chain().any(|c| matches!(
+                    c.downcast_ref::<hptx_core::Error>(),
+                    Some(hptx_core::Error::Name(_))
+                )),
+                "{bad}: {err:?}"
+            );
+        }
+    }
 
     /// A calculator that logs every write and answers with `reply`.
     fn client(mut reply: impl FnMut(&[u8]) -> Vec<Vec<u8>> + Send + 'static) -> (XservClient, Log) {
@@ -598,6 +642,63 @@ mod tests {
             *log.lock().unwrap(),
             vec![b"M".to_vec(), vec![NAK], vec![ACK]]
         );
+    }
+
+    /// PR #20 review: each `--dir` component must be a directory in the
+    /// listing before it is evaluated; a variable is refused and nothing
+    /// after `HOME` is executed.
+    #[test]
+    fn cd_checks_each_component_is_a_directory() {
+        let records = [
+            &[3][..],
+            b"SUB",
+            &[0x96, 0x2A, 0x0D, 0, 0, 0, 0],
+            &[3][..],
+            b"VAR",
+            &[0x2C, 0x2A, 0x0A, 0, 0, 0, 0],
+        ]
+        .concat();
+        let listing = encode_packet(&records).unwrap();
+        let server = move |w: &[u8]| {
+            if w == b"L" {
+                vec![listing.clone()]
+            } else if w.len() > 1 {
+                vec![vec![ACK]]
+            } else {
+                vec![]
+            }
+        };
+        let executed = |log: &Log| -> Vec<Vec<u8>> {
+            let log = log.lock().unwrap();
+            log.windows(2)
+                .filter(|w| w[0] == b"E")
+                .map(|w| w[1].clone())
+                .collect()
+        };
+        let (mut c, log) = client(server.clone());
+        xserv_cd(&mut c, "HOME/SUB").unwrap();
+        assert_eq!(
+            executed(&log),
+            [
+                encode_packet(b"HOME").unwrap(),
+                encode_packet(b"SUB").unwrap()
+            ]
+        );
+
+        for dir in ["VAR", "NOSUCH", "SUB/VAR"] {
+            let (mut c, log) = client(server.clone());
+            let err = xserv_cd(&mut c, dir).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("no such directory"),
+                "{dir}: {err:#}"
+            );
+            let ran = executed(&log);
+            assert!(
+                !ran.contains(&encode_packet(b"VAR").unwrap())
+                    && !ran.contains(&encode_packet(b"NOSUCH").unwrap()),
+                "{dir}: {ran:?}"
+            );
+        }
     }
 
     #[test]

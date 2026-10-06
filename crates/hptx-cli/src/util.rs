@@ -1,7 +1,58 @@
-//! Small pure helpers: paths, names, numbers, times.
+//! Small helpers: paths, names, numbers, times, bounded input.
 
+use std::io::Read;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use anyhow::{Context, Result};
+
+use crate::error::Hinted;
+
+/// Most bytes hptx reads from a local file or stdin: Kermit's receive
+/// limit (`kermit_proto::Config::max_size`, 4 MiB), far above the largest
+/// HP object or a whole backup.
+pub const MAX_INPUT: u64 = 4 << 20;
+
+/// Read `file` (`-` for stdin) whole, at most [`MAX_INPUT`] bytes: a file's
+/// size is checked before it is read, and the read stops one byte past the
+/// limit (stdin, a file that grows), so nothing larger is ever buffered.
+pub fn read_input(file: &Path) -> Result<Vec<u8>> {
+    read_input_limited(file, MAX_INPUT)
+}
+
+fn read_input_limited(file: &Path, limit: u64) -> Result<Vec<u8>> {
+    let label = file.display().to_string();
+    let too_large = || {
+        anyhow::Error::new(Hinted::new(
+            format!("{label} is larger than {} bytes", limit),
+            "hptx reads at most 4 MiB, more than any calculator holds; is it the right file?",
+        ))
+    };
+    let mut data = Vec::new();
+    if file == Path::new("-") {
+        std::io::stdin()
+            .lock()
+            .take(limit + 1)
+            .read_to_end(&mut data)
+            .context("reading stdin")?;
+    } else {
+        let f = std::fs::File::open(file).with_context(|| format!("cannot read {label}"))?;
+        let len = f
+            .metadata()
+            .with_context(|| format!("cannot read {label}"))?
+            .len();
+        if len > limit {
+            return Err(too_large());
+        }
+        f.take(limit + 1)
+            .read_to_end(&mut data)
+            .with_context(|| format!("cannot read {label}"))?;
+    }
+    if data.len() as u64 > limit {
+        return Err(too_large());
+    }
+    Ok(data)
+}
 
 /// Split a directory path into names below HOME: `HOME/A/B`, `/A/B`,
 /// `A/B`, `{ HOME A B }` and `HOME A B` all give `["A", "B"]`.
@@ -115,6 +166,26 @@ mod tests {
     fn numbers() {
         assert_eq!(number_text(12.0), "12");
         assert_eq!(number_text(29.5), "29.5");
+    }
+
+    /// security.md "Local input files are read whole": an oversized file
+    /// is refused on its size, before it is read.
+    #[test]
+    fn oversized_input_is_refused() {
+        let path = std::env::temp_dir().join(format!("hptx-input-{}", std::process::id()));
+        let f = std::fs::File::create(&path).unwrap();
+        // Sparse: the length says 4 MiB + 1 without writing it.
+        f.set_len(MAX_INPUT + 1).unwrap();
+        drop(f);
+        let err = read_input(&path).unwrap_err();
+        assert!(
+            err.to_string().ends_with("is larger than 4194304 bytes"),
+            "{err}"
+        );
+        std::fs::write(&path, b"12345").unwrap();
+        assert_eq!(read_input_limited(&path, 5).unwrap(), b"12345");
+        assert!(read_input_limited(&path, 4).is_err());
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

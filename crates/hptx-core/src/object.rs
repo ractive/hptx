@@ -11,9 +11,6 @@ pub const HEADER_LEN: usize = 8;
 /// Composite objects end with this 5-nibble SEMI marker.
 const SEMI: u32 = 0x0312B;
 
-/// Directory attached-library field value meaning "no library".
-const NO_LIBRARY: u32 = 0x7FF;
-
 /// Deepest object nesting the walk accepts.
 const MAX_DEPTH: usize = 64;
 
@@ -426,8 +423,8 @@ fn field(nibbles: &[u8], at: usize, width: usize) -> Result<usize> {
 }
 
 /// Size in nibbles of the object starting at nibble `at`. Fails on an
-/// unknown prolog, a truncated object, an unsupported directory or nesting
-/// deeper than 64 levels.
+/// unknown prolog, a truncated object, a directory whose records do not
+/// match its last-variable offset or nesting deeper than 64 levels.
 pub fn object_size(nibbles: &[u8], at: usize) -> Result<usize> {
     walk(nibbles, at, 0)
 }
@@ -512,13 +509,10 @@ fn lengths_size(nibbles: &[u8], at: usize, count: usize) -> Result<usize> {
 /// 5-nibble back-offset, name length n, 2n name nibbles, n again (absent when
 /// n = 0), object (or ROM pointer). wiki: protocols/hp-object-format
 fn directory_size(nibbles: &[u8], at: usize, depth: usize) -> Result<usize> {
+    // The attached library id (any value, #7FF = none) does not change the
+    // layout: always 3 nibbles.
     let lib_at = add(at, 5)?;
-    let lib = field(nibbles, lib_at, 3)?;
-    if lib != NO_LIBRARY as usize {
-        return Err(Error::Object(format!(
-            "attached library not supported (#{lib:03X} at nibble {lib_at})"
-        )));
-    }
+    field(nibbles, lib_at, 3)?;
     let off_at = add(lib_at, 3)?;
     let offset = field(nibbles, off_at, 5)?;
     let mut pos = add(off_at, 5)?;
@@ -743,8 +737,10 @@ mod tests {
     fn empty_directory() {
         let d = cat(&[f(0x02A96, 5), f(0x7FF, 3), f(0, 5)]);
         assert_eq!(object_size(&d, 0).unwrap(), 13);
+        // PR #20 review: an attached library (#123) walks like none; a
+        // backup of a HOME holding such a directory must restore.
         let lib = cat(&[f(0x02A96, 5), f(0x123, 3), f(0, 5)]);
-        assert!(object_size(&lib, 0).is_err());
+        assert_eq!(object_size(&lib, 0).unwrap(), 13);
     }
 
     #[test]
@@ -761,6 +757,9 @@ mod tests {
             vec![9; 3],
         ]);
         assert_eq!(object_size(&d, 0).unwrap(), d.len() - 3);
+        let mut with_lib = d.clone();
+        with_lib[5..8].copy_from_slice(&f(0x123, 3));
+        assert_eq!(object_size(&with_lib, 0).unwrap(), d.len() - 3);
         let bad = cat(&[f(0x02A96, 5), f(0x7FF, 3), f(3, 5), real()]);
         assert!(object_size(&bad, 0).is_err());
     }
