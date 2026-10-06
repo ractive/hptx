@@ -459,24 +459,31 @@ Decisions already made. Do not re-litigate; add a dated entry to change one.
   REPL history, written with `create_new`; neither file is used through a
   symbolic link.
 
-## 2026-10-06: crates are published from CI
+## 2026-10-06: releases and crates go through ractive/release-workflows
 
-**Context:** iteration 10 said the proto crates are published from the
-laptop (`cargo publish --dry-run`, then the user publishes). The user asked
-for publishing through CI instead, so that no crates.io token lives on a
-machine.
+**Context:** iteration 11a built a release dry run of its own, and the
+first attempt at publishing the proto crates was a hand-written
+`publish.yml` with a crates.io token. The user asked for publishing
+through CI and set the same secrets hyalo, hoppy and ff-rdp use
+(`CARGO_TOKEN`, `HOMEBREW_TAP_TOKEN`, `SCOOP_BUCKET_TOKEN`, `WINGET_TOKEN`,
+`CLOUDSMITH_API_KEY`); the shared pipeline
+`ractive/release-workflows` already does everything those repositories
+need.
 
-**Decision:** `.github/workflows/publish.yml` publishes `kermit-proto` and
-`xmodem-proto`: a dry run on every pull request that changes the file and
-on a plain dispatch, a real publish only on a dispatch from `main` with
-`dry_run=false`. The token is the repository secret `CARGO_TOKEN`
-(scopes publish-new and publish-update, limited to the two crate names).
-A crate whose version is already on the index is skipped, so a run that
-got only the first crate out can be dispatched again. Once both crates
-exist on crates.io, trusted publishing replaces the token
-(`backlog/crates-trusted-publishing.md`). hptx-core and hptx-cli stay
-unpublished; `release.yml` ships the binaries.
+**Decision:** `.github/workflows/release.yml` is a thin caller of
+`ractive/release-workflows/.github/workflows/release.yml@v0.2.0`: on a
+published GitHub release it checks the tag against `hptx-cli`'s version,
+builds eight targets, packages archives with shell completions, deb/rpm,
+SBOM and provenance, uploads the assets, publishes `kermit-proto` and
+`xmodem-proto` to crates.io, and updates the Homebrew tap, the Scoop
+bucket, winget (`ractive.hptx`) and Cloudsmith (`ractive/hptx`). A
+`workflow_dispatch` is a dry run. `publish-crates.yml` is the recovery
+path for the crates alone. Releasing is `gh release create vX.Y.Z
+--prerelease --generate-notes` after the version bump is on `main`; every
+release stays a pre-release until the real-hardware round (iteration 6).
+hptx-core and hptx-cli stay unpublished on crates.io.
 
-**Consequence:** publishing is a reviewed, repeatable workflow run; the
-first publish of each crate still needs the token, because crates.io can
-only trust a publisher for a crate that exists.
+**Consequence:** no release logic of our own to maintain; the pipeline's
+conventions (asset names `hptx-vX.Y.Z-<target>`, secrets, permissions)
+are fixed by the shared repository. Trusted publishing for crates.io is a
+change there, not here (`backlog/crates-trusted-publishing.md`).

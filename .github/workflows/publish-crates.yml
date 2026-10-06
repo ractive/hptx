@@ -1,0 +1,24 @@
+# The escape hatch for when the release workflow's crates-io job fails
+# after the release itself (assets, package managers) has succeeded:
+# publishes kermit-proto and xmodem-proto from a chosen ref with the same
+# idempotent steps ("already uploaded" counts as success).
+name: Publish crates
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref (tag/branch/sha) to publish from"
+        required: false
+        default: "main"
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    uses: ractive/release-workflows/.github/workflows/publish-crates.yml@v0.2.0
+    secrets: inherit
+    with:
+      publish-crates: kermit-proto,xmodem-proto
+      ref: ${{ inputs.ref }}
