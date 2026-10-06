@@ -9,7 +9,7 @@ priority: low
 # Switch crate publishing to crates.io trusted publishing
 
 `publish.yml` publishes `kermit-proto` and `xmodem-proto` with the
-repository secret `CARGO_REGISTRY_TOKEN` (decision log 2026-10-06). After
+repository secret `CARGO_TOKEN` (decision log 2026-10-06). After
 the first version of both crates is on crates.io, configure a trusted
 publisher for each crate (crates.io settings: repository `ractive/hptx`,
 workflow `publish.yml`, environment none), replace the token step with

@@ -469,7 +469,7 @@ machine.
 **Decision:** `.github/workflows/publish.yml` publishes `kermit-proto` and
 `xmodem-proto`: a dry run on every pull request that changes the file and
 on a plain dispatch, a real publish only on a dispatch from `main` with
-`dry_run=false`. The token is the repository secret `CARGO_REGISTRY_TOKEN`
+`dry_run=false`. The token is the repository secret `CARGO_TOKEN`
 (scopes publish-new and publish-update, limited to the two crate names).
 A crate whose version is already on the index is skipped, so a run that
 got only the first crate out can be dispatched again. Once both crates
