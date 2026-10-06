@@ -471,7 +471,7 @@ through CI and set the same secrets hyalo, hoppy and ff-rdp use
 need.
 
 **Decision:** `.github/workflows/release.yml` is a thin caller of
-`ractive/release-workflows/.github/workflows/release.yml@v0.2.0`: on a
+`ractive/release-workflows/.github/workflows/release.yml@v0.2.1`: on a
 published GitHub release it checks the tag against `hptx-cli`'s version,
 builds eight targets, packages archives with shell completions, deb/rpm,
 SBOM and provenance, uploads the assets, publishes `kermit-proto` and

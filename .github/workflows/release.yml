@@ -65,8 +65,9 @@ jobs:
         cp completions/* crates/hptx-cli/completions/
       extra-archive-paths: completions
       dry-run: ${{ github.event_name == 'workflow_dispatch' }}
-      # hyalo's matrix: the QEMU-emulated aarch64 Linux targets build only;
-      # native tests gate every PR already.
+      # hyalo's seven targets plus the native Intel macOS runner (an
+      # hptx release platform since v0.1.0); the QEMU-emulated aarch64
+      # Linux targets build only, native tests gate every PR already.
       targets: >-
         [
           {"target": "x86_64-unknown-linux-gnu", "os": "ubuntu-latest", "cross": false, "run_tests": true},
