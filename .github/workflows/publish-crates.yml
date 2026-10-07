@@ -17,7 +17,7 @@ permissions:
 
 jobs:
   publish:
-    uses: ractive/release-workflows/.github/workflows/publish-crates.yml@v0.2.1
+    uses: ractive/release-workflows/.github/workflows/publish-crates.yml@v0.2.2
     secrets: inherit
     with:
       publish-crates: kermit-proto,xmodem-proto
