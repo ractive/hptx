@@ -2,7 +2,7 @@
 type: iteration
 title: "Iteration 13: immediate NAK of the first packet"
 date: 2026-10-08
-status: in-progress
+status: completed
 tags:
   - iteration
   - kermit
@@ -31,31 +31,31 @@ of the packet's time on the wire plus slack is a rejection.
 
 ## Tasks
 
-- [ ] kermit-proto: `Config::first_packet_nak_window: Option<Duration>` and
+- [x] kermit-proto: `Config::first_packet_nak_window: Option<Duration>` and
   `Config::first_packet_nak_grace: Option<Duration>` (default `None`:
   behaviour unchanged; additive, `#[non_exhaustive]` and `Default` kept),
   documented on the fields, in the crate docs and in the README.
-- [ ] kermit-proto: in `Phase::Await`, when `first_packet_retries` forbids a
+- [x] kermit-proto: in `Phase::Await`, when `first_packet_retries` forbids a
   resend, a NAK seq 0 within the window after `poll_output` handed the
   packet out allows exactly one resend, after the immediate-NAK grace and
   only if no answer arrived; later NAKs, a second NAK and timeouts keep the
   `Some(0)` behaviour.
-- [ ] kermit-proto tests replaying the saturnus trace:
+- [x] kermit-proto tests replaying the saturnus trace:
   `immediate_nak_allows_one_resend`, `immediate_nak_then_s_is_not_resent`,
   `nak_after_the_window_is_not_resent`,
   `two_immediate_naks_allow_only_one_resend`,
   `nak_window_does_not_resend_after_a_timeout`.
-- [ ] hptx-core `host_once`: `first_packet_retries = Some(0)` and
+- [x] hptx-core `host_once`: `first_packet_retries = Some(0)` and
   `nak_grace = timeout` as before, plus `HOST_NAK_WINDOW` (250 ms) and
   `HOST_NAK_GRACE` (3 s, capped by the timeout).
-- [ ] hptx-core tests: `host_command_rejected_at_once_is_resent` (new);
+- [x] hptx-core tests: `host_command_rejected_at_once_is_resent` (new);
   `host_command_is_never_resent` now delivers its crossing NAK after the
   window (same intent: a periodic NAK never resends);
   `host_reply_packets_keep_their_retries` unchanged.
-- [ ] Workspace version 0.1.1 (path-dependency versions, `Cargo.lock`).
-- [ ] kb: decision log 2026-10-08, `docs/security.md` invariant 6,
+- [x] Workspace version 0.1.1 (path-dependency versions, `Cargo.lock`).
+- [x] kb: decision log 2026-10-08, `docs/security.md` invariant 6,
   `docs/calculator-quirks.md` (the immediate-NAK case, the residual risk).
-- [ ] Gates, e2e on the 48SX container (4848), `just e2e-saturnus 48sx`.
+- [x] Gates, e2e on the 48SX container (4848), `just e2e-saturnus 48sx`.
 
 ## Acceptance criteria
 
