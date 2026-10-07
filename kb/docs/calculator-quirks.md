@@ -35,6 +35,19 @@ Each item must be covered by a test. Source: the wiki at `~/devel/hp-literature/
   `NoReply`; the reply packets after the `S` keep their retries. Covered:
   `calc` tests `host_command_is_never_resent`,
   `host_reply_packets_keep_their_retries`.
+- The server NAKs a `C` packet it rejects right after it arrives and never
+  answers it (in-process 48SX, saturnus iteration 18: NAK seq 0 11 ms after
+  the `C`); the command did not run. The idle server's periodic NAK seq 0
+  is byte-identical, and one that crosses a `C` the server took is followed
+  by the `S` once the command is done. hptx takes a NAK within 250 ms of
+  the `C` going out (`first_packet_nak_window`; a `C` of up to ~90 bytes
+  takes ~94 ms at 9600 baud) as a rejection and resends the `C` once if no
+  `S` comes within 3 s; any other NAK never resends. Residual risk: an idle
+  NAK landing inside the window by coincidence, for a command slower than
+  3 s, runs it twice. Covered: `calc` test
+  `host_command_rejected_at_once_is_resent`, kermit-proto tests
+  `immediate_nak_*`, `nak_after_the_window_is_not_resent`,
+  `two_immediate_naks_allow_only_one_resend`.
 - Server command packets (I, S, R, C, G) must use block check 1 even after
   an I exchange agreed on 3; a type-3 C packet is NAKed. The HP sends no
   REPT field, so repeat prefixing is never used with it. Covered:

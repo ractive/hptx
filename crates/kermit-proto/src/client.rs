@@ -35,6 +35,24 @@ pub struct Config {
     /// resent `C` from a new one and runs it again, while a damaged reply
     /// packet is still re-requested.
     pub first_packet_retries: Option<u32>,
+    /// Immediate-NAK window for the first packet (default `None`: off).
+    /// When [`Config::first_packet_retries`] forbids another resend of the
+    /// packet that starts a transaction, a NAK of it (seq 0) that arrives
+    /// within this window after [`Client::poll_output`] handed the packet
+    /// out allows exactly one more resend: the server rejected the packet
+    /// (damaged on the line, sent while it was busy). The resend goes out
+    /// after [`Config::first_packet_nak_grace`] unless the server's `S` (or
+    /// another answer) arrives first. A later NAK, a second NAK and a
+    /// timeout never allow it. Set it to the time the packet takes on the
+    /// wire plus slack: an idle server's periodic NAK is byte-identical to a
+    /// rejection, and one that crosses the packet inside the window (the
+    /// server did take it) makes the command run twice if its answer takes
+    /// longer than the grace.
+    pub first_packet_nak_window: Option<Duration>,
+    /// Wait after a NAK inside [`Config::first_packet_nak_window`] before
+    /// the one resend it allows; `None` (default) means
+    /// [`Config::nak_grace`]. Capped by the receive timeout.
+    pub first_packet_nak_grace: Option<Duration>,
     /// Delay before each packet we send in reply to input (default 0).
     pub packet_pause: Duration,
     /// How long a NAK received while waiting for the reply to the first packet
@@ -65,6 +83,8 @@ impl Default for Config {
             timeout: Duration::from_secs(20),
             retries: 5,
             first_packet_retries: None,
+            first_packet_nak_window: None,
+            first_packet_nak_grace: None,
             packet_pause: Duration::ZERO,
             nak_grace: Duration::from_secs(1),
             linger: Duration::from_secs(1),
@@ -267,6 +287,11 @@ pub struct Client {
     retries: u32,
     /// Receive: decoded data bytes accepted in this transaction.
     received: usize,
+    /// Await: when the first packet last went out ([`Client::poll_output`]).
+    first_sent: Option<Instant>,
+    /// Await: an immediate NAK granted the one extra resend
+    /// ([`Config::first_packet_nak_window`]).
+    nak_resend: bool,
 }
 
 impl Client {
@@ -297,6 +322,8 @@ impl Client {
             deadline: None,
             retries: 0,
             received: 0,
+            first_sent: None,
+            nak_resend: false,
         }
     }
 
@@ -354,6 +381,8 @@ impl Client {
         self.seq = 0;
         self.retries = 0;
         self.received = 0;
+        self.first_sent = None;
+        self.nak_resend = false;
         self.deadline = None;
         self.phase = phase;
         let bytes = Packet::new(0, kind, data).wire(BlockCheck::Type1, &Framing::default());
@@ -428,6 +457,9 @@ impl Client {
         if !matches!(self.phase, Phase::Idle | Phase::Linger) {
             // Overflow (absurdly large timeout) means no deadline.
             self.deadline = now.checked_add(self.config.timeout);
+        }
+        if matches!(self.phase, Phase::Await(_)) {
+            self.first_sent = Some(now);
         }
         Some(bytes)
     }
@@ -522,7 +554,7 @@ impl Client {
     fn retry_with(&mut self, now: Instant, due: Instant, bytes: Vec<u8>) {
         self.retries += 1;
         let limit = match (&self.phase, self.config.first_packet_retries) {
-            (Phase::Await(_), Some(first)) => first,
+            (Phase::Await(_), Some(first)) => first.saturating_add(u32::from(self.nak_resend)),
             _ => self.config.retries,
         };
         if self.retries > limit {
@@ -534,9 +566,39 @@ impl Client {
     }
 
     fn stale_nak(&mut self, now: Instant) {
+        self.nak_wait(now, self.config.nak_grace);
+    }
+
+    /// Resend (or give up) at `now + grace` at the latest.
+    fn nak_wait(&mut self, now: Instant, grace: Duration) {
         // A grace period that overflows `Instant` leaves the deadline as is.
-        if let Some(grace) = now.checked_add(self.config.nak_grace) {
+        if let Some(grace) = now.checked_add(grace) {
             self.deadline = Some(self.deadline.map_or(grace, |d| d.min(grace)));
+        }
+    }
+
+    /// A NAK of seq `seq` while awaiting the answer to the first packet.
+    /// Inside [`Config::first_packet_nak_window`], with the first-packet
+    /// budget spent and no extra resend granted yet, it grants one;
+    /// otherwise it is a stale NAK.
+    fn await_nak(&mut self, now: Instant, seq: u8) {
+        if let (Some(window), Some(first), Some(sent)) = (
+            self.config.first_packet_nak_window,
+            self.config.first_packet_retries,
+            self.first_sent,
+        ) && seq == 0
+            && !self.nak_resend
+            && self.retries >= first
+            && now.saturating_duration_since(sent) <= window
+        {
+            self.nak_resend = true;
+            let grace = self
+                .config
+                .first_packet_nak_grace
+                .unwrap_or(self.config.nak_grace);
+            self.nak_wait(now, grace);
+        } else {
+            self.stale_nak(now);
         }
     }
 
@@ -608,7 +670,7 @@ impl Client {
     fn on_await(&mut self, now: Instant, kind: Kind, parsed: Result<Packet, FrameError>) {
         let Ok(p) = parsed else { return };
         match p.kind {
-            b'N' => self.stale_nak(now),
+            b'N' => self.await_nak(now, p.seq),
             b'E' => {
                 if kind == Kind::Info {
                     self.finish(Event::Done);
@@ -1645,6 +1707,135 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, Event::Error(_)))
         );
+    }
+
+    const NAK_WINDOW: Duration = Duration::from_millis(250);
+    const NAK_GRACE: Duration = Duration::from_secs(3);
+
+    /// hptx's host-command config with the immediate-NAK window.
+    fn nak_window_cfg() -> Config {
+        Config {
+            first_packet_retries: Some(0),
+            first_packet_nak_window: Some(NAK_WINDOW),
+            first_packet_nak_grace: Some(NAK_GRACE),
+            nak_grace: Duration::from_secs(20),
+            ..cfg()
+        }
+    }
+
+    /// The saturnus trace (48SX, link clock in seconds): our `C` at 0.000,
+    /// the server's NAK seq 0 at 0.011, no `S` ever. Returns the client
+    /// with the NAK fed, the start time and the `C` packet.
+    fn nak_11ms_after_c(config: Config) -> (Client, Instant, Vec<u8>) {
+        let now = Instant::now();
+        let mut c = Client::new(config);
+        c.start(now, Command::Host(b"2_m".to_vec())).unwrap();
+        let cmd = c.poll_output(now).unwrap();
+        assert_eq!(cmd, b"\x01& C2_m)\r");
+        c.handle_input(now + Duration::from_millis(11), b"\x01# N3\r");
+        assert_eq!(c.poll_output(now + Duration::from_millis(11)), None);
+        (c, now, cmd)
+    }
+
+    /// Iteration 13: the saturnus trace. A NAK 11 ms after the `C` is a
+    /// rejection: with `first_packet_retries = Some(0)` the `C` is resent
+    /// once, after the immediate-NAK grace (not the 20 s `nak_grace`), and
+    /// the server's answer to the resend completes the command.
+    #[test]
+    fn immediate_nak_allows_one_resend() {
+        let (mut c, now, cmd) = nak_11ms_after_c(nak_window_cfg());
+        let at = now + Duration::from_millis(11) + NAK_GRACE;
+        assert_eq!(c.next_timeout(), Some(at));
+        c.handle_timeout(at - Duration::from_millis(1));
+        assert_eq!(c.poll_output(at), None);
+        c.handle_timeout(at);
+        assert_eq!(c.poll_output(at), Some(cmd));
+        assert_eq!(c.poll_event(), None);
+        c.handle_input(at, &wire(0, b'Y', b"{ A }", T1));
+        assert_eq!(
+            all_events(&mut c),
+            vec![Event::ServerText(b"{ A }".to_vec()), Event::Done]
+        );
+    }
+
+    /// Iteration 13: an immediate NAK followed by the server's `S` within
+    /// the grace (the NAK was a stale one that crossed our `C`, and the
+    /// server did take it): no resend, the reply is received as usual.
+    #[test]
+    fn immediate_nak_then_s_is_not_resent() {
+        let (mut c, now, _) = nak_11ms_after_c(nak_window_cfg());
+        let t = now + Duration::from_secs(1);
+        c.handle_input(t, &wire(0, b'S', b"~* @-#Y3", T1));
+        assert_eq!(c.poll_output(t), Some(wire(0, b'Y', OURS, T1)));
+        c.handle_input(t, &wire(1, b'B', b"", T3));
+        assert_eq!(c.poll_output(t), Some(wire(1, b'Y', b"", T3)));
+        assert_eq!(c.poll_output(t + NAK_GRACE), None);
+        assert_eq!(all_events(&mut c), vec![Event::Done]);
+    }
+
+    /// Iteration 13: a NAK after the window (here 251 ms after the `C`) is
+    /// the idle server's periodic NAK, which may have crossed a `C` it took:
+    /// `Some(0)` as before, no resend, neither after it nor after the
+    /// timeout, and the wait is the full `nak_grace`.
+    #[test]
+    fn nak_after_the_window_is_not_resent() {
+        let config = nak_window_cfg();
+        let timeout = config.timeout;
+        let now = Instant::now();
+        let mut c = Client::new(config);
+        c.start(now, Command::Host(b"2_m".to_vec())).unwrap();
+        c.poll_output(now).unwrap();
+        let late = now + NAK_WINDOW + Duration::from_millis(1);
+        c.handle_input(late, b"\x01# N3\r");
+        assert_eq!(c.next_timeout(), Some(now + timeout));
+        c.handle_timeout(now + timeout);
+        assert_eq!(
+            c.poll_output(now + timeout),
+            Some(wire(0, b'E', b"Too many retries", T1))
+        );
+        assert_eq!(c.poll_output(now + timeout), None);
+        assert_eq!(all_events(&mut c), vec![Event::Error(Error::Timeout)]);
+    }
+
+    /// Iteration 13: only one resend per command. Two immediate NAKs before
+    /// the resend grant one, and an immediate NAK of the resend grants no
+    /// second: the client waits the full `nak_grace` (timeout) and gives up.
+    #[test]
+    fn two_immediate_naks_allow_only_one_resend() {
+        let config = nak_window_cfg();
+        let timeout = config.timeout;
+        let (mut c, now, cmd) = nak_11ms_after_c(config);
+        c.handle_input(now + Duration::from_millis(20), b"\x01# N3\r");
+        let at = now + Duration::from_millis(11) + NAK_GRACE;
+        assert_eq!(c.next_timeout(), Some(at));
+        c.handle_timeout(at);
+        assert_eq!(c.poll_output(at), Some(cmd));
+        c.handle_input(at + Duration::from_millis(11), b"\x01# N3\r");
+        assert_eq!(c.next_timeout(), Some(at + timeout));
+        c.handle_timeout(at + timeout);
+        assert_eq!(
+            c.poll_output(at + timeout),
+            Some(wire(0, b'E', b"Too many retries", T1))
+        );
+        assert_eq!(all_events(&mut c), vec![Event::Error(Error::Timeout)]);
+    }
+
+    /// Iteration 13: without a NAK, a timeout keeps `Some(0)`: the window
+    /// never turns silence into a resend.
+    #[test]
+    fn nak_window_does_not_resend_after_a_timeout() {
+        let config = nak_window_cfg();
+        let timeout = config.timeout;
+        let now = Instant::now();
+        let mut c = Client::new(config);
+        c.start(now, Command::Host(b"2_m".to_vec())).unwrap();
+        c.poll_output(now).unwrap();
+        c.handle_timeout(now + timeout);
+        assert_eq!(
+            c.poll_output(now + timeout),
+            Some(wire(0, b'E', b"Too many retries", T1))
+        );
+        assert_eq!(all_events(&mut c), vec![Event::Error(Error::Timeout)]);
     }
 
     #[test]

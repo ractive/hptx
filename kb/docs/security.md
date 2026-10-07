@@ -109,7 +109,18 @@ binary; the calculator's own memory (hptx runs what the user tells it to).
    would run it again. No answer in time is `Error::NoReply` ("may still be
    running or may have run; the next connection resyncs"), never a retry
    (tests `calc::host_command_is_never_resent`, kermit-proto
-   `first_packet_retries_only_cover_the_command`). Once the calculator's
+   `first_packet_retries_only_cover_the_command`). One exception
+   (iteration 13): a NAK within 250 ms of the `C` going out
+   (`first_packet_nak_window`; a `C` takes at most ~94 ms at 9600 baud) is
+   the calculator rejecting it, and the `C` is resent once if no `S` comes
+   within 3 s (tests `calc::host_command_rejected_at_once_is_resent`,
+   kermit-proto `immediate_nak_allows_one_resend`,
+   `nak_after_the_window_is_not_resent`,
+   `two_immediate_naks_allow_only_one_resend`). Residual risk: the idle
+   server's periodic NAK (every few seconds) is byte-identical; one that
+   crosses a `C` the server took and lands inside the window by
+   coincidence runs that command twice if its answer takes longer than
+   3 s. Once the calculator's
    `S` is in, the reply packets keep the normal retries (test
    `calc::host_reply_packets_keep_their_retries`). The REPL prints a
    `NoReply`, resyncs and goes on (test
@@ -119,8 +130,9 @@ binary; the calculator's own memory (hptx runs what the user tells it to).
    digits), sent once more if the first reply does not show the marker at
    level 1. Only copies of the marker on top of the stack are dropped, and
    two odd replies in a row fail the connect (test
-   `calc::sync_never_drops_what_it_did_not_push`). The marker is the only
-   command ever resent: its second attempt has the normal retries.
+   `calc::sync_never_drops_what_it_did_not_push`). Apart from a `C`
+   the calculator rejected at once, the marker is the only command ever
+   resent: its second attempt has the normal retries.
    `restore` uploads only a backup whose directory walk succeeds, an
    attached library id in any directory included (tests
    `calc::restore_refuses_a_truncated_backup`,

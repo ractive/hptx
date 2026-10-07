@@ -52,6 +52,17 @@
 //! `Some(0)` sends a `C` once, while the reply packets after the server's
 //! `S` keep [`Config::retries`].
 //!
+//! A server also NAKs a command packet it rejects, and that NAK is
+//! byte-identical to the idle server's periodic one. With
+//! [`Config::first_packet_nak_window`] set, a NAK that arrives within the
+//! window after the packet went out (its time on the wire plus slack) is
+//! taken as a rejection: it allows exactly one resend beyond
+//! [`Config::first_packet_retries`], after [`Config::first_packet_nak_grace`]
+//! and only if no answer arrived by then. Later NAKs, a second NAK and
+//! timeouts never resend. The residual risk is a periodic NAK that crosses
+//! the packet inside the window while the server took it: the command then
+//! runs twice if its answer takes longer than the grace.
+//!
 //! # Time and WebAssembly
 //!
 //! The state machine never reads a clock: every call that needs the time
