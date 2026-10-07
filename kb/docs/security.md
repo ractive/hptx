@@ -111,16 +111,23 @@ binary; the calculator's own memory (hptx runs what the user tells it to).
    (tests `calc::host_command_is_never_resent`, kermit-proto
    `first_packet_retries_only_cover_the_command`). One exception
    (iteration 13): a NAK within 250 ms of the `C` going out
-   (`first_packet_nak_window`; a `C` takes at most ~94 ms at 9600 baud) is
-   the calculator rejecting it, and the `C` is resent once if no `S` comes
-   within 3 s (tests `calc::host_command_rejected_at_once_is_resent`,
+   (`first_packet_nak_window`; a `C` takes at most ~94 ms at 9600 baud),
+   but not sooner than the `C`'s wire time (`first_packet_nak_byte_time`,
+   10 bits per byte at 9600 baud), is the calculator rejecting it, and the
+   `C` is resent once if no answer (`S`, short reply or `E`) comes within
+   3 s (tests `calc::host_command_rejected_at_once_is_resent`,
    kermit-proto `immediate_nak_allows_one_resend`,
-   `nak_after_the_window_is_not_resent`,
-   `two_immediate_naks_allow_only_one_resend`). Residual risk: the idle
-   server's periodic NAK (every few seconds) is byte-identical; one that
-   crosses a `C` the server took and lands inside the window by
-   coincidence runs that command twice if its answer takes longer than
-   3 s. Once the calculator's
+   `nak_after_the_window_is_not_resent`, `nak_before_the_wire_time_is_stale`,
+   `two_immediate_naks_allow_only_one_resend`). Input waiting before a host
+   command is discarded first, so a stale NAK buffered between commands
+   (an idle REPL) is not read as a rejection (test
+   `session::input_between_host_commands_is_discarded`), and a NAK read
+   within the `C`'s wire time never counts (test
+   `calc::host_command_is_never_resent`). Residual risk: the idle server's
+   periodic NAK (every few seconds) is byte-identical; one the server sends
+   in the narrow interval after our `C`'s wire time and within the window,
+   while it took the `C`, runs that command twice if its answer takes
+   longer than 3 s. Once the calculator's
    `S` is in, the reply packets keep the normal retries (test
    `calc::host_reply_packets_keep_their_retries`). The REPL prints a
    `NoReply`, resyncs and goes on (test

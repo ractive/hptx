@@ -20,7 +20,7 @@ use crate::object::{object_size, strip_padding, unpack};
 use crate::reply::{Iopar, Listing, StackReply, parse_list, parse_listing, parse_real};
 use crate::reply::{parse_name, parse_stack, parse_string};
 use crate::session::Session;
-use crate::transport::Transport;
+use crate::transport::{BAUD, Transport};
 use crate::xmodem::{XmodemDirection, XmodemPlan};
 use crate::{Error, Result};
 
@@ -40,10 +40,14 @@ const RESTORE_TIMEOUT: Duration = Duration::from_secs(3);
 /// that crosses the `C` lands inside 250 ms only by coincidence (the
 /// residual risk, security.md invariant 6).
 const HOST_NAK_WINDOW: Duration = Duration::from_millis(250);
-/// Wait after such a NAK before the one resend it allows, unless the
-/// calculator's `S` comes first (`Config::first_packet_nak_grace`; the
+/// Wait after such a NAK before the one resend it allows, unless an answer
+/// (`S`, short reply or `E`) comes first (`Config::first_packet_nak_grace`; the
 /// session's timeout when that is shorter).
 const HOST_NAK_GRACE: Duration = Duration::from_secs(3);
+/// One byte (10 bits) at the link's [`BAUD`]: a NAK sooner than the `C`'s
+/// length times this after it went out cannot answer it
+/// (`Config::first_packet_nak_byte_time`; ~10 ms for a short command).
+const HOST_BYTE_TIME: Duration = Duration::from_nanos(10_000_000_000 / BAUD as u64);
 
 /// Calculator model, as far as the ROM version text tells.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -225,10 +229,13 @@ impl Calculator {
     /// calculator, which cannot tell it from a new command, so the packet
     /// is never retransmitted (`first_packet_retries = Some(0)`), and a NAK
     /// (usually a stale one from the idle server) does not shorten the wait.
-    /// One exception: a NAK within [`HOST_NAK_WINDOW`] of the `C` going out
-    /// is the calculator rejecting it, and the `C` is resent once after
-    /// [`HOST_NAK_GRACE`] if no `S` came meanwhile (the command did not
-    /// run). No answer to the `C` within the timeout is
+    /// One exception: a NAK within [`HOST_NAK_WINDOW`] of the `C` going out,
+    /// but not sooner than the `C`'s wire time ([`HOST_BYTE_TIME`] per
+    /// byte), is the calculator rejecting it, and the `C` is resent once
+    /// after [`HOST_NAK_GRACE`] if no answer (`S`, short reply or `E`) came
+    /// meanwhile (the command did not run). Input waiting before the `C`
+    /// is discarded first (`Session::transact_with`), so a stale NAK is not
+    /// read as one. No answer to the `C` within the timeout is
     /// [`Error::NoReply`]. Once
     /// the calculator's `S` is in, the reply packets keep the session's
     /// retries; a failure after that is the Kermit error (the command ran).
@@ -246,6 +253,7 @@ impl Calculator {
         once.nak_grace = timeout;
         once.first_packet_nak_window = Some(HOST_NAK_WINDOW);
         once.first_packet_nak_grace = Some(HOST_NAK_GRACE.min(timeout));
+        once.first_packet_nak_byte_time = Some(HOST_BYTE_TIME);
         self.session.set_config(once);
         let result = self.host_retrying(command);
         self.session.set_config(normal);
@@ -1185,13 +1193,63 @@ mod tests {
     }
 
     /// Audit PR #18, #1: a host command goes out once. Its reply is late
-    /// (never comes here) and the server's NAK crosses it: no `C` is
-    /// resent, neither after the NAK nor after the timeout, and the error
-    /// says the command may have run. Since iteration 13 the NAK arrives
-    /// after [`HOST_NAK_WINDOW`] (the idle server's periodic NAK); one
-    /// inside the window is a rejection (`host_command_rejected_at_once_is_resent`).
+    /// (never comes here) and a NAK is read right after the `C` (within the
+    /// `C`'s wire time: a stale NAK of the idle server that was waiting in
+    /// the input, or one sent while the `C` was on the wire; PR #26 review,
+    /// #1): no `C` is resent, neither after the NAK nor after the timeout,
+    /// and the error says the command may have run.
     #[test]
     fn host_command_is_never_resent() {
+        let log: Log = Arc::default();
+        let mut server = fake_server(Arc::clone(&log), |_| "SILENT".into());
+        let check = BlockCheck::Type1;
+        let mut deframer = Deframer::new();
+        let transport = MemoryTransport::new(move |bytes: &[u8]| {
+            let mut out = server(bytes);
+            // A NAK right after each C: a stale one from the idle server,
+            // or the server asking for the C again.
+            deframer.push(bytes);
+            while let Some(frame) = deframer.next_frame() {
+                if parse_frame(&frame, check).unwrap().kind == b'C' {
+                    let nak = Packet::new(0, b'N', Vec::new());
+                    out.push(nak.encode(check, &Framing::default()).unwrap());
+                }
+            }
+            out
+        });
+        let mut kermit = Options::default().kermit;
+        kermit.timeout = Duration::from_millis(300);
+        let options = Options {
+            kermit,
+            drain: Duration::ZERO,
+            turnaround: Duration::ZERO,
+        };
+        let mut c = Calculator::new(Session::new(Box::new(transport), options).unwrap());
+        let start = std::time::Instant::now();
+        let err = c.run("1 'X' STO+").unwrap_err();
+        assert!(
+            matches!(&err, Error::NoReply { command } if command == "1 'X' STO+"),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("may have run"), "{err}");
+        assert_eq!(sent(&log), ["1 'X' STO+"]);
+        // The NAK did not cut the wait short (the old grace was 1 s, here
+        // longer than the timeout; the deadline is the full timeout).
+        assert!(start.elapsed() >= Duration::from_millis(300));
+        // The session's own budget is back for the next transaction.
+        assert_eq!(
+            c.session().config().retries,
+            Options::default().kermit.retries
+        );
+        assert_eq!(c.session().config().first_packet_retries, None);
+    }
+
+    /// Iteration 13: the idle server's periodic NAK arrives after
+    /// [`HOST_NAK_WINDOW`] (300 ms after the `C`), with the reply late
+    /// (never here): it may have crossed a `C` the server took, so no `C`
+    /// is resent, and the wait is the full timeout.
+    #[test]
+    fn host_command_late_nak_is_not_resent() {
         let log: Log = Arc::default();
         let mut server = fake_server(Arc::clone(&log), |_| "SILENT".into());
         let check = BlockCheck::Type1;
@@ -1240,7 +1298,8 @@ mod tests {
     /// Iteration 13 (saturnus trace, 48SX): the calculator NAKs a `C` at
     /// once and never answers it (it rejected the packet; the command did
     /// not run). The `C` is resent once after the immediate-NAK grace, and
-    /// the answer to the resend completes the command, which ran once.
+    /// the answer to the resend completes the command, which ran once. The
+    /// wiring only; the timing is kermit-proto's `immediate_nak_*` tests.
     #[test]
     fn host_command_rejected_at_once_is_resent() {
         let log: Log = Arc::default();
@@ -1260,14 +1319,17 @@ mod tests {
                 }
             }
             if first_c {
-                // Rejected: a NAK at once, the server never sees the C.
+                // Rejected: a NAK once the C is in (after its wire time at
+                // 9600 baud, ~11 ms); the server never runs the C.
+                std::thread::sleep(Duration::from_millis(30));
                 let nak = Packet::new(0, b'N', Vec::new());
                 return vec![nak.encode(check, &Framing::default()).unwrap()];
             }
             server(bytes)
         });
+        // A short timeout: the immediate-NAK grace is capped by it.
         let mut kermit = Options::default().kermit;
-        kermit.timeout = Duration::from_secs(10);
+        kermit.timeout = Duration::from_millis(300);
         kermit.linger = Duration::ZERO;
         let options = Options {
             kermit,
@@ -1275,14 +1337,9 @@ mod tests {
             turnaround: Duration::ZERO,
         };
         let mut c = Calculator::new(Session::new(Box::new(transport), options).unwrap());
-        let start = std::time::Instant::now();
         assert_eq!(c.run("6 7 *").unwrap().levels, ["42"]);
         assert_eq!(sent(&wire), ["C", "C"]);
         assert_eq!(sent(&log), ["6 7 *"]);
-        // The resend waited the short grace, not the 10 s timeout.
-        let elapsed = start.elapsed();
-        assert!(elapsed >= HOST_NAK_GRACE, "{elapsed:?}");
-        assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
         // The session's own config is back for the next transaction.
         assert_eq!(c.session().config().first_packet_nak_window, None);
     }

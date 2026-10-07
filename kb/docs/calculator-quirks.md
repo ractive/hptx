@@ -39,14 +39,21 @@ Each item must be covered by a test. Source: the wiki at `~/devel/hp-literature/
   answers it (in-process 48SX, saturnus iteration 18: NAK seq 0 11 ms after
   the `C`); the command did not run. The idle server's periodic NAK seq 0
   is byte-identical, and one that crosses a `C` the server took is followed
-  by the `S` once the command is done. hptx takes a NAK within 250 ms of
-  the `C` going out (`first_packet_nak_window`; a `C` of up to ~90 bytes
-  takes ~94 ms at 9600 baud) as a rejection and resends the `C` once if no
-  `S` comes within 3 s; any other NAK never resends. Residual risk: an idle
-  NAK landing inside the window by coincidence, for a command slower than
-  3 s, runs it twice. Covered: `calc` test
-  `host_command_rejected_at_once_is_resent`, kermit-proto tests
-  `immediate_nak_*`, `nak_after_the_window_is_not_resent`,
+  by the `S` once the command is done; idle NAKs also pile up in the input
+  between commands (a REPL left idle). hptx discards waiting input before
+  each host command and takes a NAK within 250 ms of the `C` going out
+  (`first_packet_nak_window`; a `C` of up to ~90 bytes takes ~94 ms at
+  9600 baud), but not sooner than the `C`'s wire time
+  (`first_packet_nak_byte_time`), as a rejection: it resends the `C` once
+  if no answer (`S`, short reply or `E`) comes within 3 s; any other NAK
+  never resends. Residual risk: an idle NAK sent in the narrow interval
+  after our `C`'s wire time and within the window, for a command slower
+  than 3 s, runs it twice. Covered: `calc` tests
+  `host_command_rejected_at_once_is_resent`,
+  `host_command_is_never_resent`, `host_command_late_nak_is_not_resent`,
+  `session` test `input_between_host_commands_is_discarded`, kermit-proto
+  tests `immediate_nak_*`, `nak_after_the_window_is_not_resent`,
+  `nak_before_the_wire_time_is_stale`, `nak_after_the_grant_keeps_the_grace`,
   `two_immediate_naks_allow_only_one_resend`.
 - Server command packets (I, S, R, C, G) must use block check 1 even after
   an I exchange agreed on 3; a type-3 C packet is NAKed. The HP sends no

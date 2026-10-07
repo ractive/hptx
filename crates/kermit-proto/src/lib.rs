@@ -58,10 +58,12 @@
 //! window after the packet went out (its time on the wire plus slack) is
 //! taken as a rejection: it allows exactly one resend beyond
 //! [`Config::first_packet_retries`], after [`Config::first_packet_nak_grace`]
-//! and only if no answer arrived by then. Later NAKs, a second NAK and
-//! timeouts never resend. The residual risk is a periodic NAK that crosses
-//! the packet inside the window while the server took it: the command then
-//! runs twice if its answer takes longer than the grace.
+//! and only if no answer arrived by then. A NAK sooner than the packet's
+//! wire time ([`Config::first_packet_nak_byte_time`] per byte) cannot answer
+//! it and is stale, like later NAKs; a second NAK and timeouts never resend.
+//! The residual risk is a periodic NAK the idle server sends just after our
+//! packet's wire time, inside the window, while it took the packet: the
+//! command then runs twice if its answer takes longer than the grace.
 //!
 //! # Time and WebAssembly
 //!

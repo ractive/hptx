@@ -51,8 +51,17 @@ pub struct Config {
     pub first_packet_nak_window: Option<Duration>,
     /// Wait after a NAK inside [`Config::first_packet_nak_window`] before
     /// the one resend it allows; `None` (default) means
-    /// [`Config::nak_grace`]. Capped by the receive timeout.
+    /// [`Config::nak_grace`]. Capped by the receive timeout. Further NAKs
+    /// while the granted resend waits do not shorten it.
     pub first_packet_nak_grace: Option<Duration>,
+    /// Lower bound of [`Config::first_packet_nak_window`]: the time one byte
+    /// takes on the link (10 bits / baud, ~1.04 ms at 9600 baud). A NAK that
+    /// arrives sooner after the packet was handed out than the packet's
+    /// length times this cannot be the server's answer to it (the packet
+    /// had not finished arriving): it is stale (input that was waiting, or
+    /// the idle server's NAK sent while ours was on the wire). `None`
+    /// (default): no lower bound.
+    pub first_packet_nak_byte_time: Option<Duration>,
     /// Delay before each packet we send in reply to input (default 0).
     pub packet_pause: Duration,
     /// How long a NAK received while waiting for the reply to the first packet
@@ -85,6 +94,7 @@ impl Default for Config {
             first_packet_retries: None,
             first_packet_nak_window: None,
             first_packet_nak_grace: None,
+            first_packet_nak_byte_time: None,
             packet_pause: Duration::ZERO,
             nak_grace: Duration::from_secs(1),
             linger: Duration::from_secs(1),
@@ -287,8 +297,9 @@ pub struct Client {
     retries: u32,
     /// Receive: decoded data bytes accepted in this transaction.
     received: usize,
-    /// Await: when the first packet last went out ([`Client::poll_output`]).
-    first_sent: Option<Instant>,
+    /// Await: when the first packet last went out ([`Client::poll_output`])
+    /// and its length in bytes.
+    first_sent: Option<(Instant, usize)>,
     /// Await: an immediate NAK granted the one extra resend
     /// ([`Config::first_packet_nak_window`]).
     nak_resend: bool,
@@ -459,7 +470,7 @@ impl Client {
             self.deadline = now.checked_add(self.config.timeout);
         }
         if matches!(self.phase, Phase::Await(_)) {
-            self.first_sent = Some(now);
+            self.first_sent = Some((now, bytes.len()));
         }
         Some(bytes)
     }
@@ -578,28 +589,41 @@ impl Client {
     }
 
     /// A NAK of seq `seq` while awaiting the answer to the first packet.
-    /// Inside [`Config::first_packet_nak_window`], with the first-packet
-    /// budget spent and no extra resend granted yet, it grants one;
-    /// otherwise it is a stale NAK.
+    /// Inside [`Config::first_packet_nak_window`] (and not before the
+    /// packet's wire time, [`Config::first_packet_nak_byte_time`]), with the
+    /// first-packet budget spent and no extra resend granted yet, it grants
+    /// one; while that resend waits, a NAK changes nothing; otherwise it is
+    /// a stale NAK.
     fn await_nak(&mut self, now: Instant, seq: u8) {
-        if let (Some(window), Some(first), Some(sent)) = (
-            self.config.first_packet_nak_window,
-            self.config.first_packet_retries,
-            self.first_sent,
-        ) && seq == 0
+        let Some(first) = self.config.first_packet_retries else {
+            return self.stale_nak(now);
+        };
+        if self.nak_resend && self.retries <= first {
+            // The granted resend is pending: keep its deadline.
+            return;
+        }
+        if let (Some(window), Some((sent, len))) =
+            (self.config.first_packet_nak_window, self.first_sent)
+            && seq == 0
             && !self.nak_resend
             && self.retries >= first
-            && now.saturating_duration_since(sent) <= window
         {
-            self.nak_resend = true;
-            let grace = self
-                .config
-                .first_packet_nak_grace
-                .unwrap_or(self.config.nak_grace);
-            self.nak_wait(now, grace);
-        } else {
-            self.stale_nak(now);
+            let since = now.saturating_duration_since(sent);
+            // The packet's wire time; an overflow means it never ends.
+            let wire = match self.config.first_packet_nak_byte_time {
+                None => Some(Duration::ZERO),
+                Some(byte) => u32::try_from(len).ok().and_then(|n| byte.checked_mul(n)),
+            };
+            if wire.is_some_and(|wire| since >= wire) && since <= window {
+                self.nak_resend = true;
+                let grace = self
+                    .config
+                    .first_packet_nak_grace
+                    .unwrap_or(self.config.nak_grace);
+                return self.nak_wait(now, grace);
+            }
         }
+        self.stale_nak(now);
     }
 
     fn finish(&mut self, event: Event) {
@@ -1711,6 +1735,8 @@ mod tests {
 
     const NAK_WINDOW: Duration = Duration::from_millis(250);
     const NAK_GRACE: Duration = Duration::from_secs(3);
+    /// One byte at 9600 baud (10 bits).
+    const BYTE_TIME: Duration = Duration::from_micros(1042);
 
     /// hptx's host-command config with the immediate-NAK window.
     fn nak_window_cfg() -> Config {
@@ -1718,6 +1744,7 @@ mod tests {
             first_packet_retries: Some(0),
             first_packet_nak_window: Some(NAK_WINDOW),
             first_packet_nak_grace: Some(NAK_GRACE),
+            first_packet_nak_byte_time: Some(BYTE_TIME),
             nak_grace: Duration::from_secs(20),
             ..cfg()
         }
@@ -1818,6 +1845,50 @@ mod tests {
             Some(wire(0, b'E', b"Too many retries", T1))
         );
         assert_eq!(all_events(&mut c), vec![Event::Error(Error::Timeout)]);
+    }
+
+    /// PR #26 review, #1: a NAK sooner than our packet's wire time (9
+    /// bytes at 9600 baud, 9.4 ms) cannot answer it: input that was
+    /// waiting in the buffer, or the idle server's NAK sent while our `C`
+    /// was on the wire. It is stale: no resend, the full `nak_grace`.
+    #[test]
+    fn nak_before_the_wire_time_is_stale() {
+        let config = nak_window_cfg();
+        let timeout = config.timeout;
+        let now = Instant::now();
+        let mut c = Client::new(config);
+        c.start(now, Command::Host(b"2_m".to_vec())).unwrap();
+        let cmd = c.poll_output(now).unwrap();
+        assert_eq!(cmd.len(), 9);
+        for ms in [0, 9] {
+            c.handle_input(now + Duration::from_millis(ms), b"\x01# N3\r");
+        }
+        assert_eq!(c.next_timeout(), Some(now + timeout));
+        c.handle_timeout(now + timeout);
+        assert_eq!(
+            c.poll_output(now + timeout),
+            Some(wire(0, b'E', b"Too many retries", T1))
+        );
+        assert_eq!(all_events(&mut c), vec![Event::Error(Error::Timeout)]);
+    }
+
+    /// PR #26 review, #3: once an immediate NAK granted the resend, a
+    /// further NAK (here a stale one with a `nak_grace` shorter than the
+    /// immediate-NAK grace) does not bring the resend forward.
+    #[test]
+    fn nak_after_the_grant_keeps_the_grace() {
+        let config = Config {
+            nak_grace: Duration::from_secs(1),
+            ..nak_window_cfg()
+        };
+        let (mut c, now, cmd) = nak_11ms_after_c(config);
+        let at = now + Duration::from_millis(11) + NAK_GRACE;
+        c.handle_input(now + Duration::from_millis(500), b"\x01# N3\r");
+        assert_eq!(c.next_timeout(), Some(at));
+        c.handle_timeout(now + Duration::from_millis(1500));
+        assert_eq!(c.poll_output(now + Duration::from_millis(1500)), None);
+        c.handle_timeout(at);
+        assert_eq!(c.poll_output(at), Some(cmd));
     }
 
     /// Iteration 13: without a NAK, a timeout keeps `Some(0)`: the window

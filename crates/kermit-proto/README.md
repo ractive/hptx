@@ -123,8 +123,10 @@ fn main() -> std::io::Result<()> {
   it once. The HP also NAKs a `C` it rejects, right after it arrives (11 ms
   on a 48SX), and that NAK looks exactly like the periodic idle one. Since
   0.1.1, `Config::first_packet_nak_window` (the packet's time on the wire
-  plus slack) and `Config::first_packet_nak_grace` let a NAK inside the
-  window allow one resend if no answer follows within the grace.
+  plus slack), `Config::first_packet_nak_grace` and
+  `Config::first_packet_nak_byte_time` (lower bound: a NAK sooner than the
+  packet's wire time is stale) let a NAK inside the window allow one resend
+  if no answer follows within the grace.
 - A host command's reply arrives either in the ACK (short reply) or as a
   text transfer (`X`, `D`.., `Z`, `B`); both end up as `Event::ServerText`.
 
