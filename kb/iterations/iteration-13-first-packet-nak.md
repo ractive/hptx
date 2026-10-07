@@ -59,22 +59,22 @@ of the packet's time on the wire plus slack is a rejection.
 
 ## Tasks: PR #26 review
 
-- [ ] #1 (high) Stale idle NAKs buffered between host commands were read
+- [x] #1 (high) Stale idle NAKs buffered between host commands were read
   right after the `C`, inside the window: `Session` discards waiting input
   before each host command (`input_between_host_commands_is_discarded`),
   and `Config::first_packet_nak_byte_time` puts a lower bound (the
   packet's wire time) on the window (`nak_before_the_wire_time_is_stale`;
   hptx-core: 10 bits at 9600 baud per byte).
-- [ ] #2 (medium) `host_command_is_never_resent` back to its original shape
+- [x] #2 (medium) `host_command_is_never_resent` back to its original shape
   (NAK in the same write as the `C`), passing through the lower bound; the
   300 ms variant is `host_command_late_nak_is_not_resent`.
-- [ ] #3 (low) A NAK while the granted resend waits keeps its deadline
+- [x] #3 (low) A NAK while the granted resend waits keeps its deadline
   (`nak_after_the_grant_keeps_the_grace`).
-- [ ] #4 (low) `host_command_rejected_at_once_is_resent` uses a 300 ms
+- [x] #4 (low) `host_command_rejected_at_once_is_resent` uses a 300 ms
   session timeout (the grace is capped by it) and checks the wiring only.
-- [ ] #5 (low, GLM) Docs say the resend is cancelled by any answer (`S`,
+- [x] #5 (low, GLM) Docs say the resend is cancelled by any answer (`S`,
   short reply or `E`), not only an `S`.
-- [ ] Decision log, security.md invariant 6 and the quirk updated for the
+- [x] Decision log, security.md invariant 6 and the quirk updated for the
   discard, the lower bound and the narrower residual risk; gates and e2e
   rerun.
 
