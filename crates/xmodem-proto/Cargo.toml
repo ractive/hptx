@@ -13,7 +13,7 @@ categories = ["network-programming", "hardware-support"]
 [dev-dependencies]
 # Only for the text trace format (`kermit_proto::trace`) shared by both
 # protocol crates' recorded traces and replay tests.
-kermit-proto = { path = "../kermit-proto", version = "0.1.0" }
+kermit-proto = { path = "../kermit-proto", version = "0.1.1" }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # The caller's clock on wasm32 (`std::time::Instant::now()` panics on

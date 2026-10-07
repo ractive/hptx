@@ -20,6 +20,13 @@ use crate::{Error, Result};
 const IDLE_WAIT: Duration = Duration::from_millis(100);
 /// Shortest read wait.
 const MIN_WAIT: Duration = Duration::from_millis(10);
+/// Read wait while discarding input that is already waiting before a host
+/// command ([`Session::transact_with`]): long enough to collect what the
+/// link has buffered, short enough to cost nothing noticeable.
+const PENDING_WAIT: Duration = Duration::from_millis(1);
+/// Most time spent discarding waiting input before a host command (a link
+/// that never goes quiet must not stall the command).
+const PENDING_MAX: Duration = Duration::from_millis(50);
 
 /// Tunables for a [`Session`].
 #[derive(Clone, Debug)]
@@ -141,6 +148,9 @@ impl Session {
         if let Some(end) = self.last_end {
             std::thread::sleep((end + self.turnaround).saturating_duration_since(Instant::now()));
         }
+        if matches!(command, Command::Host(_)) {
+            self.discard_pending()?;
+        }
         let result = self.run(command, progress);
         self.answered = self.client.peer_params().is_some();
         if result.is_err() {
@@ -148,6 +158,18 @@ impl Session {
             self.last_end = Some(Instant::now());
         }
         result
+    }
+
+    /// Discard input that arrived between transactions, before a host
+    /// command goes out: stale NAKs of the idle server (one every few
+    /// seconds) that would otherwise be read right after the `C`, inside the
+    /// immediate-NAK window of host commands. Nothing of the
+    /// coming transaction can be in it yet.
+    fn discard_pending(&mut self) -> Result<()> {
+        let end = Instant::now() + PENDING_MAX;
+        let mut buf = [0u8; 256];
+        while self.transport.read(&mut buf, PENDING_WAIT)? > 0 && Instant::now() < end {}
+        Ok(())
     }
 
     fn run(&mut self, command: Command, progress: &mut dyn FnMut(&Event)) -> Result<Transcript> {
@@ -371,6 +393,29 @@ mod tests {
         );
         let t = s.transact(Command::Host(b"6 7 *".to_vec())).unwrap();
         assert_eq!(t.text, host_reply());
+    }
+
+    /// PR #26 review, #1: input that arrived between transactions (here a
+    /// stray packet after the first reply; on the link, the idle server's
+    /// NAKs) is discarded before a host command goes out, so it is not read
+    /// as the first answer to the `C`.
+    #[test]
+    fn input_between_host_commands_is_discarded() {
+        use kermit_proto::codec::{Framing, Packet};
+        let line = |dir: &str, kind: u8, data: &[u8]| {
+            let p = Packet::new(0, kind, data.to_vec())
+                .encode(kermit_proto::BlockCheck::Type1, &Framing::default())
+                .unwrap();
+            format!("{dir} {}\n", kermit_proto::trace::escape(&p))
+        };
+        let trace = line(">", b'C', b"A")
+            + &line("<", b'Y', b"a")
+            + &line("<", b'Y', b"stale")
+            + &line(">", b'C', b"B")
+            + &line("<", b'Y', b"b");
+        let mut s = session(&trace, options());
+        assert_eq!(s.transact(Command::Host(b"A".to_vec())).unwrap().text, b"a");
+        assert_eq!(s.transact(Command::Host(b"B".to_vec())).unwrap().text, b"b");
     }
 
     #[test]

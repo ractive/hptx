@@ -490,3 +490,41 @@ hptx-core and hptx-cli stay unpublished on crates.io.
 conventions (asset names `hptx-vX.Y.Z-<target>`, secrets, permissions)
 are fixed by the shared repository. Trusted publishing for crates.io is a
 change there, not here (`backlog/crates-trusted-publishing.md`).
+
+## 2026-10-08 (iteration 13)
+
+- **An immediate NAK of a host command allows one resend.** saturnus found
+  the 48SX NAKing a `C` 11 ms after it went out and never answering it: the
+  calculator rejected the packet and the command did not run, but
+  `first_packet_retries = Some(0)` forbade the resend, so the command failed
+  (in hptx as `NoReply` after the full `--timeout`). The idle server's
+  periodic NAK seq 0 is byte-identical, and one that crosses our `C` means
+  the server took it and will run it (its `S` comes when the command is
+  done), so the NAK alone cannot allow a resend. Decision: time tells them
+  apart. kermit-proto `Config` gained `first_packet_nak_window:
+  Option<Duration>` and `first_packet_nak_grace: Option<Duration>` (both
+  `None` by default: behaviour unchanged; additive). When
+  `first_packet_retries` forbids another resend, a NAK seq 0 that arrives
+  within the window after `poll_output` handed the first packet out allows
+  exactly one resend, after the grace and only if no answer came by then.
+  A later NAK, a second NAK and a timeout keep the `Some(0)` behaviour.
+  hptx-core `host_once` keeps `Some(0)` and `nak_grace = timeout` and sets
+  the window to 250 ms (`HOST_NAK_WINDOW`: a `C` of up to ~90 bytes takes
+  ~94 ms at 9600 baud, plus slack) and the grace to 3 s (`HOST_NAK_GRACE`,
+  capped by the timeout), so a rejected command is resent after 3 s instead
+  of failing after 20 s. No answer to the resend is `NoReply` as before.
+  PR #26 review: idle NAKs buffered between commands (a REPL left idle
+  longer than the NAK period) were read right after the `C`, inside the
+  window. Two guards: `Session` discards input already waiting before
+  each host command (1 ms reads, at most 50 ms), and the window has a
+  lower bound, `first_packet_nak_byte_time` (hptx: 10 bits at 9600 baud
+  per byte): a NAK sooner than our packet's wire time cannot answer it and
+  is stale. While a granted resend waits, further NAKs leave its deadline
+  alone. The resend is cancelled by any answer (`S`, short reply or `E`).
+  Residual risk, accepted: an idle NAK the server sends in the narrow
+  interval after our `C`'s wire time and within the 250 ms window, while
+  it took the `C`, runs a command whose answer takes longer than 3 s twice
+  (security.md invariant 6, calculator-quirks). A link faster than its
+  nominal baud (an emulator) can deliver a real rejection inside the wire
+  time; that case keeps the iteration 12 behaviour (`NoReply`). Workspace
+  version 0.1.1.
