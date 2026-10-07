@@ -1,5 +1,5 @@
 ---
-type: backlog
+title: "CI emulator flakes: the silent 48SX and the 49G XModem start"
 title: CI emulator flakes: the silent 48SX and the 49G XModem start
 date: 2026-10-06
 status: planned
