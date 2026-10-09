@@ -15,7 +15,8 @@
 //!   calculator ([`XmodemSession`]).
 //! - [`xserv`]: XSERV (49g+/50g) packet framing; unverified on hardware.
 //!
-//! Wiki references (`~/devel/hp-literature/`): `protocols/server-commands`,
+//! Wiki references (calculator-knowledgebase,
+//! <https://github.com/ractive/calculator-knowledgebase>): `protocols/server-commands`,
 //! `protocols/hp-object-format`, `protocols/iopar`, `hardware/uart`,
 //! `protocols/xmodem-hp`, `protocols/xserv`.
 

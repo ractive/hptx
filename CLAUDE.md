@@ -48,8 +48,11 @@ Always use `hyalo` for kb interactions, never Read/Grep/Edit on kb files
 except for body prose: `hyalo summary`, `hyalo find`, `hyalo read <path>`,
 `hyalo set`, `hyalo task toggle`, `hyalo lint`. `.hyalo.toml` sets `dir = "kb"`;
 do not pass `--dir`. Follow the hints hyalo prints. `hyalo lint` must be clean
-before a PR. The calculator wiki at `~/devel/hp-literature/` is separate and
-also hyalo-driven.
+before a PR. The calculator wiki is a separate public repository,
+calculator-knowledgebase (<https://github.com/ractive/calculator-knowledgebase>,
+checked out at `~/devel/calculator-knowledgebase/`), also hyalo-driven with
+its own clean-room rules in its CLAUDE.md; new calculator findings go there
+as commits or PRs to that repository.
 
 # Rust
 - Edition 2024, stable. Windows, Linux, macOS.
