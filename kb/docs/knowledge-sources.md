@@ -10,13 +10,15 @@ tags:
 
 # Knowledge sources
 
-- `~/devel/hp-literature/` is an LLM wiki about the calculators. Query it with
-  `hyalo` from that directory (`hyalo summary`, `hyalo read index.md`,
-  `hyalo find "kermit server"`). Protocol pages: `protocols/kermit`,
+- calculator-knowledgebase (<https://github.com/ractive/calculator-knowledgebase>,
+  checked out at `~/devel/calculator-knowledgebase/`) is a public LLM wiki
+  about the calculators. Query it with `hyalo` from that directory
+  (`hyalo summary`, `hyalo read index.md`, `hyalo find "kermit server"`). Protocol pages: `protocols/kermit`,
   `kermit-hp`, `server-commands`, `iopar`, `hp-object-format`, `xmodem`,
   `xmodem-hp`, `xserv`. Cite them in code comments as `wiki: protocols/kermit-hp`.
-  New calculator facts go into that wiki (it has its own CLAUDE.md), not only
-  into code comments.
+  New calculator facts go into that wiki (it has its own CLAUDE.md: public,
+  no private material, facts in our own words), as commits or PRs to it,
+  not only into code comments.
 - `~/devel/hpcomm/` is the 1999-2001 HPComm C++ source (GPL, co-owned by HP).
   Read `hpcomm/Kermit.cpp`, `Prot.cpp`, `Filer*.cpp`, `hpgcomm/XModem.cpp` to
   learn HP behaviour. Never copy or closely translate it: hptx is MIT.

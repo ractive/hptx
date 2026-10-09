@@ -11,7 +11,7 @@ tags:
 
 # Calculator quirks checklist
 
-Each item must be covered by a test. Source: the wiki at `~/devel/hp-literature/` and the saturnng container experiments of 2026-10-04 and 2026-10-05.
+Each item must be covered by a test. Source: the calculator-knowledgebase wiki (`~/devel/calculator-knowledgebase/`) and the saturnng container experiments of 2026-10-04 and 2026-10-05.
 
 - Server answers only R, S, C, G D, G F, G L, I. No REMOTE CD: hptx
   changes directory with `C HOME`, then `C NAME` per level, each name
