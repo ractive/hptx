@@ -533,8 +533,9 @@ change there, not here (`backlog/crates-trusted-publishing.md`).
 
 - **No `saturnus` feature; the in-process transport is always built**
   (user). Replaces "saturnus in-process, behind a feature" (2026-10-05). The
-  feature saved little (the saturnus core has no dependencies; saturnus-drive
-  adds `anyhow`, `miniz_oxide` and `saturnus-host`) but hptx-cli never
+  feature saved little (at the pinned rev the saturnus core has no
+  dependencies; saturnus-drive adds `anyhow` and `png`, which hptx already
+  uses) but hptx-cli never
   forwarded it, so installed and released binaries could not open
   `saturnus://` addresses, and with the feature off cargo warned about the
   workspace's `[profile.dev.package.saturnus*]` overrides. hptx-core and
