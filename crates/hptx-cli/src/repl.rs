@@ -31,6 +31,7 @@ Commands (everything else is RPL for the calculator):
   :rm NAME...                     delete variables (directories with their contents)
   :pict [FILE] [--force]          graphics screen as PNG [default: hptx-pict-<time>.png]
   :info                           model, version, free memory, path, IOPAR
+  :chars                          HP characters and their trigraphs (no calculator)
   :help                           this list
   :quit, :q                       leave (Ctrl-D too)
   ::RPL                           send RPL that starts with a colon: ::a:1 sends :a:1"
@@ -49,6 +50,10 @@ nothing. After an error the calculator's message and the stack it left are
 printed (to stderr) and the session goes on. One line must fit in one Kermit
 packet (77 encoded bytes). Files that exist are kept unless --force, and
 :put replaces a variable only with --overwrite.
+
+Type HP characters as Unicode or as ASCII trigraphs: → \\->  « \\<<  » \\>>
+√ \\v/  π \\pi  Σ \\GS  ∫ \\.S  ∂ \\.d  ∞ \\oo  ≤ \\<=  ≥ \\>=  ≠ \\=/
+:chars (or `hptx chars`) lists all of them.
 
 Ctrl-C clears the line, Ctrl-D or :quit leaves. History is kept in
   Linux    $XDG_DATA_HOME/hptx/history (default ~/.local/share/hptx/history)
@@ -129,12 +134,13 @@ pub enum Meta {
         force: bool,
     },
     Info,
+    Chars,
     Help,
     Quit,
 }
 
 const META_LIST: &str = "commands: :ls [PATH], :cd PATH, :get NAME [FILE], :put FILE [NAME] [--overwrite], :rm NAME..., \
-     :pict [FILE], :info, :help, :quit; ::RPL sends RPL that starts with a colon";
+     :pict [FILE], :info, :chars, :help, :quit; ::RPL sends RPL that starts with a colon";
 
 /// Parse the text after the colon.
 pub fn parse_meta(text: &str) -> std::result::Result<Meta, Hinted> {
@@ -218,6 +224,10 @@ pub fn parse_meta(text: &str) -> std::result::Result<Meta, Hinted> {
             arity(0, 0)?;
             Meta::Info
         }
+        "chars" => {
+            arity(0, 0)?;
+            Meta::Chars
+        }
         "help" | "h" | "?" => Meta::Help,
         "quit" | "q" | "exit" => Meta::Quit,
         _ => {
@@ -239,6 +249,7 @@ fn usage(command: &str) -> String {
         "rm" => ":rm NAME...",
         "pict" => ":pict [FILE] [--force]",
         "info" => ":info",
+        "chars" => ":chars",
         _ => return META_LIST.to_string(),
     };
     format!("usage: {form}")
@@ -647,6 +658,8 @@ impl Ctx {
             Line::Meta(text) => match parse_meta(text)? {
                 Meta::Quit => Ok(Shown::Quit),
                 Meta::Help => Ok(Shown::Help),
+                // Local: nothing goes to the calculator.
+                Meta::Chars => Ok(Shown::Outcome(crate::offline::chars())),
                 meta => self.repl_meta(calc, meta).map(Shown::Outcome),
             },
         }
@@ -711,7 +724,7 @@ impl Ctx {
             }
             Meta::Info => self.info_on(calc)?,
             // Answered by repl_eval.
-            Meta::Help | Meta::Quit => Outcome::default(),
+            Meta::Chars | Meta::Help | Meta::Quit => Outcome::default(),
         })
     }
 }
@@ -994,7 +1007,7 @@ fn repl_command(cmd: &str) -> Option<String> {
     }
     let mut line: Vec<String> = match command.as_str() {
         "run" if !args.is_empty() => return Some(args.join(" ")),
-        "ls" | "rm" | "info" => {
+        "ls" | "rm" | "info" | "chars" => {
             let mut l = vec![format!(":{command}")];
             l.extend(plain.iter().map(|w| quote(w)));
             l
@@ -1132,6 +1145,7 @@ mod tests {
             }
         );
         assert_eq!(parse_meta("info").unwrap(), Meta::Info);
+        assert_eq!(parse_meta("chars").unwrap(), Meta::Chars);
         assert_eq!(parse_meta("help").unwrap(), Meta::Help);
         assert_eq!(parse_meta("quit").unwrap(), Meta::Quit);
         assert_eq!(parse_meta("q").unwrap(), Meta::Quit);
@@ -1151,6 +1165,8 @@ mod tests {
         assert!(parse_meta("get").is_err());
         assert!(parse_meta("get A b c").is_err());
         assert!(parse_meta("info x").is_err());
+        assert_eq!(parse_meta("chars x").unwrap_err().hint, "usage: :chars");
+        assert!(parse_meta("chars --json").is_err());
         assert!(parse_meta("rm X --force").is_err());
         let e = parse_meta("put a.hp --force").unwrap_err();
         assert_eq!(e.message, ":put: unknown option --force");
@@ -1258,6 +1274,15 @@ mod tests {
             json!({"results": [{"name": "X"}]})
         );
         assert_eq!(shown_json(&Shown::Quit), json!({"quit": true}));
+        // :chars: the same array as `hptx chars --json` has in results.
+        let chars = shown_json(&Shown::Outcome(crate::offline::chars()));
+        assert_eq!(chars.as_object().unwrap().len(), 1);
+        assert_eq!(chars["results"], crate::offline::chars().results);
+        assert_eq!(
+            chars["results"][3],
+            json!({"code": 131, "char": "√", "trigraph": "\\v/"})
+        );
+        assert!(!chars.to_string().contains('\n'));
         assert!(
             shown_json(&Shown::Help)["help"]
                 .as_str()

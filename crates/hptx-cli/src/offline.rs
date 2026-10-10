@@ -1,5 +1,5 @@
 //! Commands that need no calculator: `object inspect`, `object convert`,
-//! `grob to-png`, `completions`.
+//! `grob to-png`, `chars`, `completions`.
 
 use std::fmt::Write as _;
 use std::io::Write;
@@ -554,6 +554,31 @@ fn not_a_grob(label: &str, data: &[u8], why: &str) -> anyhow::Error {
     .into()
 }
 
+/// The rule for the codes 160-255 without a mnemonic, after the table.
+pub const NUMERIC_TRIGRAPHS: &str =
+    "Codes 160-255 not listed: \\nnn, three decimal digits (\\160 no-break space, \\233 é).";
+
+/// `chars`: the characters with a mnemonic trigraph, from the charset
+/// tables. Text: `131  √  \v/` per line; JSON: `[{code, char, trigraph}]`.
+pub fn chars() -> Outcome {
+    let named = hptx_core::charset::named_chars();
+    let mut text = String::new();
+    for c in &named {
+        let _ = writeln!(text, "{}  {}  {}", c.code, c.text, c.trigraph);
+    }
+    text.push_str(NUMERIC_TRIGRAPHS);
+    let results: Vec<Value> = named
+        .iter()
+        .map(|c| json!({ "code": c.code, "char": c.text, "trigraph": c.trigraph }))
+        .collect();
+    Outcome {
+        total: Some(results.len() as u64),
+        results: Value::Array(results),
+        text,
+        ..Outcome::default()
+    }
+}
+
 /// `completions SHELL`.
 pub fn completions(shell: clap_complete::Shell) -> Result<Option<Outcome>> {
     let mut cmd = <crate::Cli as clap::CommandFactory>::command();
@@ -592,6 +617,43 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("hptx-offline-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join(name)
+    }
+
+    #[test]
+    fn chars_lists_both_tables_in_text_and_json() {
+        use crate::output::{Format, render};
+        let outcome = chars();
+        let named = hptx_core::charset::named_chars();
+        assert_eq!(named.len(), 40);
+        assert_eq!(outcome.total, Some(40));
+        let text = render(&outcome, Format::Text, None).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 41);
+        assert_eq!(lines[3], "131  √  \\v/");
+        assert_eq!(lines[40], NUMERIC_TRIGRAPHS);
+        let json: Value =
+            serde_json::from_str(&render(&outcome, Format::Json, None).unwrap()).unwrap();
+        let rows = json["results"].as_array().unwrap();
+        assert_eq!(rows.len(), named.len());
+        for (i, c) in named.iter().enumerate() {
+            assert_eq!(lines[i], format!("{}  {}  {}", c.code, c.text, c.trigraph));
+            assert_eq!(
+                rows[i],
+                json!({"code": c.code, "char": c.text, "trigraph": c.trigraph})
+            );
+            // What the line shows types the code back.
+            assert_eq!(
+                hptx_core::charset::encode_command(c.trigraph).unwrap(),
+                [c.code]
+            );
+        }
+        for code in [171u8, 187, 176, 181, 215, 216, 223, 247] {
+            assert!(rows.iter().any(|r| r["code"] == code), "{code}");
+        }
+        assert_eq!(
+            render(&outcome, Format::Json, Some(".results[7].trigraph")).unwrap(),
+            "\\pi"
+        );
     }
 
     #[test]

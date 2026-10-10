@@ -535,9 +535,19 @@ change there, not here (`backlog/crates-trusted-publishing.md`).
   (user). Replaces "saturnus in-process, behind a feature" (2026-10-05). The
   feature saved little (at the pinned rev the saturnus core has no
   dependencies; saturnus-drive adds `anyhow` and `png`, which hptx already
-  uses) but hptx-cli never
-  forwarded it, so installed and released binaries could not open
-  `saturnus://` addresses, and with the feature off cargo warned about the
-  workspace's `[profile.dev.package.saturnus*]` overrides. hptx-core and
-  hptx-cli are not published, so the git dependency stays acceptable; it
-  remains pinned by `rev`.
+  uses) but hptx-cli never forwarded it, so installed and released binaries
+  could not open `saturnus://` addresses, and with the feature off cargo
+  warned about the workspace's `[profile.dev.package.saturnus*]` overrides.
+  hptx-core and hptx-cli are not published, so the git dependency stays
+  acceptable; it remains pinned by `rev`.
+
+## 2026-10-10 (character list)
+
+- **`hptx chars` and `:chars`** list the 40 characters with a mnemonic
+  trigraph (code, character, trigraph; `--json` gives `[{code, char,
+  trigraph}]`) and the `\nnn` rule for the rest of 160-255. `hptx chars`
+  needs no calculator; `:chars` sends nothing to it (the REPL still opens
+  its link first). The rows come from `hptx_core::charset::named_chars()`,
+  built from the private `HIGH` and `LATIN_TRIGRAPHS` tables, so the list
+  cannot drift from what `encode_command` accepts. `run --help` and `repl
+  --help` show the common ones and point to the full list.
