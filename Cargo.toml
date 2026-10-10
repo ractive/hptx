@@ -16,7 +16,7 @@ clap = { version = "4", features = ["derive"] }
 unwrap_used = "warn"
 expect_used = "warn"
 
-# The in-process emulator (feature `saturnus`) runs far below real time
+# The in-process emulator (saturnus transport) runs far below real time
 # unoptimised; the e2e suite drives it in the test profile.
 [profile.dev.package.saturnus]
 opt-level = 3

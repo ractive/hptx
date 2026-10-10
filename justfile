@@ -51,7 +51,7 @@ e2e-saturnus model="48sx" roms="../saturnus/roms":
         *) echo "e2e-saturnus: model is 48sx, 48gx or 49g, not {{model}}" >&2; exit 2 ;;
     esac
     dir=$(cd "{{roms}}" && pwd)
-    HPTX_E2E_ADDR="saturnus://{{model}}@$dir/$rom" cargo test -p hptx-core --features saturnus --test e2e -- --nocapture
+    HPTX_E2E_ADDR="saturnus://{{model}}@$dir/$rom" cargo test -p hptx-core --test e2e -- --nocapture
 
 # e.g. `just record-trace dir > crates/kermit-proto/traces/48sx-dir.trace`
 # Record a Kermit trace from the running emulator to stdout

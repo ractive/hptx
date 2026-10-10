@@ -164,8 +164,7 @@ binary; the calculator's own memory (hptx runs what the user tells it to).
 - `cargo-deny` (`deny.toml`: advisories, licenses, bans, sources) runs in
   CI on every PR and push to main (iteration 11a) and locally with
   `cargo deny --locked check`.
-- Git dependencies (`saturnus`, `saturnus-drive`, feature `saturnus` only)
-  are pinned by commit rev.
+- Git dependencies (`saturnus`, `saturnus-drive`) are pinned by commit rev.
 - Default features are trimmed where they pull system libraries or I/O:
   `serialport` without libudev, `rustyline` with file history only.
 - `kermit-proto` and `xmodem-proto` are the only crates published; they have

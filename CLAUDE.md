@@ -60,8 +60,7 @@ as commits or PRs to that repository.
   `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace -q`,
   `cargo deny --locked check` (`deny.toml` checks the all-features graph).
   This is the local minimum; CI (`.github/workflows/ci.yml`) is authoritative
-  and adds `--locked`, `--all-features` clippy, the `saturnus` feature tests,
-  the wasm32 check of the proto crates and the emulator e2e suites.
+  and adds `--locked`, the wasm32 check of the proto crates and the emulator e2e suites.
 - No `.unwrap()`/`.expect()` outside tests; `anyhow::Context` with `?`.
 - Test policy in `kb/docs/test-policy.md`: fast unit tests, one e2e binary per
   crate, emulator tests gated by `HPTX_E2E_ADDR`.

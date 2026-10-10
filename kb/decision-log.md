@@ -528,3 +528,15 @@ change there, not here (`backlog/crates-trusted-publishing.md`).
   nominal baud (an emulator) can deliver a real rejection inside the wire
   time; that case keeps the iteration 12 behaviour (`NoReply`). Workspace
   version 0.1.1.
+
+## 2026-10-10 (saturnus transport always built)
+
+- **No `saturnus` feature; the in-process transport is always built**
+  (user). Replaces "saturnus in-process, behind a feature" (2026-10-05). The
+  feature saved little (the saturnus core has no dependencies; saturnus-drive
+  adds `anyhow`, `miniz_oxide` and `saturnus-host`) but hptx-cli never
+  forwarded it, so installed and released binaries could not open
+  `saturnus://` addresses, and with the feature off cargo warned about the
+  workspace's `[profile.dev.package.saturnus*]` overrides. hptx-core and
+  hptx-cli are not published, so the git dependency stays acceptable; it
+  remains pinned by `rev`.

@@ -1,4 +1,4 @@
-//! In-process link to the `saturnus` emulator (feature `saturnus`): an HP
+//! In-process link to the `saturnus` emulator: an HP
 //! 48SX, 48GX or 49G.
 //!
 //! The transport owns a [`saturnus::Machine`] and runs it in emulated time,

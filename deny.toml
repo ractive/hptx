@@ -57,6 +57,6 @@ wildcards = "allow"
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-# hptx-core's optional in-process transport (feature `saturnus`), pinned to
+# hptx-core's in-process saturnus transport, pinned to
 # a rev in crates/hptx-core/Cargo.toml.
 allow-git = ["https://github.com/ractive/saturnus"]
