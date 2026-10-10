@@ -5,9 +5,8 @@
 # (EmbarkStudios/cargo-deny-action, SHA-pinned; iteration 11a). Modelled on
 # hyalo's deny.toml.
 #
-# The graph is checked with every feature on (`all-features` below), so the
-# optional `saturnus` transport of hptx-core and its dependencies are
-# audited too, not only the default build.
+# The graph is checked with every feature on (`all-features` below), so a
+# feature added later is audited too, not only the default build.
 
 [graph]
 all-features = true
@@ -49,14 +48,15 @@ allow = ["MPL-2.0"]
 # 0.8 (png) vs 0.9 (flate2). They clear when serialport and png move on.
 [bans]
 multiple-versions = "warn"
-# hptx-core's optional git dependency on saturnus has no `version`, which
-# cargo-deny counts as a wildcard requirement; nothing else is a wildcard.
+# hptx-core's git dependencies on saturnus and saturnus-drive have no
+# `version`, which cargo-deny counts as wildcard requirements; nothing else
+# is a wildcard.
 wildcards = "allow"
 
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-# hptx-core's optional in-process transport (feature `saturnus`), pinned to
+# hptx-core's in-process saturnus transport, pinned to
 # a rev in crates/hptx-core/Cargo.toml.
 allow-git = ["https://github.com/ractive/saturnus"]

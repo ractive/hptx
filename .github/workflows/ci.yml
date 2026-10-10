@@ -38,7 +38,7 @@ jobs:
       - if: runner.os == 'Linux'
         run: cargo fmt --all -- --check
       # A Docker action, so Linux only. deny.toml checks the graph with every
-      # feature on (the saturnus git dependency included).
+      # feature on.
       - name: Check dependency advisories, licences, bans and sources
         if: runner.os == 'Linux'
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
@@ -52,10 +52,6 @@ jobs:
         run: cargo check -p kermit-proto -p xmodem-proto --target wasm32-unknown-unknown --locked
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo test --locked --workspace -q
-      # The in-process saturnus transport (git dependency on the public
-      # saturnus repo); its e2e run needs a ROM and stays local.
-      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
-      - run: cargo test --locked -p hptx-core --features saturnus -q
 
   e2e:
     runs-on: ubuntu-24.04

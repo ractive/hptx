@@ -1,6 +1,6 @@
-//! Links to a calculator: serial port, TCP (emulator), in-memory (tests) and,
-//! with the `saturnus` feature, the saturnus emulator in-process (HP 48SX,
-//! 48GX or 49G, chosen in the `saturnus://MODEL@ROM` address).
+//! Links to a calculator: serial port, TCP (emulator), in-memory (tests) and
+//! the saturnus emulator in-process (HP 48SX, 48GX or 49G, chosen in the
+//! `saturnus://MODEL@ROM` address).
 //!
 //! A [`Transport`] writes whole packets and reads with a timeout. Each packet
 //! goes out in one write: the HP's receiver overruns on inter-byte gaps.
@@ -14,9 +14,7 @@ use kermit_proto::trace::{self, Direction};
 
 use crate::{Error, Result};
 
-#[cfg(feature = "saturnus")]
 mod saturnus;
-#[cfg(feature = "saturnus")]
 pub use saturnus::SaturnusTransport;
 
 /// A byte link to a calculator.
@@ -36,7 +34,7 @@ const MIN_TIMEOUT: Duration = Duration::from_millis(1);
 
 /// Open a link: `tcp://host:port` for an emulator, `saturnus://[MODEL@]ROM`
 /// for the in-process saturnus emulator booted from the ROM image at the
-/// path `ROM` (needs the `saturnus` feature; see [`parse_saturnus`]), e.g.
+/// path `ROM` (see [`parse_saturnus`]), e.g.
 /// `saturnus:///abs/sxrom-j` (an HP 48SX) or
 /// `saturnus://49g@/abs/rom.49g`; anything else without a `scheme://`
 /// prefix is a serial device path (`/dev/ttyUSB0`, `COM3`).
@@ -148,19 +146,8 @@ pub fn parse_saturnus(addr: &str) -> Result<(EmulatorModel, &std::path::Path)> {
 /// Boot the saturnus emulator in-process as `model` from the ROM image at
 /// `rom` and start its Kermit server (48SX, 48GX and 49G; other models are
 /// [`Error::Emulator`]).
-#[cfg(feature = "saturnus")]
 pub fn open_saturnus(model: EmulatorModel, rom: &std::path::Path) -> Result<Box<dyn Transport>> {
     Ok(Box::new(SaturnusTransport::open(model, rom)?))
-}
-
-/// Without the `saturnus` feature there is no in-process emulator.
-#[cfg(not(feature = "saturnus"))]
-pub fn open_saturnus(model: EmulatorModel, rom: &std::path::Path) -> Result<Box<dyn Transport>> {
-    Err(Error::Emulator(format!(
-        "cannot boot {} as the {}: hptx-core was built without the `saturnus` feature",
-        rom.display(),
-        model.name()
-    )))
 }
 
 /// Read and discard everything that arrives within `period` from now; returns

@@ -17,8 +17,6 @@ thiserror = "2.0.21"
 # The saturnus emulator, in-process (`saturnus://[MODEL@]ROM` addresses), and its
 # host-side driver for the scripted boot and Kermit server start. Keep both
 # at the same rev.
-saturnus = { git = "https://github.com/ractive/saturnus", rev = "a6e7e9514821dede1ce8114c6562366c97d8e8ce", optional = true }
-saturnus-drive = { git = "https://github.com/ractive/saturnus", rev = "a6e7e9514821dede1ce8114c6562366c97d8e8ce", optional = true }
+saturnus = { git = "https://github.com/ractive/saturnus", rev = "a6e7e9514821dede1ce8114c6562366c97d8e8ce" }
+saturnus-drive = { git = "https://github.com/ractive/saturnus", rev = "a6e7e9514821dede1ce8114c6562366c97d8e8ce" }
 
-[features]
-saturnus = ["dep:saturnus", "dep:saturnus-drive"]

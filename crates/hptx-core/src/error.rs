@@ -16,7 +16,7 @@ pub enum Error {
     )]
     Address(String),
     /// The in-process emulator could not be started (missing ROM, wrong
-    /// size, no `saturnus` feature).
+    /// size).
     #[error("emulator: {0}")]
     Emulator(String),
     /// A host command got no reply in time. A `C` packet is sent only once
