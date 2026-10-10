@@ -87,3 +87,8 @@ publish and no tag.
   dropped instead of written (`if xfer.poll_output(now).is_none() {
   break; } continue;`). The tests and e2e pass, so likely nothing is queued at that point
   in practice (not verified further); worth a look in the next xmodem iteration.
+- Writes are queued and done by the driver after each poll, so a failed
+  write of the final ACK reaches the core on its next read, after `Done`:
+  the transaction keeps its transcript where it used to return `Io`.
+  Progress callbacks of the blocking API see each event after the core
+  handled it (before, just before).
