@@ -31,7 +31,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
           components: rustfmt, clippy
-          # The wasm32 check of the protocol crates runs on Linux only.
+          # The wasm32 checks (protocol crates, hptx-core) run on Linux only.
           targets: ${{ runner.os == 'Linux' && 'wasm32-unknown-unknown' || '' }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # Formatting and the dependency audit are platform-independent: once.
@@ -50,6 +50,15 @@ jobs:
       - name: Check the protocol crates on wasm32
         if: runner.os == 'Linux'
         run: cargo check -p kermit-proto -p xmodem-proto --target wasm32-unknown-unknown --locked
+      # hptx-core without its default `native` feature (no serial port, no
+      # TCP) is the protocol core of saturnus-tx in the browser: it must
+      # build for wasm32 and pass clippy on its own.
+      - name: Build hptx-core on wasm32 without default features
+        if: runner.os == 'Linux'
+        run: cargo build -p hptx-core --no-default-features --target wasm32-unknown-unknown --locked
+      - name: Clippy on hptx-core without default features
+        if: runner.os == 'Linux'
+        run: cargo clippy --locked -p hptx-core --no-default-features --all-targets -- -D warnings
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo test --locked --workspace -q
       # The in-process saturnus transport (git dependency on the public

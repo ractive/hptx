@@ -1,14 +1,21 @@
-//! Links to a calculator: serial port, TCP (emulator), in-memory (tests) and,
-//! with the `saturnus` feature, the saturnus emulator in-process (HP 48SX,
-//! 48GX or 49G, chosen in the `saturnus://MODEL@ROM` address).
+//! Blocking links to a calculator: serial port and TCP (emulator) with the
+//! `native` feature (default), the saturnus emulator in-process (HP 48SX,
+//! 48GX or 49G, chosen in the `saturnus://MODEL@ROM` address) with the
+//! `saturnus` feature, and in-memory (tests).
 //!
 //! A [`Transport`] writes whole packets and reads with a timeout. Each packet
-//! goes out in one write: the HP's receiver overruns on inter-byte gaps.
+//! goes out in one write: the HP's receiver overruns on inter-byte gaps. A
+//! host without blocking reads (a browser) uses
+//! [`machine::Machine`](crate::machine::Machine) instead.
 
 use std::collections::VecDeque;
-use std::io::{self, ErrorKind, Read, Write};
+use std::io::{self, ErrorKind};
+#[cfg(feature = "native")]
+use std::io::{Read, Write};
+#[cfg(feature = "native")]
 use std::net::TcpStream;
-use std::time::{Duration, Instant};
+
+use crate::time::{Duration, Instant};
 
 use kermit_proto::trace::{self, Direction};
 
@@ -32,6 +39,7 @@ pub trait Transport: Send {
 pub const BAUD: u32 = 9600;
 
 /// Shortest timeout handed to the OS; zero would mean "block forever".
+#[cfg(feature = "native")]
 const MIN_TIMEOUT: Duration = Duration::from_millis(1);
 
 /// Open a link: `tcp://host:port` for an emulator, `saturnus://[MODEL@]ROM`
@@ -39,7 +47,8 @@ const MIN_TIMEOUT: Duration = Duration::from_millis(1);
 /// path `ROM` (needs the `saturnus` feature; see [`parse_saturnus`]), e.g.
 /// `saturnus:///abs/sxrom-j` (an HP 48SX) or
 /// `saturnus://49g@/abs/rom.49g`; anything else without a `scheme://`
-/// prefix is a serial device path (`/dev/ttyUSB0`, `COM3`).
+/// prefix is a serial device path (`/dev/ttyUSB0`, `COM3`). Serial and
+/// TCP need the `native` feature: without it they are [`Error::Address`].
 pub fn open(addr: &str) -> Result<Box<dyn Transport>> {
     if addr.starts_with("saturnus://") {
         let (model, rom) = parse_saturnus(addr)?;
@@ -49,12 +58,36 @@ pub fn open(addr: &str) -> Result<Box<dyn Transport>> {
         if host_port.is_empty() {
             return Err(Error::Address(addr.to_string()));
         }
-        return Ok(Box::new(TcpTransport::connect(host_port)?));
+        return open_tcp(addr, host_port);
     }
     if addr.is_empty() || addr.contains("://") {
         return Err(Error::Address(addr.to_string()));
     }
+    open_serial(addr)
+}
+
+#[cfg(feature = "native")]
+fn open_tcp(_addr: &str, host_port: &str) -> Result<Box<dyn Transport>> {
+    Ok(Box::new(TcpTransport::connect(host_port)?))
+}
+
+#[cfg(not(feature = "native"))]
+fn open_tcp(addr: &str, _host_port: &str) -> Result<Box<dyn Transport>> {
+    Err(Error::Address(format!(
+        "{addr} (hptx-core was built without the `native` feature)"
+    )))
+}
+
+#[cfg(feature = "native")]
+fn open_serial(addr: &str) -> Result<Box<dyn Transport>> {
     Ok(Box::new(SerialTransport::open(addr)?))
+}
+
+#[cfg(not(feature = "native"))]
+fn open_serial(addr: &str) -> Result<Box<dyn Transport>> {
+    Err(Error::Address(format!(
+        "{addr} (hptx-core was built without the `native` feature)"
+    )))
 }
 
 /// A calculator model the in-process emulator can be asked to run, by its
@@ -180,12 +213,14 @@ pub fn drain(transport: &mut dyn Transport, period: Duration) -> io::Result<usiz
     }
 }
 
-/// TCP link, e.g. to the emulator's serial bridge.
+/// TCP link, e.g. to the emulator's serial bridge (feature `native`).
+#[cfg(feature = "native")]
 #[derive(Debug)]
 pub struct TcpTransport {
     stream: TcpStream,
 }
 
+#[cfg(feature = "native")]
 impl TcpTransport {
     /// Connect to `host:port` with Nagle disabled.
     pub fn connect(host_port: &str) -> Result<Self> {
@@ -195,6 +230,7 @@ impl TcpTransport {
     }
 }
 
+#[cfg(feature = "native")]
 impl Transport for TcpTransport {
     fn write_packet(&mut self, packet: &[u8]) -> io::Result<()> {
         self.stream.write_all(packet)?;
@@ -213,11 +249,13 @@ impl Transport for TcpTransport {
     }
 }
 
-/// Serial port at [`BAUD`], 8N1, no flow control.
+/// Serial port at [`BAUD`], 8N1, no flow control (feature `native`).
+#[cfg(feature = "native")]
 pub struct SerialTransport {
     port: Box<dyn serialport::SerialPort>,
 }
 
+#[cfg(feature = "native")]
 impl SerialTransport {
     /// Open and configure the serial device at `path`.
     pub fn open(path: &str) -> Result<Self> {
@@ -235,6 +273,7 @@ impl SerialTransport {
     }
 }
 
+#[cfg(feature = "native")]
 impl Transport for SerialTransport {
     fn write_packet(&mut self, packet: &[u8]) -> io::Result<()> {
         self.port.write_all(packet)?;
@@ -355,7 +394,9 @@ impl Transport for MemoryTransport {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    #[cfg(feature = "native")]
     use std::net::TcpListener;
+    #[cfg(feature = "native")]
     use std::sync::mpsc;
 
     const SHORT: Duration = Duration::from_millis(20);
@@ -401,6 +442,7 @@ mod tests {
         assert_eq!(t.read(&mut buf, Duration::ZERO).unwrap(), 0);
     }
 
+    #[cfg(feature = "native")]
     #[test]
     fn tcp_transport() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -436,6 +478,7 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
     }
 
+    #[cfg(feature = "native")]
     #[test]
     fn open_addresses() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();

@@ -160,9 +160,8 @@ fn core_failure(message: String, err: &Error, link: &LinkInfo) -> Failure {
                 .into(),
         ),
         Error::Emulator(_) => Some(
-            "saturnus://[MODEL@]ROM addresses (MODEL 48sx, the default, 48gx or 49g) need hptx \
-             built with the `saturnus` feature of hptx-core and a readable ROM file of that \
-             model; use tcp://host:port for the Docker emulator"
+            "saturnus://[MODEL@]ROM addresses (MODEL 48sx, the default, 48gx or 49g) need a \
+             readable ROM file of that model; use tcp://host:port for the Docker emulator"
                 .into(),
         ),
         Error::Serial(_) => {
