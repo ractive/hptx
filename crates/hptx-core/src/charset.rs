@@ -151,6 +151,37 @@ pub fn trigraph_at(s: &str) -> Option<(u8, usize)> {
     None
 }
 
+/// A character with a mnemonic trigraph: its code, its Unicode text and the
+/// ASCII trigraph that types it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamedChar {
+    /// The byte in the HP character set (128-255).
+    pub code: u8,
+    /// The character as Unicode text (`x̄` is two code points).
+    pub text: String,
+    /// The trigraph, e.g. `\->`.
+    pub trigraph: &'static str,
+}
+
+/// Every character with a mnemonic trigraph (all of 128-159 and some of
+/// 160-255), by code. The other codes 160-255 are typed as `\nnn`, three
+/// decimal digits.
+pub fn named_chars() -> Vec<NamedChar> {
+    let high = (0x80u8..)
+        .zip(HIGH.iter())
+        .map(|(code, (text, trigraph))| NamedChar {
+            code,
+            text: (*text).to_string(),
+            trigraph,
+        });
+    let latin = LATIN_TRIGRAPHS.iter().map(|&(code, trigraph)| NamedChar {
+        code,
+        text: char::from(code).to_string(),
+        trigraph,
+    });
+    high.chain(latin).collect()
+}
+
 /// HP bytes to 7-bit ASCII the way the calculator writes them with
 /// translation mode 3: bytes 128-255 become trigraphs, the rest is unchanged.
 pub fn to_trigraphs(bytes: &[u8]) -> String {
@@ -213,6 +244,26 @@ mod tests {
         assert!(matches!(encode("€"), Err(Error::Charset('€'))));
         assert_eq!(encode("x").unwrap(), b"x");
         assert_eq!(encode("x\u{0304}y").unwrap(), b"\x81y");
+    }
+
+    #[test]
+    fn named_chars_cover_both_tables_and_round_trip() {
+        let named = named_chars();
+        assert_eq!(named.len(), HIGH.len() + LATIN_TRIGRAPHS.len());
+        assert!(named.windows(2).all(|w| w[0].code < w[1].code));
+        for c in &named {
+            assert_eq!(
+                encode_command(c.trigraph).unwrap(),
+                [c.code],
+                "{}",
+                c.trigraph
+            );
+            assert_eq!(encode(&c.text).unwrap(), [c.code], "{}", c.text);
+            assert_eq!(decode(&[c.code]), c.text);
+            assert_eq!(to_trigraphs(&[c.code]), c.trigraph);
+        }
+        assert_eq!(named[3].trigraph, "\\v/");
+        assert_eq!(named[3].text, "√");
     }
 
     #[test]

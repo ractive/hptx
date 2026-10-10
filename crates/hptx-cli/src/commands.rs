@@ -296,6 +296,7 @@ impl Ctx {
                         force,
                     },
             } => return offline::grob_to_png(&file, output.as_deref(), force),
+            Command::Chars => offline::chars(),
             Command::Completions { shell } => return offline::completions(shell),
         }))
     }
