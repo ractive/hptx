@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "HP 48/49 calculator layer of hptx: Kermit and XModem driver loops, calculator operations, HP objects; blocking or sans-I/O (wasm32)"
+readme = "README.md"
 
 [lints]
 workspace = true
@@ -12,7 +14,7 @@ workspace = true
 kermit-proto = { version = "0.1.1", path = "../kermit-proto" }
 xmodem-proto = { version = "0.1.1", path = "../xmodem-proto" }
 png = "0.18.1"
-serialport = { version = "4.10.1", default-features = false }
+serialport = { version = "4.10.1", default-features = false, optional = true }
 thiserror = "2.0.21"
 # The saturnus emulator, in-process (`saturnus://[MODEL@]ROM` addresses), and its
 # host-side driver for the scripted boot and Kermit server start. Keep both
@@ -20,5 +22,16 @@ thiserror = "2.0.21"
 saturnus = { git = "https://github.com/ractive/saturnus", rev = "a6e7e9514821dede1ce8114c6562366c97d8e8ce", optional = true }
 saturnus-drive = { git = "https://github.com/ractive/saturnus", rev = "a6e7e9514821dede1ce8114c6562366c97d8e8ce", optional = true }
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# The wall clock for the sync-marker seed of the blocking API
+# (`std::time::SystemTime::now()` panics on wasm32-unknown-unknown); the
+# same crate kermit-proto uses for its `Instant` there.
+web-time = "1.1.0"
+
 [features]
+default = ["native"]
+# Serial ports and TCP (`transport::open` of a device path or tcp://).
+# Without it the crate has no OS I/O and builds for wasm32-unknown-unknown.
+native = ["dep:serialport"]
+# The saturnus emulator in-process (`saturnus://[MODEL@]ROM`).
 saturnus = ["dep:saturnus", "dep:saturnus-drive"]

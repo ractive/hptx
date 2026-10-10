@@ -377,6 +377,7 @@ dependencies = [
  "saturnus-drive",
  "serialport",
  "thiserror",
+ "web-time",
  "xmodem-proto",
 ]
 

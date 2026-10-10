@@ -6,7 +6,9 @@ pub enum Error {
     /// The link failed.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
-    /// The serial port could not be opened or configured.
+    /// The serial port could not be opened or configured (feature
+    /// `native`).
+    #[cfg(feature = "native")]
     #[error("serial port: {0}")]
     Serial(#[from] serialport::Error),
     /// The link address is not `tcp://host:port`, `saturnus://[MODEL@]ROM`

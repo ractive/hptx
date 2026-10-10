@@ -1,4 +1,4 @@
-//! Drives a [`kermit_proto::Client`] over a [`Transport`].
+//! Drives a [`kermit_proto::Client`] over a byte link.
 //!
 //! The loop is the one from `kermit-proto`'s docs: write each queued packet
 //! with one write (the HP overruns on inter-byte gaps), handle the events,
@@ -7,12 +7,16 @@
 //! out, and through the client's linger after a receive (re-ACKing a
 //! repeated `B`). Input left over from the idle server (periodic NAKs) is
 //! drained when the session is created.
-
-use std::time::{Duration, Instant};
+//!
+//! The loop is written once, as async code on the crate's link (see
+//! [`machine`](crate::machine)); [`Session`] runs it over a [`Transport`]
+//! with the system clock.
 
 use kermit_proto::{Client, Command, Config, Event, StartError};
 
 use crate::charset;
+use crate::link::{self, Link, Progress};
+use crate::time::{Duration, Instant};
 use crate::transport::{self, Transport};
 use crate::{Error, Result};
 
@@ -78,9 +82,11 @@ pub struct Transcript {
     pub text: Vec<u8>,
 }
 
-/// A Kermit connection to a calculator in server mode.
-pub struct Session {
-    transport: Box<dyn Transport>,
+/// The Kermit side of a link, without the I/O: the client, its
+/// configuration and the pacing between transactions.
+#[derive(Debug)]
+pub(crate) struct KermitCore {
+    pub(crate) link: Link,
     client: Client,
     config: Config,
     turnaround: Duration,
@@ -90,72 +96,50 @@ pub struct Session {
     answered: bool,
 }
 
-impl Session {
-    /// Wrap `transport`, discarding input for `options.drain` first.
-    pub fn new(mut transport: Box<dyn Transport>, options: Options) -> Result<Self> {
-        transport::drain(transport.as_mut(), options.drain)?;
-        Ok(Session {
-            transport,
+impl KermitCore {
+    pub(crate) fn new(link: Link, options: &Options) -> Self {
+        KermitCore {
+            link,
             client: Client::new(options.kermit.clone()),
-            config: options.kermit,
+            config: options.kermit.clone(),
             turnaround: options.turnaround,
             last_end: None,
             answered: false,
-        })
+        }
     }
 
-    /// Open `addr` (see [`transport::open`]) with default [`Options`].
-    pub fn open(addr: &str) -> Result<Self> {
-        Session::new(transport::open(addr)?, Options::default())
-    }
-
-    /// Give the link back, e.g. for an XModem transfer after
-    /// [`Calculator::prepare_for_xmodem`](crate::Calculator::prepare_for_xmodem)
-    /// ended server mode.
-    pub fn into_transport(self) -> Box<dyn Transport> {
-        self.transport
-    }
-
-    /// The Kermit configuration in use.
-    pub fn config(&self) -> &Config {
+    pub(crate) fn config(&self) -> &Config {
         &self.config
     }
 
-    /// Use `config` from the next transaction on.
-    pub fn set_config(&mut self, config: Config) {
+    pub(crate) fn set_config(&mut self, config: Config) {
         self.client = Client::new(config.clone());
         self.config = config;
     }
 
-    /// Whether the server sent its parameters (its `S`, or the ACK to an
-    /// `I` or `S`) in the last transaction, also when it failed later: for
-    /// a host command, whether the `C` was received and answered.
-    pub fn answered(&self) -> bool {
+    pub(crate) fn answered(&self) -> bool {
         self.answered
     }
 
-    /// Run one transaction to completion.
-    pub fn transact(&mut self, command: Command) -> Result<Transcript> {
-        self.transact_with(command, &mut |_| {})
+    /// Count a transaction as ended at `now` (an aborted one): the next
+    /// waits for the turnaround.
+    pub(crate) fn ended_at(&mut self, now: Instant) {
+        self.last_end = Some(now);
     }
 
-    /// Run one transaction, passing every event to `progress` first.
-    pub fn transact_with(
-        &mut self,
-        command: Command,
-        progress: &mut dyn FnMut(&Event),
-    ) -> Result<Transcript> {
+    /// Run one transaction to completion; every event goes to the link.
+    pub(crate) async fn transact(&mut self, command: Command) -> Result<Transcript> {
         if let Some(end) = self.last_end {
-            std::thread::sleep((end + self.turnaround).saturating_duration_since(Instant::now()));
+            self.link.sleep_until(end + self.turnaround).await;
         }
         if matches!(command, Command::Host(_)) {
-            self.discard_pending()?;
+            self.discard_pending().await?;
         }
-        let result = self.run(command, progress);
+        let result = self.run(command).await;
         self.answered = self.client.peer_params().is_some();
         if result.is_err() {
             self.client = Client::new(self.config.clone());
-            self.last_end = Some(Instant::now());
+            self.last_end = Some(self.link.now());
         }
         result
     }
@@ -165,21 +149,25 @@ impl Session {
     /// seconds) that would otherwise be read right after the `C`, inside the
     /// immediate-NAK window of host commands. Nothing of the
     /// coming transaction can be in it yet.
-    fn discard_pending(&mut self) -> Result<()> {
-        let end = Instant::now() + PENDING_MAX;
-        let mut buf = [0u8; 256];
-        while self.transport.read(&mut buf, PENDING_WAIT)? > 0 && Instant::now() < end {}
-        Ok(())
+    async fn discard_pending(&mut self) -> Result<()> {
+        let end = self.link.now() + PENDING_MAX;
+        loop {
+            let deadline = self.link.now() + PENDING_WAIT;
+            let got = self.link.read(Some(deadline)).await?;
+            if got.is_empty() || self.link.now() >= end {
+                return Ok(());
+            }
+        }
     }
 
-    fn run(&mut self, command: Command, progress: &mut dyn FnMut(&Event)) -> Result<Transcript> {
+    async fn run(&mut self, command: Command) -> Result<Transcript> {
         let sending = matches!(command, Command::Send(_));
         let command_text = match &command {
             Command::Host(bytes) | Command::Get(bytes) => charset::decode(bytes),
             _ => String::new(),
         };
         self.client
-            .start(Instant::now(), command)
+            .start(self.link.now(), command)
             .map_err(|e| match e {
                 StartError::TooLong { len, max } => Error::CommandTooLong {
                     command: command_text,
@@ -193,11 +181,10 @@ impl Session {
         let mut transcript = Transcript::default();
         let mut current: Option<ReceivedFile> = None;
         let mut outcome: Option<Result<()>> = None;
-        let mut buf = [0u8; 1024];
         'run: loop {
-            let now = Instant::now();
+            let now = self.link.now();
             while let Some(packet) = self.client.poll_output(now) {
-                match self.transport.write_packet(&packet) {
+                match self.link.write(packet) {
                     Ok(()) => {}
                     // A re-ACK during the linger: the transaction is
                     // complete, a failing link does not undo it.
@@ -206,7 +193,7 @@ impl Session {
                 }
             }
             while let Some(event) = self.client.poll_event() {
-                progress(&event);
+                self.link.emit(Progress::Kermit(event.clone()));
                 match event {
                     Event::FileStart { name } if sending => {
                         transcript.stored_names.push(charset::decode(&name));
@@ -244,21 +231,21 @@ impl Session {
                     _ => {}
                 }
             }
-            let wait = match (self.client.next_timeout(), &outcome) {
+            let deadline = match (self.client.next_timeout(), &outcome) {
                 (None, Some(_)) => break,
-                (Some(t), _) => t.saturating_duration_since(now),
-                (None, None) => IDLE_WAIT,
+                (Some(t), _) => t,
+                (None, None) => now + IDLE_WAIT,
             };
-            let n = match self.transport.read(&mut buf, wait.max(MIN_WAIT)) {
-                Ok(n) => n,
+            let input = match self.link.read(Some(deadline.max(now + MIN_WAIT))).await {
+                Ok(input) => input,
                 // Lingering after Done: the transcript is complete, a
                 // failing link only ends the linger.
                 Err(_) if matches!(outcome, Some(Ok(()))) => break,
                 Err(e) => return Err(e.into()),
             };
-            let now = Instant::now();
-            if n > 0 {
-                self.client.handle_input(now, &buf[..n]);
+            let now = self.link.now();
+            if !input.is_empty() {
+                self.client.handle_input(now, &input);
             }
             // Also after input: handle_input does not check the deadline, so
             // a peer that keeps sending garbage (noise, wrong speed) would
@@ -270,6 +257,84 @@ impl Session {
             Some(Err(e)) => Err(e),
             _ => Ok(transcript),
         }
+    }
+}
+
+/// A Kermit connection to a calculator in server mode, over a blocking
+/// [`Transport`] with the system clock. For a link driven from outside (a
+/// browser), see [`machine::Machine`](crate::machine::Machine).
+pub struct Session {
+    pub(crate) transport: Box<dyn Transport>,
+    pub(crate) core: KermitCore,
+}
+
+impl Session {
+    /// Wrap `transport`, discarding input for `options.drain` first.
+    pub fn new(mut transport: Box<dyn Transport>, options: Options) -> Result<Self> {
+        let link = Link::new(Instant::now());
+        link::drive(
+            transport.as_mut(),
+            &link,
+            link.drain(options.drain),
+            &mut |_| {},
+        )?;
+        Ok(Session {
+            transport,
+            core: KermitCore::new(link, &options),
+        })
+    }
+
+    /// Open `addr` (see [`transport::open`]) with default [`Options`].
+    pub fn open(addr: &str) -> Result<Self> {
+        Session::new(transport::open(addr)?, Options::default())
+    }
+
+    /// Give the link back, e.g. for an XModem transfer after
+    /// [`Calculator::prepare_for_xmodem`](crate::Calculator::prepare_for_xmodem)
+    /// ended server mode.
+    pub fn into_transport(self) -> Box<dyn Transport> {
+        self.transport
+    }
+
+    /// The Kermit configuration in use.
+    pub fn config(&self) -> &Config {
+        self.core.config()
+    }
+
+    /// Use `config` from the next transaction on.
+    pub fn set_config(&mut self, config: Config) {
+        self.core.set_config(config);
+    }
+
+    /// Whether the server sent its parameters (its `S`, or the ACK to an
+    /// `I` or `S`) in the last transaction, also when it failed later: for
+    /// a host command, whether the `C` was received and answered.
+    pub fn answered(&self) -> bool {
+        self.core.answered()
+    }
+
+    /// Run one transaction to completion.
+    pub fn transact(&mut self, command: Command) -> Result<Transcript> {
+        self.transact_with(command, &mut |_| {})
+    }
+
+    /// Run one transaction, passing every event to `progress`.
+    pub fn transact_with(
+        &mut self,
+        command: Command,
+        progress: &mut dyn FnMut(&Event),
+    ) -> Result<Transcript> {
+        let link = self.core.link.clone();
+        link::drive(
+            self.transport.as_mut(),
+            &link,
+            self.core.transact(command),
+            &mut |p| {
+                if let Progress::Kermit(event) = p {
+                    progress(event);
+                }
+            },
+        )
     }
 }
 
@@ -588,11 +653,7 @@ mod tests {
         };
         let mut s = Session {
             transport: Box::new(NoisyLine { reads: 0 }),
-            client: Client::new(options.kermit.clone()),
-            config: options.kermit,
-            turnaround: options.turnaround,
-            last_end: None,
-            answered: false,
+            core: KermitCore::new(Link::new(Instant::now()), &options),
         };
         let start = Instant::now();
         let err = s.transact(Command::Host(b"6 7 *".to_vec())).unwrap_err();

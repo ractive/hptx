@@ -14,6 +14,12 @@ lint:
     cargo clippy --workspace --all-targets -- -D warnings
     cargo deny --locked check
 
+# hptx-core without default features (no serial port or TCP) for the browser: wasm32 build and clippy
+wasm:
+    cargo check -p kermit-proto -p xmodem-proto --target wasm32-unknown-unknown --locked
+    cargo build -p hptx-core --no-default-features --target wasm32-unknown-unknown --locked
+    cargo clippy -p hptx-core --no-default-features --all-targets -- -D warnings
+
 # Format all code
 fmt:
     cargo fmt --all

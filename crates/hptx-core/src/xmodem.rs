@@ -1,5 +1,5 @@
-//! Drives an [`xmodem_proto::Transfer`] over a [`Transport`]: XModem
-//! transfers with the calculator's `XRECV` and `XSEND`.
+//! Drives an [`xmodem_proto::Transfer`] over a byte link: XModem transfers
+//! with the calculator's `XRECV` and `XSEND`.
 //!
 //! The calculator side cannot be started from the host: inside the Kermit
 //! server both commands fail with "Port Not Available" (49G and 48GX,
@@ -23,17 +23,22 @@
 //! block or control byte goes out in one write, reads wait at most until the
 //! machine's next deadline, `handle_timeout` runs after every read, and a
 //! watchdog cancels a transfer that stops making progress (a line full of
-//! noise never lets the machine's own timeouts fire).
+//! noise never lets the machine's own timeouts fire). It is written once, as
+//! async code on the crate's link: [`XmodemSession`] runs it over a
+//! [`Transport`] with the system clock, a
+//! [`Machine`](crate::machine::Machine) from outside
+//! ([`Op::XmodemSend`](crate::machine::Op::XmodemSend),
+//! [`Op::XmodemReceive`](crate::machine::Op::XmodemReceive)).
 //!
 //! wiki: protocols/xmodem, protocols/xmodem-hp.
-
-use std::time::{Duration, Instant};
 
 use xmodem_proto::{BlockSize, Check, Command, Config, Event, Transfer};
 
 use crate::calc::Model;
+use crate::link::{self, Link, Progress};
 use crate::object::{HEADER_LEN, inspect, strip_padding};
-use crate::transport::{self, Transport};
+use crate::time::{Duration, Instant};
+use crate::transport::Transport;
 use crate::{Error, Result};
 
 /// Read wait while the machine has no deadline.
@@ -172,6 +177,7 @@ pub struct XmodemReceived {
 pub struct XmodemSession {
     transport: Box<dyn Transport>,
     options: XmodemOptions,
+    link: Link,
 }
 
 /// What [`XmodemSession::run`] collected.
@@ -185,7 +191,11 @@ impl XmodemSession {
     /// Wrap an open `transport` (e.g. from
     /// [`Calculator::into_transport`](crate::Calculator::into_transport)).
     pub fn new(transport: Box<dyn Transport>, options: XmodemOptions) -> Self {
-        XmodemSession { transport, options }
+        XmodemSession {
+            transport,
+            options,
+            link: Link::new(Instant::now()),
+        }
     }
 
     /// The options in use.
@@ -204,17 +214,22 @@ impl XmodemSession {
         self.send_with(data, &mut |_| {})
     }
 
-    /// [`XmodemSession::send`], passing every event to `progress` first.
+    /// [`XmodemSession::send`], passing every event to `progress`.
     pub fn send_with(
         &mut self,
         data: &[u8],
         progress: &mut dyn FnMut(&Event),
     ) -> Result<XmodemReport> {
-        let outcome = self.run(Command::Send(data.to_vec()), progress)?;
-        Ok(XmodemReport {
-            check: outcome.check.unwrap_or(self.options.xmodem.check),
-            bytes: outcome.bytes,
-        })
+        link::drive(
+            self.transport.as_mut(),
+            &self.link,
+            send(&self.link, &self.options, data),
+            &mut |p| {
+                if let Progress::Xmodem(event) = p {
+                    progress(event);
+                }
+            },
+        )
     }
 
     /// Receive a file from a calculator running `XSEND` and cut the padding
@@ -224,130 +239,156 @@ impl XmodemSession {
         self.receive_with(&mut |_| {})
     }
 
-    /// [`XmodemSession::receive`], passing every event to `progress` first.
+    /// [`XmodemSession::receive`], passing every event to `progress`.
     pub fn receive_with(&mut self, progress: &mut dyn FnMut(&Event)) -> Result<XmodemReceived> {
-        let outcome = self.run(Command::Receive, progress)?;
-        let (raw, last_block) = outcome
-            .file
-            .ok_or_else(|| Error::Reply("XModem transfer ended without a file".into()))?;
-        // The object's length per the walk; the cut succeeded iff the result
-        // has exactly that length.
-        let object_len = inspect(&raw)
-            .ok()
-            .and_then(|i| i.size_nibbles)
-            .map(|n| HEADER_LEN + n.div_ceil(2));
-        // Padding never fills a whole block (a sender does not send a block
-        // of pure padding), so a cut may remove at most last_block - 1
-        // bytes; a walk that comes out a full block short leaves the data
-        // untouched instead of losing real bytes.
-        let data = strip_padding(&raw, last_block.saturating_sub(1)).to_vec();
-        let stripped = match object_len {
-            Some(len) if data.len() == len => Some(raw.len() - len),
-            _ => None,
-        };
-        Ok(XmodemReceived {
-            check: outcome.check.unwrap_or(self.options.xmodem.check),
-            received: raw.len(),
-            last_block,
-            stripped,
-            data,
-        })
+        link::drive(
+            self.transport.as_mut(),
+            &self.link,
+            receive(&self.link, &self.options),
+            &mut |p| {
+                if let Progress::Xmodem(event) = p {
+                    progress(event);
+                }
+            },
+        )
     }
+}
 
-    fn run(&mut self, command: Command, progress: &mut dyn FnMut(&Event)) -> Result<Outcome> {
-        transport::drain(self.transport.as_mut(), self.options.drain)?;
-        let config = self.options.config();
-        // Watchdog: the start window (plus one reply timeout for the last
-        // start character), then the time the machine needs to give up on
-        // one block. Reset on every sign of progress.
-        let start_limit = config.start_timeout.saturating_add(config.timeout);
-        let stall_limit = config
-            .timeout
-            .saturating_mul(config.retries.saturating_add(2))
-            .saturating_add(config.purge)
-            .saturating_add(config.byte_timeout);
-        let mut xfer = Transfer::new(config);
-        let begin = Instant::now();
-        xfer.start(begin, command)
-            .map_err(|e| Error::Reply(format!("XModem: {e}")))?;
-        let mut watchdog = begin.checked_add(start_limit);
-        let mut stalled = false;
+/// Send `data` to a calculator running `XRECV`.
+pub(crate) async fn send(
+    link: &Link,
+    options: &XmodemOptions,
+    data: &[u8],
+) -> Result<XmodemReport> {
+    let outcome = run(link, options, Command::Send(data.to_vec())).await?;
+    Ok(XmodemReport {
+        check: outcome.check.unwrap_or(options.xmodem.check),
+        bytes: outcome.bytes,
+    })
+}
 
-        let mut out = Outcome {
-            check: None,
-            bytes: 0,
-            file: None,
-        };
-        let mut result: Option<Result<()>> = None;
-        let mut buf = [0u8; 2048];
-        'run: loop {
-            let now = Instant::now();
-            while let Some(bytes) = xfer.poll_output(now) {
-                match self.transport.write_packet(&bytes) {
-                    Ok(()) => {}
-                    // A re-ACK during the linger: the file is complete, a
-                    // failing link does not undo it.
-                    Err(_) if matches!(result, Some(Ok(()))) => break 'run,
-                    Err(e) => return Err(e.into()),
-                }
-            }
-            while let Some(event) = xfer.poll_event() {
-                progress(&event);
-                match event {
-                    Event::Started { check } => {
-                        out.check = Some(check);
-                        watchdog = now.checked_add(stall_limit);
-                    }
-                    Event::Progress { bytes, .. } => {
-                        out.bytes = bytes;
-                        watchdog = now.checked_add(stall_limit);
-                    }
-                    Event::FileEnd {
-                        data, last_block, ..
-                    } => out.file = Some((data, last_block)),
-                    Event::Done => result = Some(Ok(())),
-                    Event::Error(xmodem_proto::Error::Cancelled) if stalled => {
-                        result = Some(Err(Error::Xmodem(xmodem_proto::Error::Timeout)));
-                    }
-                    Event::Error(e) => result = Some(Err(Error::Xmodem(e))),
-                    _ => {}
-                }
-            }
-            if result.is_some() && xfer.next_timeout().is_none() {
-                // Done or failed, and the final ACK or CANs are written.
-                if xfer.poll_output(now).is_none() {
-                    break;
-                }
-                continue;
-            }
-            if result.is_none() && watchdog.is_some_and(|w| now >= w) {
-                stalled = true;
-                xfer.cancel(now);
-                continue;
-            }
-            let until = match (xfer.next_timeout(), watchdog) {
-                (Some(a), Some(b)) => Some(a.min(b)),
-                (a, b) => a.or(b),
-            };
-            let wait = until.map_or(IDLE_WAIT, |t| t.saturating_duration_since(now));
-            let n = match self.transport.read(&mut buf, wait.max(MIN_WAIT)) {
-                Ok(n) => n,
-                // Lingering after Done: the file is complete, a failing
-                // link only ends the linger.
-                Err(_) if matches!(result, Some(Ok(()))) => break,
+/// Receive a file from a calculator running `XSEND` and cut the padding.
+pub(crate) async fn receive(link: &Link, options: &XmodemOptions) -> Result<XmodemReceived> {
+    let outcome = run(link, options, Command::Receive).await?;
+    let (raw, last_block) = outcome
+        .file
+        .ok_or_else(|| Error::Reply("XModem transfer ended without a file".into()))?;
+    // The object's length per the walk; the cut succeeded iff the result
+    // has exactly that length.
+    let object_len = inspect(&raw)
+        .ok()
+        .and_then(|i| i.size_nibbles)
+        .map(|n| HEADER_LEN + n.div_ceil(2));
+    // Padding never fills a whole block (a sender does not send a block
+    // of pure padding), so a cut may remove at most last_block - 1
+    // bytes; a walk that comes out a full block short leaves the data
+    // untouched instead of losing real bytes.
+    let data = strip_padding(&raw, last_block.saturating_sub(1)).to_vec();
+    let stripped = match object_len {
+        Some(len) if data.len() == len => Some(raw.len() - len),
+        _ => None,
+    };
+    Ok(XmodemReceived {
+        check: outcome.check.unwrap_or(options.xmodem.check),
+        received: raw.len(),
+        last_block,
+        stripped,
+        data,
+    })
+}
+
+async fn run(link: &Link, options: &XmodemOptions, command: Command) -> Result<Outcome> {
+    link.drain(options.drain).await?;
+    let config = options.config();
+    // Watchdog: the start window (plus one reply timeout for the last
+    // start character), then the time the machine needs to give up on
+    // one block. Reset on every sign of progress.
+    let start_limit = config.start_timeout.saturating_add(config.timeout);
+    let stall_limit = config
+        .timeout
+        .saturating_mul(config.retries.saturating_add(2))
+        .saturating_add(config.purge)
+        .saturating_add(config.byte_timeout);
+    let mut xfer = Transfer::new(config);
+    let begin = link.now();
+    xfer.start(begin, command)
+        .map_err(|e| Error::Reply(format!("XModem: {e}")))?;
+    let mut watchdog = begin.checked_add(start_limit);
+    let mut stalled = false;
+
+    let mut out = Outcome {
+        check: None,
+        bytes: 0,
+        file: None,
+    };
+    let mut result: Option<Result<()>> = None;
+    'run: loop {
+        let now = link.now();
+        while let Some(bytes) = xfer.poll_output(now) {
+            match link.write(bytes) {
+                Ok(()) => {}
+                // A re-ACK during the linger: the file is complete, a
+                // failing link does not undo it.
+                Err(_) if matches!(result, Some(Ok(()))) => break 'run,
                 Err(e) => return Err(e.into()),
-            };
-            let now = Instant::now();
-            if n > 0 {
-                xfer.handle_input(now, buf.get(..n).unwrap_or_default());
             }
-            // Also after input: the machine checks deadlines only here.
-            xfer.handle_timeout(now);
         }
-        match result {
-            Some(Err(e)) => Err(e),
-            _ => Ok(out),
+        while let Some(event) = xfer.poll_event() {
+            link.emit(Progress::Xmodem(event.clone()));
+            match event {
+                Event::Started { check } => {
+                    out.check = Some(check);
+                    watchdog = now.checked_add(stall_limit);
+                }
+                Event::Progress { bytes, .. } => {
+                    out.bytes = bytes;
+                    watchdog = now.checked_add(stall_limit);
+                }
+                Event::FileEnd {
+                    data, last_block, ..
+                } => out.file = Some((data, last_block)),
+                Event::Done => result = Some(Ok(())),
+                Event::Error(xmodem_proto::Error::Cancelled) if stalled => {
+                    result = Some(Err(Error::Xmodem(xmodem_proto::Error::Timeout)));
+                }
+                Event::Error(e) => result = Some(Err(Error::Xmodem(e))),
+                _ => {}
+            }
         }
+        if result.is_some() && xfer.next_timeout().is_none() {
+            // Done or failed, and the final ACK or CANs are written.
+            if xfer.poll_output(now).is_none() {
+                break;
+            }
+            continue;
+        }
+        if result.is_none() && watchdog.is_some_and(|w| now >= w) {
+            stalled = true;
+            xfer.cancel(now);
+            continue;
+        }
+        let until = match (xfer.next_timeout(), watchdog) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let deadline = until.unwrap_or(now + IDLE_WAIT).max(now + MIN_WAIT);
+        let input = match link.read(Some(deadline)).await {
+            Ok(input) => input,
+            // Lingering after Done: the file is complete, a failing
+            // link only ends the linger.
+            Err(_) if matches!(result, Some(Ok(()))) => break,
+            Err(e) => return Err(e.into()),
+        };
+        let now = link.now();
+        if !input.is_empty() {
+            xfer.handle_input(now, &input);
+        }
+        // Also after input: the machine checks deadlines only here.
+        xfer.handle_timeout(now);
+    }
+    match result {
+        Some(Err(e)) => Err(e),
+        _ => Ok(out),
     }
 }
 

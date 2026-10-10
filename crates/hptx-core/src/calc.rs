@@ -9,17 +9,18 @@
 //! undefined name pushes the name and evaluating a variable runs it, so names
 //! are checked against the listing before they are evaluated.
 
-use std::time::Duration;
+use crate::time::Duration;
 
 use kermit_proto::{Command, OutgoingFile};
 
 use crate::charset::{decode, encode, encode_command};
 use crate::grob::Grob;
+use crate::link::{self, Link};
 use crate::object::{HEADER_LEN, KERMIT_PADDING_ALLOWANCE, ObjectType, inspect};
 use crate::object::{object_size, strip_padding, unpack};
 use crate::reply::{Iopar, Listing, StackReply, parse_list, parse_listing, parse_real};
 use crate::reply::{parse_name, parse_stack, parse_string};
-use crate::session::Session;
+use crate::session::{KermitCore, Session};
 use crate::transport::{BAUD, Transport};
 use crate::xmodem::{XmodemDirection, XmodemPlan};
 use crate::{Error, Result};
@@ -112,54 +113,55 @@ pub enum TransferMode {
     Ascii,
 }
 
-/// A calculator in Kermit server mode.
-pub struct Calculator {
-    session: Session,
+/// What a calculator connection remembers between operations, apart from
+/// the Kermit session.
+#[derive(Debug)]
+pub(crate) struct CalcState {
     /// Last transfer mode set or read by us; `None` = unknown.
-    mode: Option<TransferMode>,
+    pub(crate) mode: Option<TransferMode>,
+    /// State of the generator behind the sync markers.
+    rng: u64,
 }
 
-impl Calculator {
-    /// Wrap an open session. The transfer mode is unknown until read or set.
-    pub fn new(session: Session) -> Self {
-        Calculator {
-            session,
+impl CalcState {
+    /// A fresh state; `seed` makes the sync markers of this connection
+    /// differ from those of an earlier one.
+    pub(crate) fn new(seed: u64) -> Self {
+        CalcState {
             mode: None,
+            rng: seed,
         }
     }
 
-    /// Open `addr` (see [`crate::transport::open`]) with default options
-    /// and [`sync`](Calculator::sync).
-    pub fn open(addr: &str) -> Result<Self> {
-        let mut calc = Calculator::new(Session::open(addr)?);
-        calc.sync()?;
-        Ok(calc)
+    /// The next sync marker: `HPTX-` and six hex digits of a splitmix64
+    /// step (13 characters with the quotes, far below every model's display
+    /// width), plain ASCII without RPL delimiters.
+    fn marker(&mut self) -> String {
+        self.rng = self.rng.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.rng;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        format!("HPTX-{:06x}", z & 0xFF_FFFF)
+    }
+}
+
+/// The calculator operations as async code on a Kermit core (see
+/// [`crate::machine`]): driven by [`Calculator`] over a transport, or by a
+/// [`Machine`](crate::machine::Machine) from outside.
+pub(crate) struct CalcOps<'a> {
+    pub(crate) k: &'a mut KermitCore,
+    pub(crate) st: &'a mut CalcState,
+}
+
+impl CalcOps<'_> {
+    /// [`Calculator::sync`].
+    pub(crate) async fn sync(&mut self) -> Result<()> {
+        let marker = self.st.marker();
+        self.sync_with(&marker).await
     }
 
-    /// Get in step with the server at the start of a session.
-    ///
-    /// When a client dies while a host command runs, the calculator still
-    /// finishes the command and offers its reply (an S packet repeated
-    /// every 5 s for about a minute). The next client's first command is
-    /// eaten as a bad ACK and the late reply arrives in its place. Sequence
-    /// numbers restart at zero for every command and host commands and
-    /// `G D` both answer with text, so the late reply cannot be told apart
-    /// on the wire, and repeating an arbitrary command would repeat its
-    /// effect. Instead the session starts with a sacrificial command that
-    /// pushes a marker string unique to this session ([`sync_marker`],
-    /// short enough that no model truncates it). A reply whose level 1 is
-    /// the marker is ours: the marker is dropped (every copy of it on top
-    /// of the stack, in case an earlier attempt was not eaten after all).
-    /// Any other reply was a late one and our command was eaten: the marker
-    /// command is sent once more. Nothing but the marker is ever dropped
-    /// and nothing else is ever resent. Link errors are returned; a second
-    /// odd reply is [`Error::Reply`]: hptx and the calculator are not in
-    /// step, and nothing is run on a stack it cannot vouch for.
-    pub fn sync(&mut self) -> Result<()> {
-        self.sync_with(&sync_marker())
-    }
-
-    fn sync_with(&mut self, marker: &str) -> Result<()> {
+    async fn sync_with(&mut self, marker: &str) -> Result<()> {
         let command = format!("\"{marker}\"");
         for attempt in 0..2 {
             // The first attempt is sent once and gets one timeout period
@@ -167,9 +169,9 @@ impl Calculator {
             // the normal budget: the marker is the one command that may
             // safely run twice, only markers are ever dropped.
             let result = if attempt == 0 {
-                self.host(&command)
+                self.host(&command).await
             } else {
-                self.host_retrying(&command)
+                self.host_retrying(&command).await
             };
             let reply = match result {
                 // The calculator aborted a transfer left over from the dead
@@ -196,7 +198,7 @@ impl Calculator {
                 let mut left = ours;
                 while left > 0 {
                     let n = left.min(2);
-                    self.drop_levels(n)?;
+                    self.drop_levels(n).await?;
                     left -= n;
                 }
                 return Ok(());
@@ -207,21 +209,10 @@ impl Calculator {
         )))
     }
 
-    /// The underlying session. Forgets the cached transfer mode, since the
-    /// caller may change flag -35 through it.
-    pub fn session(&mut self) -> &mut Session {
-        self.mode = None;
-        &mut self.session
-    }
-
-    /// Run a host command (Unicode or ASCII trigraphs such as `\->`) and
-    /// return the stack. An `Error:` reply is `Ok` with `error` set. Forgets
-    /// the cached transfer mode, since the command may change flag -35.
-    /// The command is sent once: no reply in time is [`Error::NoReply`],
-    /// never a second run.
-    pub fn run(&mut self, command: &str) -> Result<StackReply> {
-        self.mode = None;
-        self.host(command)
+    /// [`Calculator::run`].
+    pub(crate) async fn run(&mut self, command: &str) -> Result<StackReply> {
+        self.st.mode = None;
+        self.host(command).await
     }
 
     /// Send `command` as a `C` packet exactly once and parse the stack
@@ -239,14 +230,14 @@ impl Calculator {
     /// [`Error::NoReply`]. Once
     /// the calculator's `S` is in, the reply packets keep the session's
     /// retries; a failure after that is the Kermit error (the command ran).
-    fn host(&mut self, command: &str) -> Result<StackReply> {
-        let timeout = self.session.config().timeout;
-        self.host_once(command, timeout)
+    async fn host(&mut self, command: &str) -> Result<StackReply> {
+        let timeout = self.k.config().timeout;
+        self.host_once(command, timeout).await
     }
 
     /// [`host`](Calculator::host) with a reply timeout of `timeout`.
-    fn host_once(&mut self, command: &str, timeout: Duration) -> Result<StackReply> {
-        let normal = self.session.config().clone();
+    async fn host_once(&mut self, command: &str, timeout: Duration) -> Result<StackReply> {
+        let normal = self.k.config().clone();
         let mut once = normal.clone();
         once.timeout = timeout;
         once.first_packet_retries = Some(0);
@@ -254,11 +245,11 @@ impl Calculator {
         once.first_packet_nak_window = Some(HOST_NAK_WINDOW);
         once.first_packet_nak_grace = Some(HOST_NAK_GRACE.min(timeout));
         once.first_packet_nak_byte_time = Some(HOST_BYTE_TIME);
-        self.session.set_config(once);
-        let result = self.host_retrying(command);
-        self.session.set_config(normal);
+        self.k.set_config(once);
+        let result = self.host_retrying(command).await;
+        self.k.set_config(normal);
         match result {
-            Err(Error::Kermit(kermit_proto::Error::Timeout)) if !self.session.answered() => {
+            Err(Error::Kermit(kermit_proto::Error::Timeout)) if !self.k.answered() => {
                 Err(Error::NoReply {
                     command: command.to_string(),
                 })
@@ -270,21 +261,21 @@ impl Calculator {
     /// Send `command` as a `C` packet with the session's retries and parse
     /// the stack reply. Only for a command that may run twice (the sync
     /// marker).
-    fn host_retrying(&mut self, command: &str) -> Result<StackReply> {
+    async fn host_retrying(&mut self, command: &str) -> Result<StackReply> {
         let bytes = encode_command(command)?;
-        let transcript = self.session.transact(Command::Host(bytes))?;
+        let transcript = self.k.transact(Command::Host(bytes)).await?;
         Ok(parse_stack(&decode(&transcript.text)))
     }
 
     /// Run `parts` joined by spaces as one command; if that is too long for
     /// a packet, run each part on its own in order. The first reply with an
     /// error becomes [`Error::Calculator`].
-    fn exec(&mut self, parts: &[String]) -> Result<StackReply> {
-        match self.host(&parts.join(" ")) {
+    async fn exec(&mut self, parts: &[String]) -> Result<StackReply> {
+        match self.host(&parts.join(" ")).await {
             Err(Error::CommandTooLong { .. }) if parts.len() > 1 => {
                 let mut last = StackReply::default();
                 for part in parts {
-                    last = checked(self.host(part)?)?;
+                    last = checked(self.host(part).await?)?;
                 }
                 Ok(last)
             }
@@ -294,8 +285,8 @@ impl Calculator {
 
     /// Run `command`, read `levels` stack levels (level 1 first) and drop
     /// them again.
-    fn query(&mut self, command: &str, levels: usize) -> Result<Vec<String>> {
-        let reply = checked(self.host(command)?)?;
+    async fn query(&mut self, command: &str, levels: usize) -> Result<Vec<String>> {
+        let reply = checked(self.host(command).await?)?;
         if reply.levels.len() < levels {
             return Err(Error::Reply(format!(
                 "{command}: expected {levels} stack level(s), got {:?}",
@@ -303,39 +294,37 @@ impl Calculator {
             )));
         }
         let values = reply.levels[..levels].to_vec();
-        self.drop_levels(levels)?;
+        self.drop_levels(levels).await?;
         Ok(values)
     }
 
     /// Drop `n` levels (1 or 2) pushed by an internal query.
-    fn drop_levels(&mut self, n: usize) -> Result<()> {
+    async fn drop_levels(&mut self, n: usize) -> Result<()> {
         let command = if n >= 2 { "DROP2" } else { "DROP" };
-        checked(self.host(command)?).map(|_| ())
+        checked(self.host(command).await?).map(|_| ())
     }
 
-    /// The current directory listing (`G D`).
-    pub fn list(&mut self) -> Result<Listing> {
-        let transcript = self.session.transact(Command::Directory)?;
+    /// [`Calculator::list`].
+    pub(crate) async fn list(&mut self) -> Result<Listing> {
+        let transcript = self.k.transact(Command::Directory).await?;
         parse_listing(&decode(&transcript.text))
     }
 
-    /// The current directory path, e.g. `["HOME", "D1"]`: from the listing
-    /// header (48GX, 49G) or a `PATH` query (48SX, whose listing has none).
-    pub fn path(&mut self) -> Result<Vec<String>> {
-        if let Some(path) = self.list()?.path {
+    /// [`Calculator::path`].
+    pub(crate) async fn path(&mut self) -> Result<Vec<String>> {
+        if let Some(path) = self.list().await?.path {
             return Ok(path);
         }
         let [value]: [String; 1] = self
-            .query("PATH", 1)?
+            .query("PATH", 1)
+            .await?
             .try_into()
             .map_err(|_| Error::Reply("PATH: no value".into()))?;
         parse_list(&value).ok_or_else(|| Error::Reply(format!("PATH: not a list: {value:?}")))
     }
 
-    /// Change to the absolute directory `path`, e.g. `["HOME", "D1"]` (the
-    /// leading `HOME` is optional). Each component is checked against the
-    /// listing before it is evaluated.
-    pub fn cd(&mut self, path: &[&str]) -> Result<()> {
+    /// [`Calculator::cd`].
+    pub(crate) async fn cd(&mut self, path: &[&str]) -> Result<()> {
         let components = match path.split_first() {
             Some((&"HOME", rest)) => rest,
             _ => path,
@@ -343,9 +332,9 @@ impl Calculator {
         for name in components {
             validate_name(name)?;
         }
-        self.exec(&["HOME".to_string()])?;
+        self.exec(&["HOME".to_string()]).await?;
         for name in components {
-            let listing = self.list()?;
+            let listing = self.list().await?;
             let is_dir = listing
                 .entries
                 .iter()
@@ -353,42 +342,43 @@ impl Calculator {
             if !is_dir {
                 return Err(Error::Reply(format!("{name}: no such directory")));
             }
-            self.exec(&[(*name).to_string()])?;
+            self.exec(&[(*name).to_string()]).await?;
         }
         Ok(())
     }
 
-    /// Go to the parent directory (`UPDIR`).
-    pub fn updir(&mut self) -> Result<()> {
-        self.exec(&["UPDIR".to_string()]).map(|_| ())
+    /// [`Calculator::updir`].
+    pub(crate) async fn updir(&mut self) -> Result<()> {
+        self.exec(&["UPDIR".to_string()]).await.map(|_| ())
     }
 
-    /// Create directory `name` in the current directory (`CRDIR`).
-    pub fn mkdir(&mut self, name: &str) -> Result<()> {
-        self.exec(&[format!("{} CRDIR", quote(name)?)]).map(|_| ())
+    /// [`Calculator::mkdir`].
+    pub(crate) async fn mkdir(&mut self, name: &str) -> Result<()> {
+        self.exec(&[format!("{} CRDIR", quote(name)?)])
+            .await
+            .map(|_| ())
     }
 
-    /// Delete variable `name` from the current directory; a directory is
-    /// deleted with its contents (`PGDIR`).
-    pub fn remove(&mut self, name: &str) -> Result<()> {
+    /// [`Calculator::remove`].
+    pub(crate) async fn remove(&mut self, name: &str) -> Result<()> {
         let quoted = quote(name)?;
         let is_dir = self
-            .list()?
+            .list()
+            .await?
             .entries
             .iter()
             .find(|e| e.name == name)
             .map(|e| e.is_directory())
             .ok_or_else(|| Error::Reply(format!("{name}: no such variable")))?;
         let purge = if is_dir { "PGDIR" } else { "PURGE" };
-        self.exec(&[format!("{quoted} {purge}")]).map(|_| ())
+        self.exec(&[format!("{quoted} {purge}")]).await.map(|_| ())
     }
 
-    /// Rename variable `from` to `to` in the current directory (`RCL`, `STO`,
-    /// then `PURGE` or `PGDIR`). `to` must not exist yet.
-    pub fn rename(&mut self, from: &str, to: &str) -> Result<()> {
+    /// [`Calculator::rename`].
+    pub(crate) async fn rename(&mut self, from: &str, to: &str) -> Result<()> {
         let quoted_from = quote(from)?;
         let quoted_to = quote(to)?;
-        let listing = self.list()?;
+        let listing = self.list().await?;
         let is_dir = listing
             .entries
             .iter()
@@ -404,24 +394,24 @@ impl Calculator {
             format!("{quoted_to} STO"),
             format!("{quoted_from} {purge}"),
         ])
+        .await
         .map(|_| ())
     }
 
-    /// Free memory in bytes (`MEM`).
-    pub fn mem(&mut self) -> Result<f64> {
-        let values = self.query("MEM", 1)?;
+    /// [`Calculator::mem`].
+    pub(crate) async fn mem(&mut self) -> Result<f64> {
+        let values = self.query("MEM", 1).await?;
         let value = values.first().map(String::as_str).unwrap_or_default();
         parse_real(value).ok_or_else(|| Error::Reply(format!("MEM: not a number: {value:?}")))
     }
 
-    /// The ROM version text, e.g. `Version HP48-R, Copyright HP 1993`;
-    /// `None` on the 48SX, which has no `VERSION` command.
-    pub fn version(&mut self) -> Result<Option<String>> {
-        let reply = checked(self.host("VERSION")?)?;
+    /// [`Calculator::version`].
+    pub(crate) async fn version(&mut self) -> Result<Option<String>> {
+        let reply = checked(self.host("VERSION").await?)?;
         // 48SX: the undefined name evaluates to itself.
         let level1 = reply.level(1).unwrap_or_default().trim();
         if level1 == "VERSION" || parse_name(level1).as_deref() == Some("VERSION") {
-            self.drop_levels(1)?;
+            self.drop_levels(1).await?;
             return Ok(None);
         }
         let (Some(l2), Some(l1)) = (reply.level(2), reply.level(1)) else {
@@ -434,63 +424,60 @@ impl Calculator {
         let version = parse_string(l2).ok_or_else(|| bad(l2))?;
         let copyright = parse_string(l1).ok_or_else(|| bad(l1))?;
         let version = version.split_whitespace().collect::<Vec<_>>().join(" ");
-        self.drop_levels(2)?;
+        self.drop_levels(2).await?;
         Ok(Some(format!("{version}, {copyright}")))
     }
 
-    /// The serial settings (`IOPAR`).
-    pub fn iopar(&mut self) -> Result<Iopar> {
-        let values = self.query("IOPAR", 1)?;
+    /// [`Calculator::iopar`].
+    pub(crate) async fn iopar(&mut self) -> Result<Iopar> {
+        let values = self.query("IOPAR", 1).await?;
         let value = values.first().map(String::as_str).unwrap_or_default();
         Iopar::parse(value).ok_or_else(|| Error::Reply(format!("IOPAR: bad list: {value:?}")))
     }
 
-    /// Store `iopar` as `IOPAR` in HOME and return to the current directory.
-    /// Takes effect when the calculator reopens the port (e.g. the next
-    /// `SERVER`), not in the running session.
-    pub fn set_iopar(&mut self, iopar: &Iopar) -> Result<()> {
+    /// [`Calculator::set_iopar`].
+    pub(crate) async fn set_iopar(&mut self, iopar: &Iopar) -> Result<()> {
         self.exec(&[
             "PATH HOME".to_string(),
             format!("{} 'IOPAR' STO", iopar.to_rpl()),
             "EVAL".to_string(),
         ])
+        .await
         .map(|_| ())
     }
 
-    /// Read the transfer mode (flag -35) and cache it.
-    pub fn transfer_mode(&mut self) -> Result<TransferMode> {
-        let values = self.query("-35 FS?", 1)?;
+    /// [`Calculator::transfer_mode`].
+    pub(crate) async fn transfer_mode(&mut self) -> Result<TransferMode> {
+        let values = self.query("-35 FS?", 1).await?;
         let value = values.first().map(String::as_str).unwrap_or_default();
         let mode = match parse_real(value) {
             Some(1.0) => TransferMode::Binary,
             Some(0.0) => TransferMode::Ascii,
             _ => return Err(Error::Reply(format!("-35 FS?: not a flag: {value:?}"))),
         };
-        self.mode = Some(mode);
+        self.st.mode = Some(mode);
         Ok(mode)
     }
 
-    /// Set the transfer mode (flag -35) unless the cached mode already is
-    /// `mode`.
-    pub fn set_transfer_mode(&mut self, mode: TransferMode) -> Result<()> {
-        if self.mode == Some(mode) {
+    /// [`Calculator::set_transfer_mode`].
+    pub(crate) async fn set_transfer_mode(&mut self, mode: TransferMode) -> Result<()> {
+        if self.st.mode == Some(mode) {
             return Ok(());
         }
         let command = match mode {
             TransferMode::Binary => "-35 SF",
             TransferMode::Ascii => "-35 CF",
         };
-        self.exec(&[command.to_string()])?;
-        self.mode = Some(mode);
+        self.exec(&[command.to_string()]).await?;
+        self.st.mode = Some(mode);
         Ok(())
     }
 
-    /// GET variable `name` from the current directory in `mode`. Binary
-    /// data is cut after the object (the calculator pads the last packet).
-    pub fn get(&mut self, name: &str, mode: TransferMode) -> Result<Vec<u8>> {
+    /// [`Calculator::get`].
+    pub(crate) async fn get(&mut self, name: &str, mode: TransferMode) -> Result<Vec<u8>> {
         validate_name(name)?;
-        self.set_transfer_mode(mode)?;
-        let transcript = self.session.transact(Command::Get(encode(name)?))?;
+        self.set_transfer_mode(mode).await?;
+        let transcript = self.k.transact(Command::Get(encode(name)?)).await?;
         let [file]: [_; 1] = transcript.files.try_into().map_err(|files: Vec<_>| {
             Error::Reply(format!(
                 "GET {name}: expected one file, got {}",
@@ -503,17 +490,20 @@ impl Calculator {
         })
     }
 
-    /// SEND `data` as variable `name` in `mode` and return the name the
-    /// calculator stored it under (it can differ, e.g. a `.1` suffix when
-    /// the name exists).
-    pub fn put(&mut self, name: &str, data: &[u8], mode: TransferMode) -> Result<String> {
+    /// [`Calculator::put`].
+    pub(crate) async fn put(
+        &mut self,
+        name: &str,
+        data: &[u8],
+        mode: TransferMode,
+    ) -> Result<String> {
         validate_name(name)?;
-        self.set_transfer_mode(mode)?;
+        self.set_transfer_mode(mode).await?;
         let file = OutgoingFile {
             name: encode(name)?,
             data: data.to_vec(),
         };
-        let transcript = self.session.transact(Command::Send(vec![file]))?;
+        let transcript = self.k.transact(Command::Send(vec![file])).await?;
         transcript
             .stored_names
             .into_iter()
@@ -521,35 +511,26 @@ impl Calculator {
             .ok_or_else(|| Error::Reply(format!("SEND {name}: no file stored")))
     }
 
-    /// Fetch the graphics screen PICT (plots, drawings) via `PICT RCL`, a
-    /// temporary variable `HPTXTMP` and a binary GET; the variable is purged
-    /// afterwards. A calculator that never drew anything has a 0x0 PICT;
-    /// `ERASE` makes it 131x64. The display itself cannot be captured over
-    /// the link: `LCD→` in server mode only sees the server's own banner.
-    /// Leaves the calculator in binary transfer mode.
-    pub fn pict(&mut self) -> Result<Grob> {
-        self.refuse_existing(PICT_VAR)?;
-        self.exec(&[format!("PICT RCL '{PICT_VAR}' STO")])?;
-        let data = self.get(PICT_VAR, TransferMode::Binary);
-        let purge = self.exec(&[format!("'{PICT_VAR}' PURGE")]);
+    /// [`Calculator::pict`].
+    pub(crate) async fn pict(&mut self) -> Result<Grob> {
+        self.refuse_existing(PICT_VAR).await?;
+        self.exec(&[format!("PICT RCL '{PICT_VAR}' STO")]).await?;
+        let data = self.get(PICT_VAR, TransferMode::Binary).await;
+        let purge = self.exec(&[format!("'{PICT_VAR}' PURGE")]).await;
         let data = data?;
         purge?;
         Grob::from_file(&data)
     }
 
-    /// Back up HOME: `ARCHIVE` into port 0, recall it into a temporary
-    /// variable `HPTXBK`, GET that in binary mode, then remove both. Returns
-    /// the binary transfer file of the Directory object. `ARCHIVE :IO:name`
-    /// fails in server mode ("Port Not Available"), hence the detour.
-    /// Leaves the calculator in binary transfer mode.
-    pub fn backup(&mut self) -> Result<Vec<u8>> {
-        self.refuse_existing(BACKUP_VAR)?;
-        self.exec(&[format!(":0:{BACKUP_VAR} ARCHIVE")])?;
-        let result = self.backup_steps();
+    /// [`Calculator::backup`].
+    pub(crate) async fn backup(&mut self) -> Result<Vec<u8>> {
+        self.refuse_existing(BACKUP_VAR).await?;
+        self.exec(&[format!(":0:{BACKUP_VAR} ARCHIVE")]).await?;
+        let result = self.backup_steps().await;
         if result.is_err() {
             // Best effort: the error being reported matters more.
-            let _ = self.exec(&[format!(":0:{BACKUP_VAR} PURGE")]);
-            let _ = self.exec(&[format!("'{BACKUP_VAR}' PGDIR")]);
+            let _ = self.exec(&[format!(":0:{BACKUP_VAR} PURGE")]).await;
+            let _ = self.exec(&[format!("'{BACKUP_VAR}' PGDIR")]).await;
         }
         let data = result?;
         let info = inspect(&data)?;
@@ -562,43 +543,41 @@ impl Calculator {
         Ok(data)
     }
 
-    fn backup_steps(&mut self) -> Result<Vec<u8>> {
+    async fn backup_steps(&mut self) -> Result<Vec<u8>> {
         // STO before PURGE, else "Object In Use".
         self.exec(&[
             format!(":0:{BACKUP_VAR} RCL"),
             format!("'{BACKUP_VAR}' STO"),
             format!(":0:{BACKUP_VAR} PURGE"),
-        ])?;
-        let data = self.get(BACKUP_VAR, TransferMode::Binary)?;
-        self.exec(&[format!("'{BACKUP_VAR}' PGDIR")])?;
+        ])
+        .await?;
+        let data = self.get(BACKUP_VAR, TransferMode::Binary).await?;
+        self.exec(&[format!("'{BACKUP_VAR}' PGDIR")]).await?;
         Ok(data)
     }
 
-    /// Replace HOME with the backup `data` (from [`Calculator::backup`]):
-    /// binary PUT as `HPTXRS`, copy to port 0, `RESTORE` from there. The
-    /// calculator warm-starts and leaves server mode; restart `SERVER` on
-    /// it, then call [`Calculator::purge_restore_leftover`] to delete
-    /// `:0:HPTXRS`. `data` must be a Directory whose object walk succeeds
-    /// (a truncated file never reaches `RESTORE`).
-    pub fn restore(&mut self, data: &[u8]) -> Result<()> {
+    /// [`Calculator::restore`].
+    pub(crate) async fn restore(&mut self, data: &[u8]) -> Result<()> {
         check_backup(data)?;
-        self.refuse_existing(RESTORE_VAR)?;
-        let stored = self.put(RESTORE_VAR, data, TransferMode::Binary)?;
+        self.refuse_existing(RESTORE_VAR).await?;
+        let stored = self.put(RESTORE_VAR, data, TransferMode::Binary).await?;
         if stored != RESTORE_VAR {
             return Err(Error::Reply(format!(
                 "backup stored as {stored}, expected {RESTORE_VAR}"
             )));
         }
-        let copied = self.exec(&[
-            format!("'{RESTORE_VAR}' RCL"),
-            format!(":0:{RESTORE_VAR} STO"),
-            format!("'{RESTORE_VAR}' PGDIR"),
-        ]);
+        let copied = self
+            .exec(&[
+                format!("'{RESTORE_VAR}' RCL"),
+                format!(":0:{RESTORE_VAR} STO"),
+                format!("'{RESTORE_VAR}' PGDIR"),
+            ])
+            .await;
         if let Err(e) = copied {
-            let _ = self.exec(&[format!("'{RESTORE_VAR}' PGDIR")]);
+            let _ = self.exec(&[format!("'{RESTORE_VAR}' PGDIR")]).await;
             return Err(e);
         }
-        self.restore_from_port()
+        self.restore_from_port().await
     }
 
     /// `RESTORE` from `:0:HPTXRS`. The warm start ends server mode, so no
@@ -607,11 +586,11 @@ impl Calculator {
     /// (success). An answer leaves the result unknown ([`Error::Reply`],
     /// `:0:HPTXRS` stays): the `RESTORE` may have been lost, or it ran and
     /// someone restarted `SERVER` within the probe's timeout.
-    fn restore_from_port(&mut self) -> Result<()> {
-        self.mode = None;
-        let timeout = self.session.config().timeout;
+    async fn restore_from_port(&mut self) -> Result<()> {
+        self.st.mode = None;
+        let timeout = self.k.config().timeout;
         let restore = format!(":0:{RESTORE_VAR} RESTORE");
-        match self.host_once(&restore, RESTORE_TIMEOUT.min(timeout)) {
+        match self.host_once(&restore, RESTORE_TIMEOUT.min(timeout)).await {
             Err(Error::NoReply { .. }) => {}
             Err(e) => return Err(e),
             Ok(reply) => {
@@ -619,8 +598,8 @@ impl Calculator {
                 return Err(Error::Reply("calculator did not restart".into()));
             }
         }
-        let marker = sync_marker();
-        let probe = self.host_once(&format!("\"{marker}\""), timeout);
+        let marker = self.st.marker();
+        let probe = self.host_once(&format!("\"{marker}\""), timeout).await;
         let still_running = || {
             Error::Reply(format!(
                 "the calculator answers again, so RESTORE's result is unknown: it may have \
@@ -637,70 +616,45 @@ impl Calculator {
                 {
                     // Best effort: the probe's own marker; the error matters
                     // more.
-                    let _ = self.drop_levels(1);
+                    let _ = self.drop_levels(1).await;
                 }
                 Err(still_running())
             }
         }
     }
 
-    /// Delete the backup object `:0:HPTXRS` that [`Calculator::restore`]
-    /// leaves in port 0, once `SERVER` runs again.
-    pub fn purge_restore_leftover(&mut self) -> Result<()> {
-        self.exec(&[format!(":0:{RESTORE_VAR} PURGE")]).map(|_| ())
+    /// [`Calculator::purge_restore_leftover`].
+    pub(crate) async fn purge_restore_leftover(&mut self) -> Result<()> {
+        self.exec(&[format!(":0:{RESTORE_VAR} PURGE")])
+            .await
+            .map(|_| ())
     }
 
-    /// End server mode (`G F`).
-    pub fn finish(&mut self) -> Result<()> {
-        self.session.transact(Command::Finish).map(|_| ())
+    /// [`Calculator::finish`].
+    pub(crate) async fn finish(&mut self) -> Result<()> {
+        self.k.transact(Command::Finish).await.map(|_| ())
     }
 
-    /// The underlying session, consuming the calculator.
-    pub fn into_session(self) -> Session {
-        self.session
+    /// [`Calculator::model`].
+    pub(crate) async fn model(&mut self) -> Result<Model> {
+        Ok(Model::from_version(self.version().await?.as_deref()))
     }
 
-    /// The open link, consuming the calculator, e.g. for an
-    /// [`XmodemSession`](crate::XmodemSession) after
     /// [`Calculator::prepare_for_xmodem`].
-    pub fn into_transport(self) -> Box<dyn Transport> {
-        self.session.into_transport()
-    }
-
-    /// The model, from the `VERSION` text (see [`Model::from_version`]).
-    pub fn model(&mut self) -> Result<Model> {
-        Ok(Model::from_version(self.version()?.as_deref()))
-    }
-
-    /// Get the calculator ready for an XModem transfer of variable `name`
-    /// in the current directory and say what the user must type.
-    ///
-    /// `XRECV` and `XSEND` cannot be started through the Kermit server (they
-    /// fail with "Port Not Available" on the 49G and 48GX), so this checks
-    /// the name (it must exist for `XSEND`), switches a 49G in algebraic
-    /// mode to RPN (flag -95; typed `'NAME' XRECV` needs RPN), and ends
-    /// server mode with Kermit FINISH. An existing `NAME` is refused for
-    /// `XRECV` on the 48G/GX ("XRECV Error: Name Conflict"); the 49G stores
-    /// the object as `NAME.1` instead, which the plan's notes say. The user then types
-    /// [`XmodemPlan::keys`] on the calculator while an
-    /// [`XmodemSession`](crate::XmodemSession) on
-    /// [`Calculator::into_transport`] waits. Afterwards the calculator is
-    /// out of server mode with an empty stack: `SERVER` must be typed again.
-    /// Errors for the 48S/SX, which has no XModem.
-    pub fn prepare_for_xmodem(
+    pub(crate) async fn prepare_for_xmodem(
         &mut self,
         direction: XmodemDirection,
         name: &str,
     ) -> Result<XmodemPlan> {
         let quoted = quote(name)?;
-        let model = self.model()?;
+        let model = self.model().await?;
         if !model.has_xmodem() {
             return Err(Error::Unsupported(format!(
                 "the {} has no XModem; use Kermit",
                 model.name()
             )));
         }
-        let exists = self.list()?.entries.iter().any(|e| e.name == name);
+        let exists = self.list().await?.entries.iter().any(|e| e.name == name);
         if direction == XmodemDirection::FromCalculator && !exists {
             return Err(Error::Reply(format!("{name}: no such variable")));
         }
@@ -712,15 +666,15 @@ impl Calculator {
         }
         let mut switched_to_rpn = false;
         if model == Model::Hp49G {
-            let flag = self.query("-95. FS?", 1)?;
+            let flag = self.query("-95. FS?", 1).await?;
             let alg = flag.first().and_then(|v| parse_real(v)) == Some(1.0);
             if alg {
-                self.exec(&["-95. CF".to_string()])?;
+                self.exec(&["-95. CF".to_string()]).await?;
                 switched_to_rpn = true;
             }
         }
-        self.finish()?;
-        self.mode = None;
+        self.finish().await?;
+        self.st.mode = None;
 
         let command = direction.calculator_command();
         let mut notes = Vec::new();
@@ -763,8 +717,8 @@ impl Calculator {
     }
 
     /// Fail if `name` exists in the current directory.
-    fn refuse_existing(&mut self, name: &str) -> Result<()> {
-        if self.list()?.entries.iter().any(|e| e.name == name) {
+    async fn refuse_existing(&mut self, name: &str) -> Result<()> {
+        if self.list().await?.entries.iter().any(|e| e.name == name) {
             return Err(Error::Reply(format!(
                 "{name} exists in the current directory; remove it first"
             )));
@@ -773,18 +727,312 @@ impl Calculator {
     }
 }
 
-/// The string [`Calculator::sync`] pushes: `HPTX-` and six random hex
-/// digits (13 characters with the quotes, far below every model's display
-/// width), plain ASCII without RPL delimiters.
-pub fn sync_marker() -> String {
+/// A calculator in Kermit server mode, over a blocking [`Transport`] with
+/// the system clock. For a link driven from outside (a browser), see
+/// [`machine::Machine`](crate::machine::Machine), which runs the same
+/// operations.
+pub struct Calculator {
+    session: Session,
+    state: CalcState,
+}
+
+impl Calculator {
+    /// Wrap an open session. The transfer mode is unknown until read or set.
+    pub fn new(session: Session) -> Self {
+        Calculator {
+            session,
+            state: CalcState::new(entropy()),
+        }
+    }
+
+    /// Open `addr` (see [`crate::transport::open`]) with default options
+    /// and [`sync`](Calculator::sync).
+    pub fn open(addr: &str) -> Result<Self> {
+        let mut calc = Calculator::new(Session::open(addr)?);
+        calc.sync()?;
+        Ok(calc)
+    }
+
+    /// The underlying session. Forgets the cached transfer mode, since the
+    /// caller may change flag -35 through it.
+    pub fn session(&mut self) -> &mut Session {
+        self.state.mode = None;
+        &mut self.session
+    }
+
+    /// The underlying session, consuming the calculator.
+    pub fn into_session(self) -> Session {
+        self.session
+    }
+
+    /// The open link, consuming the calculator, e.g. for an
+    /// [`XmodemSession`](crate::XmodemSession) after
+    /// [`Calculator::prepare_for_xmodem`].
+    pub fn into_transport(self) -> Box<dyn Transport> {
+        self.session.into_transport()
+    }
+
+    /// The transport, the link and the operations, borrowed apart.
+    fn split(&mut self) -> (&mut dyn Transport, Link, CalcOps<'_>) {
+        let link = self.session.core.link.clone();
+        let ops = CalcOps {
+            k: &mut self.session.core,
+            st: &mut self.state,
+        };
+        (self.session.transport.as_mut(), link, ops)
+    }
+
+    #[cfg(test)]
+    fn sync_with(&mut self, marker: &str) -> Result<()> {
+        let (transport, link, mut c) = self.split();
+        link::drive(transport, &link, c.sync_with(marker), &mut |_| {})
+    }
+
+    #[cfg(test)]
+    fn restore_from_port(&mut self) -> Result<()> {
+        let (transport, link, mut c) = self.split();
+        link::drive(transport, &link, c.restore_from_port(), &mut |_| {})
+    }
+
+    /// Get in step with the server at the start of a session.
+    ///
+    /// When a client dies while a host command runs, the calculator still
+    /// finishes the command and offers its reply (an S packet repeated
+    /// every 5 s for about a minute). The next client's first command is
+    /// eaten as a bad ACK and the late reply arrives in its place. Sequence
+    /// numbers restart at zero for every command and host commands and
+    /// `G D` both answer with text, so the late reply cannot be told apart
+    /// on the wire, and repeating an arbitrary command would repeat its
+    /// effect. Instead the session starts with a sacrificial command that
+    /// pushes a marker string unique to this session ([`sync_marker`],
+    /// short enough that no model truncates it). A reply whose level 1 is
+    /// the marker is ours: the marker is dropped (every copy of it on top
+    /// of the stack, in case an earlier attempt was not eaten after all).
+    /// Any other reply was a late one and our command was eaten: the marker
+    /// command is sent once more. Nothing but the marker is ever dropped
+    /// and nothing else is ever resent. Link errors are returned; a second
+    /// odd reply is [`Error::Reply`]: hptx and the calculator are not in
+    /// step, and nothing is run on a stack it cannot vouch for.
+    pub fn sync(&mut self) -> Result<()> {
+        let (transport, link, mut c) = self.split();
+        link::drive(transport, &link, c.sync(), &mut |_| {})
+    }
+
+    /// Run a host command (Unicode or ASCII trigraphs such as `\->`) and
+    /// return the stack. An `Error:` reply is `Ok` with `error` set. Forgets
+    /// the cached transfer mode, since the command may change flag -35.
+    /// The command is sent once: no reply in time is [`Error::NoReply`],
+    /// never a second run.
+    pub fn run(&mut self, command: &str) -> Result<StackReply> {
+        let (transport, link, mut c) = self.split();
+        link::drive(transport, &link, c.run(command), &mut |_| {})
+    }
+
+    /// The current directory listing (`G D`).
+    pub fn list(&mut self) -> Result<Listing> {
+        let (transport, link, mut c) = self.split();
+        link::drive(transport, &link, c.list(), &mut |_| {})
+    }
+
+    /// The current directory path, e.g. `["HOME", "D1"]`: from the listing
+    /// header (48GX, 49G) or a `PATH` query (48SX, whose listing has none).
+    pub fn path(&mut self) -> Result<Vec<String>> {
+        let (transport, link, mut c) = self.split();
+        link::drive(transport, &link, c.path(), &mut |_| {})
+    }
+
+    /// Change to the absolute directory `path`, e.g. `["HOME", "D1"]` (the
+    /// leading `HOME` is optional). Each component is checked against the
+    /// listing before it is evaluated.
+    pub fn cd(&mut self, path: &[&str]) -> Result<()> {
+        let (transport, link, mut c) = self.split();
+        link::drive(transport, &link, c.cd(path), &mut |_| {})
+    }
+
+    /// Go to the parent directory (`UPDIR`).
+    pub fn updir(&mut self) -> Result<()> {
+        let (transport, link, mut c) = self.split();
+        link::drive(transport, &link, c.updir(), &mut |_| {})
+    }
+
+    /// Create directory `name` in the current directory (`CRDIR`).
+    pub fn mkdir(&mut self, name: &str) -> Result<()> {
+        let (transport, link, mut c) = self.split();
+        link::drive(transport, &link, c.mkdir(name), &mut |_| {})
+    }
+
+    /// Delete variable `name` from the current directory; a directory is
+    /// deleted with its contents (`PGDIR`).
+    pub fn remove(&mut self, name: &str) -> Result<()> {
+        let (transport, link, mut c) = self.split();
+        link::drive(transport, &link, c.remove(name), &mut |_| {})
+    }
+
+    /// Rename variable `from` to `to` in the current directory (`RCL`, `STO`,
+    /// then `PURGE` or `PGDIR`). `to` must not exist yet.
+    pub fn rename(&mut self, from: &str, to: &str) -> Result<()> {
+        let (transport, link, mut c) = self.split();
+        link::drive(transport, &link, c.rename(from, to), &mut |_| {})
+    }
+
+    /// Free memory in bytes (`MEM`).
+    pub fn mem(&mut self) -> Result<f64> {
+        let (transport, link, mut c) = self.split();
+        link::drive(transport, &link, c.mem(), &mut |_| {})
+    }
+
+    /// The ROM version text, e.g. `Version HP48-R, Copyright HP 1993`;
+    /// `None` on the 48SX, which has no `VERSION` command.
+    pub fn version(&mut self) -> Result<Option<String>> {
+        let (transport, link, mut c) = self.split();
+        link::drive(transport, &link, c.version(), &mut |_| {})
+    }
+
+    /// The serial settings (`IOPAR`).
+    pub fn iopar(&mut self) -> Result<Iopar> {
+        let (transport, link, mut c) = self.split();
+        link::drive(transport, &link, c.iopar(), &mut |_| {})
+    }
+
+    /// Store `iopar` as `IOPAR` in HOME and return to the current directory.
+    /// Takes effect when the calculator reopens the port (e.g. the next
+    /// `SERVER`), not in the running session.
+    pub fn set_iopar(&mut self, iopar: &Iopar) -> Result<()> {
+        let (transport, link, mut c) = self.split();
+        link::drive(transport, &link, c.set_iopar(iopar), &mut |_| {})
+    }
+
+    /// Read the transfer mode (flag -35) and cache it.
+    pub fn transfer_mode(&mut self) -> Result<TransferMode> {
+        let (transport, link, mut c) = self.split();
+        link::drive(transport, &link, c.transfer_mode(), &mut |_| {})
+    }
+
+    /// Set the transfer mode (flag -35) unless the cached mode already is
+    /// `mode`.
+    pub fn set_transfer_mode(&mut self, mode: TransferMode) -> Result<()> {
+        let (transport, link, mut c) = self.split();
+        link::drive(transport, &link, c.set_transfer_mode(mode), &mut |_| {})
+    }
+
+    /// GET variable `name` from the current directory in `mode`. Binary
+    /// data is cut after the object (the calculator pads the last packet).
+    pub fn get(&mut self, name: &str, mode: TransferMode) -> Result<Vec<u8>> {
+        let (transport, link, mut c) = self.split();
+        link::drive(transport, &link, c.get(name, mode), &mut |_| {})
+    }
+
+    /// SEND `data` as variable `name` in `mode` and return the name the
+    /// calculator stored it under (it can differ, e.g. a `.1` suffix when
+    /// the name exists).
+    pub fn put(&mut self, name: &str, data: &[u8], mode: TransferMode) -> Result<String> {
+        let (transport, link, mut c) = self.split();
+        link::drive(transport, &link, c.put(name, data, mode), &mut |_| {})
+    }
+
+    /// Fetch the graphics screen PICT (plots, drawings) via `PICT RCL`, a
+    /// temporary variable `HPTXTMP` and a binary GET; the variable is purged
+    /// afterwards. A calculator that never drew anything has a 0x0 PICT;
+    /// `ERASE` makes it 131x64. The display itself cannot be captured over
+    /// the link: `LCD→` in server mode only sees the server's own banner.
+    /// Leaves the calculator in binary transfer mode.
+    pub fn pict(&mut self) -> Result<Grob> {
+        let (transport, link, mut c) = self.split();
+        link::drive(transport, &link, c.pict(), &mut |_| {})
+    }
+
+    /// Back up HOME: `ARCHIVE` into port 0, recall it into a temporary
+    /// variable `HPTXBK`, GET that in binary mode, then remove both. Returns
+    /// the binary transfer file of the Directory object. `ARCHIVE :IO:name`
+    /// fails in server mode ("Port Not Available"), hence the detour.
+    /// Leaves the calculator in binary transfer mode.
+    pub fn backup(&mut self) -> Result<Vec<u8>> {
+        let (transport, link, mut c) = self.split();
+        link::drive(transport, &link, c.backup(), &mut |_| {})
+    }
+
+    /// Replace HOME with the backup `data` (from [`Calculator::backup`]):
+    /// binary PUT as `HPTXRS`, copy to port 0, `RESTORE` from there. The
+    /// calculator warm-starts and leaves server mode; restart `SERVER` on
+    /// it, then call [`Calculator::purge_restore_leftover`] to delete
+    /// `:0:HPTXRS`. `data` must be a Directory whose object walk succeeds
+    /// (a truncated file never reaches `RESTORE`).
+    pub fn restore(&mut self, data: &[u8]) -> Result<()> {
+        let (transport, link, mut c) = self.split();
+        link::drive(transport, &link, c.restore(data), &mut |_| {})
+    }
+
+    /// Delete the backup object `:0:HPTXRS` that [`Calculator::restore`]
+    /// leaves in port 0, once `SERVER` runs again.
+    pub fn purge_restore_leftover(&mut self) -> Result<()> {
+        let (transport, link, mut c) = self.split();
+        link::drive(transport, &link, c.purge_restore_leftover(), &mut |_| {})
+    }
+
+    /// End server mode (`G F`).
+    pub fn finish(&mut self) -> Result<()> {
+        let (transport, link, mut c) = self.split();
+        link::drive(transport, &link, c.finish(), &mut |_| {})
+    }
+
+    /// The model, from the `VERSION` text (see [`Model::from_version`]).
+    pub fn model(&mut self) -> Result<Model> {
+        let (transport, link, mut c) = self.split();
+        link::drive(transport, &link, c.model(), &mut |_| {})
+    }
+
+    /// Get the calculator ready for an XModem transfer of variable `name`
+    /// in the current directory and say what the user must type.
+    ///
+    /// `XRECV` and `XSEND` cannot be started through the Kermit server (they
+    /// fail with "Port Not Available" on the 49G and 48GX), so this checks
+    /// the name (it must exist for `XSEND`), switches a 49G in algebraic
+    /// mode to RPN (flag -95; typed `'NAME' XRECV` needs RPN), and ends
+    /// server mode with Kermit FINISH. An existing `NAME` is refused for
+    /// `XRECV` on the 48G/GX ("XRECV Error: Name Conflict"); the 49G stores
+    /// the object as `NAME.1` instead, which the plan's notes say. The user then types
+    /// [`XmodemPlan::keys`] on the calculator while an
+    /// [`XmodemSession`](crate::XmodemSession) on
+    /// [`Calculator::into_transport`] waits. Afterwards the calculator is
+    /// out of server mode with an empty stack: `SERVER` must be typed again.
+    /// Errors for the 48S/SX, which has no XModem.
+    pub fn prepare_for_xmodem(
+        &mut self,
+        direction: XmodemDirection,
+        name: &str,
+    ) -> Result<XmodemPlan> {
+        let (transport, link, mut c) = self.split();
+        link::drive(
+            transport,
+            &link,
+            c.prepare_for_xmodem(direction, name),
+            &mut |_| {},
+        )
+    }
+}
+
+/// Seed for the sync markers of a [`Calculator`]: the per-process random
+/// hasher keys mixed with the time.
+fn entropy() -> u64 {
     use std::hash::{BuildHasher, Hasher};
+    #[cfg(not(target_arch = "wasm32"))]
+    use std::time::{SystemTime, UNIX_EPOCH};
+    #[cfg(target_arch = "wasm32")]
+    use web_time::{SystemTime, UNIX_EPOCH};
     // RandomState is seeded per process from the OS; mix in the time so two
     // states in one process differ too.
     let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
-    if let Ok(since) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+    if let Ok(since) = SystemTime::now().duration_since(UNIX_EPOCH) {
         hasher.write_u128(since.as_nanos());
     }
-    format!("HPTX-{:06x}", hasher.finish() & 0xFF_FFFF)
+    hasher.finish()
+}
+
+/// A sync marker as [`Calculator::sync`] pushes: `HPTX-` and six random
+/// hex digits (13 characters with the quotes, far below every model's
+/// display width), plain ASCII without RPL delimiters.
+pub fn sync_marker() -> String {
+    CalcState::new(entropy()).marker()
 }
 
 /// Check that `data` is a backup [`Calculator::restore`] can upload: a
@@ -886,7 +1134,7 @@ fn is_windows_device(name: &str) -> bool {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::session::Options;
     use crate::transport::MemoryTransport;
@@ -894,13 +1142,13 @@ mod tests {
     use kermit_proto::prefix::{self, Quoting};
     use std::sync::{Arc, Mutex};
 
-    type Log = Arc<Mutex<Vec<String>>>;
+    pub(crate) type Log = Arc<Mutex<Vec<String>>>;
 
     /// A Kermit server answering `C` and `G D` like the 48SX trace
     /// `48sx-host.trace`, with block check type 1: S, then X, D.., Z, B,
     /// each after the ACK of the previous one. `reply` maps the decoded
     /// command (`G D` for the listing) to the reply text.
-    fn fake_server(
+    pub(crate) fn fake_server(
         log: Log,
         mut reply: impl FnMut(&str) -> String + Send + 'static,
     ) -> impl FnMut(&[u8]) -> Vec<Vec<u8>> + Send {

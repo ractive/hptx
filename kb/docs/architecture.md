@@ -64,6 +64,14 @@ calc        Calculator: list, cd, get/put (sets flag -35), run, mkdir,
             remove, rename, IOPAR, screenshot, backup, restore.
 ```
 
+Since iteration 14 (decision log 2026-10-10) the session, calc and xmodem
+logic is async code on a crate-private mailbox (`link`) that never reads a
+clock or touches a port. `machine::Machine` drives it sans-I/O (fed bytes
+and time; for a browser with Web Serial, wasm32 without the default
+`native` feature); `Session`, `Calculator` and `XmodemSession` drive it
+over a `Transport` with the system clock. Serial and TCP need `native`
+(default), the in-process emulator `saturnus`.
+
 Host commands (`C`) return the stack as display text and leave their
 results on the user's stack, so every internal query drops what it pushed;
 names are checked in a `G D` listing before they are evaluated (decision
